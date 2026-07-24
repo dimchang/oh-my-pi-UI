@@ -1,0 +1,40 @@
+# ===== Dependencies (downloaded, 501MB) =====
+node_modules/
+
+# ===== Build output (electron-vite) =====
+out/
+dist/
+
+# ===== Packaged artifacts (electron-builder) =====
+# Contains the 501MB portable .exe, win-unpacked/, builder-debug.yml
+release/
+
+# ===== Downloaded binaries =====
+# standalone omp.exe (152MB) fetched from GitHub releases — not source
+resources/omp.exe
+
+# ===== electron-vite generated temp configs =====
+# Keep the real source: electron.vite.config.ts
+electron.vite.config.*.mjs
+
+# ===== omp RPC session / transcript dumps (runtime artifacts) =====
+*.jsonl
+019f8079-1bbd-7000-bc3b-2ed939c73ea3
+
+# ===== Logs =====
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ===== OS / editor cruft =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ===== Local tooling data (project memory / skills, not source) =====
+.workbuddy/
+
+# ===== One-off debug probe (hardcodes local paths) =====
+probe-omp.mjs

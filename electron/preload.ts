@@ -1,0 +1,70 @@
+/**
+ * preload.ts — contextBridge 暴露 window.omp 给渲染进程。
+ */
+
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import { IPC, type OmpApi, type FileEntry, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig } from '../src/shared/ipc-channels';
+import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
+
+function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
+  const listener = (_e: IpcRendererEvent, payload: T) => cb(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+const api: OmpApi = {
+  platform: process.platform,
+  send: (sessionPath: string, cmd: RpcCommand) => ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
+  acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
+    ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode),
+  newSessionForCwd: (cwd: string, approvalMode?: ApprovalMode) =>
+    ipcRenderer.invoke(IPC.OmpNewSession, cwd, approvalMode),
+  release: (sessionPath: string) => ipcRenderer.invoke(IPC.OmpRelease, sessionPath),
+  renameKey: (oldKey: string, newKey: string) => ipcRenderer.invoke(IPC.OmpRenameKey, oldKey, newKey),
+  listSessions: (cwd?: string) => ipcRenderer.invoke(IPC.SessionList, cwd),
+  deleteSession: (p: string) => ipcRenderer.invoke(IPC.SessionDelete, p),
+  readSessionMessages: (p: string) => ipcRenderer.invoke(IPC.SessionMessages, p),
+  getSessionUserEntries: (p: string) => ipcRenderer.invoke(IPC.SessionUserEntries, p),
+  getOmpInfo: () => ipcRenderer.invoke(IPC.GetOmpInfo),
+  openExternal: (url: string) => ipcRenderer.invoke(IPC.OpenExternal, url),
+  copyText: (text: string) => ipcRenderer.invoke(IPC.ClipboardWriteText, text),
+  showItemInFolder: (fullPath: string) => ipcRenderer.invoke(IPC.ShowItemInFolder, fullPath),
+  showSaveDialog: (defaultPath?: string) => ipcRenderer.invoke(IPC.ShowSaveDialog, defaultPath),
+  listFiles: (dirPath: string) => ipcRenderer.invoke(IPC.ListFiles, dirPath),
+  onEvent: (cb) => subscribe<OmpFrame & { __sessionPath?: string }>(IPC.RpcEvent, cb),
+  onReady: (cb) => subscribe<string>(IPC.RpcReady, cb),
+  onExit: (cb) => subscribe<{ sessionPath: string; code: number | null }>(IPC.OmpExit, cb),
+  onStderr: (cb) => subscribe<{ sessionPath: string; line: string }>(IPC.OmpStderr, cb),
+  onNotFound: (cb) => subscribe<string>(IPC.OmpNotFound, cb),
+  notifyReady: (initialCwd?: string) => ipcRenderer.invoke(IPC.RendererReady, initialCwd),
+
+  // M5: 工作空间
+  getWorkspaces: () => ipcRenderer.invoke(IPC.WorkspacesGet),
+  saveWorkspaces: (file: WorkspacesFile) => ipcRenderer.invoke(IPC.WorkspacesSave, file),
+  openDirDialog: (defaultPath?: string) => ipcRenderer.invoke(IPC.DialogOpenDir, defaultPath),
+
+  // 模型配置：读写 omp 原生 ~/.omp/agent/models.yml
+  readModelsConfig: () => ipcRenderer.invoke(IPC.OmpModelsRead),
+  writeOmpProvider: (id: string, cfg: OmpProviderConfig) =>
+    ipcRenderer.invoke(IPC.OmpModelsWriteProvider, id, cfg),
+  deleteOmpProvider: (id: string) => ipcRenderer.invoke(IPC.OmpModelsDeleteProvider, id),
+
+  // 自定义标题栏窗口控制（Windows frameless 模式）
+  minimizeWindow: () => ipcRenderer.invoke(IPC.WindowMinimize),
+  maximizeWindow: () => ipcRenderer.invoke(IPC.WindowMaximize),
+  closeWindow: () => ipcRenderer.invoke(IPC.WindowClose),
+  isWindowMaximized: () => ipcRenderer.invoke(IPC.WindowIsMaximized),
+  onWindowMaximizedChange: (cb) => subscribe<boolean>(IPC.WindowMaximizedChange, cb),
+
+  // 自定义标题栏菜单动作
+  menuReload: () => ipcRenderer.invoke(IPC.MenuReload),
+  menuForceReload: () => ipcRenderer.invoke(IPC.MenuForceReload),
+  menuToggleDevTools: () => ipcRenderer.invoke(IPC.MenuToggleDevTools),
+  menuResetZoom: () => ipcRenderer.invoke(IPC.MenuResetZoom),
+  menuZoomIn: () => ipcRenderer.invoke(IPC.MenuZoomIn),
+  menuZoomOut: () => ipcRenderer.invoke(IPC.MenuZoomOut),
+  menuToggleFullscreen: () => ipcRenderer.invoke(IPC.MenuToggleFullscreen),
+  menuShowAbout: () => ipcRenderer.invoke(IPC.MenuShowAbout),
+};
+
+contextBridge.exposeInMainWorld('omp', api);

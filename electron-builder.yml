@@ -1,0 +1,20 @@
+appId: com.ompgui.app
+productName: OMP Codex
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**
+  - package.json
+win:
+  target:
+    - target: portable
+      arch: [x64]
+  artifactName: ${productName}-${version}-portable.${ext}
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: ${productName}-Setup-${version}.${ext}
+asar: true

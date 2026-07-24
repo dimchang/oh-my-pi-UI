@@ -1,0 +1,732 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import { useApp, type UiRequest } from './store';
+import { rpc } from './rpc-client';
+import { ChatView } from './components/ChatView';
+import { SkillsPanel } from './components/SkillsPanel';
+import { InputBox } from './components/InputBox';
+import { WorkspaceList } from './components/WorkspaceList';
+import { ModelPicker } from './components/ModelPicker';
+import { PermissionPicker } from './components/PermissionPicker';
+import { ThinkingPicker } from './components/ThinkingPicker';
+import { StatusBar } from './components/StatusBar';
+import { PermissionModal } from './components/PermissionModal';
+import { FileTree } from './components/FileTree';
+import { TitleBar } from './components/TitleBar';
+import { TodoPanel } from './components/TodoPanel';
+import { SettingsPanel } from './components/SettingsPanel';
+import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
+import type { OmpFrame, RpcExtensionUIRequest, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
+import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
+
+export default function App(): React.ReactElement {
+  const ready = useApp((s) => s.ready);
+  const exited = useApp((s) => s.ompExited);
+  const uiQueue = useApp((s) => s.uiQueue);
+  const rightPanel = useApp((s) => s.rightPanel);
+  const mainView = useApp((s) => s.mainView);
+  const [toasts, setToasts] = useState<Array<{ id: number; text: string; level: string }>>([]);
+
+  const pushToast = useCallback((text: string, level = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts((t) => [...t, { id, text, level }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5000);
+  }, []);
+
+  const togglePanel = useCallback((panel: 'files' | 'diff' | 'todo') => {
+    const st = useApp.getState();
+    st.setState({ rightPanel: st.rightPanel === panel ? 'off' : panel });
+  }, []);
+
+  /** 刷新某会话进程的状态栏（model/thinkingLevel/contextUsage 等）。
+   *  多进程下这些是 per-session 的，所以必须带 sessionPath 路由。 */
+  const refreshState = useCallback((sessionPath?: string): Promise<void> => {
+    const sp = sessionPath ?? useApp.getState().currentSessionPath;
+    if (!sp) return Promise.resolve();
+    return rpc.getState(sp).then((r) => {
+      if (r.success && r.data) {
+        const d = r.data as RpcSessionState;
+        const isCurrent = sp === useApp.getState().currentSessionPath;
+        useApp.getState().setState({
+          ...(isCurrent ? {
+            model: d.model,
+            thinkingLevel: d.thinkingLevel,
+            contextUsage: d.contextUsage,
+            sessionId: d.sessionId,
+            todoPhases: d.todoPhases ?? [],
+            isCompacting: d.isCompacting ?? false,
+          } : {}),
+          // isStreaming/isAborting 改由 procStateMap 驱动，这里不覆写
+        });
+        // 持久化的 lastModel 跟 omp 当前 model 不一致 → 自动恢复
+        const last = useApp.getState().lastModel;
+        if (last && (!d.model || d.model.provider !== last.provider || d.model.id !== last.id)) {
+          void rpc.setModel(sp, last.provider, last.id).then((sr) => {
+            if (sr.success && sr.data && sp === useApp.getState().currentSessionPath) {
+              useApp.getState().setState({ model: sr.data as ModelInfo });
+            }
+          }).catch(() => undefined);
+        }
+      }
+    }).catch(() => undefined);
+  }, []);
+
+  const refreshSessions = useCallback((): Promise<void> => {
+    return window.omp.listSessions()
+      .then((list) => useApp.getState().setSessions(list))
+      .catch(() => undefined);
+  }, []);
+
+  /** 拉取某会话进程的可用技能 / 命令列表。 */
+  const refreshCommands = useCallback((sessionPath: string): void => {
+    void rpc.getAvailableCommands(sessionPath).then((r) => {
+      if (r.success && r.data) {
+        const cmds = r.data.commands;
+        if (Array.isArray(cmds) && cmds.length > 0) {
+          useApp.getState().setState({ slashCommands: cmds as SlashCommand[] });
+        }
+      }
+    }).catch(() => undefined);
+  }, []);
+
+  /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
+   *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
+   *  关键：omp 进程运行期间不写文件，只有首条消息完成后才落盘（probe 实测）。 */
+  const migrateTempSession = useCallback(() => {
+    const st = useApp.getState();
+    const cur = st.currentSessionPath;
+    if (!cur || !cur.startsWith('__new_')) return;
+    const cwd = st.currentWorkspace()?.cwd;
+    if (!cwd) return;
+    const newest = st.sessions
+      .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
+      .sort((a, b) => b.mtime - a.mtime)[0];
+    if (!newest || newest.path === cur) return;
+    const buf = st.sessionsMap[cur];
+    const ps = st.procStateMap[cur];
+    const sessionsMap = { ...st.sessionsMap };
+    delete sessionsMap[cur];
+    if (buf) sessionsMap[newest.path] = buf;
+    const procStateMap = { ...st.procStateMap };
+    delete procStateMap[cur];
+    if (ps) procStateMap[newest.path] = ps;
+    st.setState({ sessionsMap, procStateMap, currentSessionPath: newest.path });
+    void rpc.renameKey(cur, newest.path);
+  }, []);
+
+  /** 新建会话后：设为 current + 清缓冲 + 刷新列表/状态。newSessionForCwd 已返回新 path。 */
+  const resolveAndSelectNewSession = useCallback(async (newSessionPath: string): Promise<void> => {
+    useApp.getState().setCurrentSessionPath(newSessionPath);
+    useApp.getState().setProcState(newSessionPath, { status: 'online' });
+    useApp.getState().resetChat();
+    await refreshSessions();
+    await refreshState(newSessionPath);
+  }, [refreshSessions, refreshState]);
+
+  /** 加载 workspaces 文件并补全"扫盘发现的但 store 里没有"的工作空间。 */
+  const loadAndReconcileWorkspaces = useCallback((): void => {
+    void window.omp.getWorkspaces().then((file) => {
+      useApp.getState().setWorkspacesFile(file);
+      const st = useApp.getState();
+      const sessions = st.sessions;
+      const existingCwds = new Set(st.workspaces.map((w) => cwdKey(w.cwd)));
+      const archivedCwds = new Set(st.archived.map((w) => cwdKey(w.cwd)));
+      const removed = new Set(st.removedCwds.map(cwdKey));
+      let dirty = false;
+      for (const s of sessions) {
+        const key = cwdKey(s.cwd);
+        if (existingCwds.has(key)) continue;
+        if (archivedCwds.has(key) || removed.has(key)) continue;
+        useApp.getState().upsertWorkspace({
+          id: key,
+          cwd: s.cwd,
+          displayName: basename(s.cwd),
+          collapsed: false,
+          createdAt: Date.now(),
+        });
+        existingCwds.add(key);
+        dirty = true;
+      }
+      if (dirty) useApp.getState().persistWorkspaces();
+    }).catch(() => undefined);
+  }, []);
+
+  // ---- omp 帧订阅（多进程：每帧带 __sessionPath 路由）----
+  useEffect(() => {
+    const offEvent = window.omp.onEvent((frame: OmpFrame & { __sessionPath?: string }) => {
+      const f = frame as { type?: string; __sessionPath?: string };
+      const sp = f.__sessionPath;
+      const st = useApp.getState();
+
+      if (f.type === 'extension_ui_request') {
+        const req = frame as RpcExtensionUIRequest & { __sessionPath?: string };
+        handleUiRequest(req, st, pushToast);
+        return;
+      }
+      if (f.type === 'available_commands_update') {
+        st.setState({ slashCommands: (frame as AvailableCommandsUpdateFrame).commands ?? [] });
+        return;
+      }
+      if (f.type === 'notice') {
+        const n = frame as { message?: string; level?: string };
+        if (n.message) pushToast(n.message, n.level ?? 'info');
+        return;
+      }
+      if (f.type === 'thinking_level_changed') {
+        const t = frame as { thinkingLevel?: import('../shared/rpc-types').ThinkingLevel };
+        if (t.thinkingLevel && sp === useApp.getState().currentSessionPath) {
+          st.setState({ thinkingLevel: t.thinkingLevel });
+        }
+        return;
+      }
+      // 聊天流事件：按 __sessionPath 路由到对应会话缓冲
+      st.applyAgentEvent(frame as Record<string, unknown>);
+      if (f.type === 'agent_end') {
+        // omp 在 agent_end 时 flush 完整 JSONL，重新扫盘；新会话此时才落盘，迁移 tempKey→realPath
+        void refreshSessions().then(() => migrateTempSession());
+        // 仅当 agent_end 来自当前显示会话，才刷新状态栏
+        if (sp && sp === useApp.getState().currentSessionPath) {
+          void refreshState(sp);
+        }
+      }
+    });
+
+    const offReady = window.omp.onReady((sessionPath: string) => {
+      // 首次任意进程 ready → 解除"正在连接"遮罩
+      useApp.getState().setReady(true);
+      useApp.getState().setOmpExited(null);
+      useApp.getState().setProcState(sessionPath, { status: 'online' });
+      // 若 ready 的是当前显示会话，刷新状态栏 + 加载历史
+      if (sessionPath === useApp.getState().currentSessionPath) {
+        void refreshState(sessionPath).then(() => {
+          const st = useApp.getState();
+          const resumed = st.sessions.find((x) => x.id === st.sessionId);
+          if (resumed && resumed.path === sessionPath) {
+            st.loadSessionMessages(resumed.path);
+          }
+        });
+      }
+      refreshCommands(sessionPath);
+    });
+
+    const offExit = window.omp.onExit(({ sessionPath, code }) => {
+      useApp.getState().setProcState(sessionPath, { status: 'offline', isStreaming: false, isAborting: false });
+      // 仅当退出的是当前显示会话，弹"已退出"遮罩
+      if (sessionPath === useApp.getState().currentSessionPath) {
+        useApp.getState().setOmpExited(code);
+      }
+    });
+
+    const offStderr = window.omp.onStderr(({ line }) => {
+      useApp.getState().pushStderr(line);
+    });
+
+    return () => { offEvent(); offReady(); offExit(); offStderr(); };
+  }, [pushToast, refreshState, refreshSessions, refreshCommands, migrateTempSession]);
+
+  // 渲染进程挂载：加载 workspaces，完成后通知主进程 renderer 就绪（多进程下主进程不再直接起 omp）
+  const workspacesLoaded = useApp((s) => s.workspacesLoaded);
+  useEffect(() => {
+    loadAndReconcileWorkspaces();
+  }, [loadAndReconcileWorkspaces]);
+  useEffect(() => {
+    if (workspacesLoaded) {
+      const initialCwd = useApp.getState().currentWorkspace()?.cwd;
+      void window.omp.notifyReady(initialCwd);
+    }
+  }, [workspacesLoaded]);
+
+  // 启动时加载会话列表，初始化首个显示会话（取 currentWorkspace 下 mtime 最大者，懒 acquire）
+  useEffect(() => {
+    if (!workspacesLoaded) return;
+    void refreshSessions().then(() => {
+      loadAndReconcileWorkspaces();
+      const st = useApp.getState();
+      const cwd = st.currentWorkspace()?.cwd;
+      if (cwd) {
+        const newest = st.sessions
+          .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (newest) {
+          st.setCurrentSessionPath(newest.path);
+          st.loadSessionMessages(newest.path);
+          // 懒拉起该会话的进程（带 -c 续接历史）
+          const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+          void rpc.acquire(newest.path, cwd, approvalMode).catch((e) =>
+            pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
+          );
+        }
+      }
+    });
+  }, [workspacesLoaded, refreshSessions, pushToast]);
+
+  // ---- 键盘快捷键 ----
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === 't') {
+        e.preventDefault();
+        const sp = useApp.getState().currentSessionPath;
+        if (sp) void rpc.cycleThinkingLevel(sp).catch(() => undefined);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // ---- 用户操作 ----
+  const onSend = useCallback((text: string) => {
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
+    if (!sp) {
+      pushToast('请先选择一个会话', 'error');
+      return;
+    }
+    const cwd = st.currentWorkspace()?.cwd ?? '';
+    const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const doSend = async () => {
+      // 懒拉起该会话的进程（带 -c 续接）。已在线则 no-op。**不影响其他会话**。
+      await rpc.acquire(sp, cwd, approvalMode);
+      useApp.getState().appendUserMessage(text);
+      await rpc.prompt(sp, text);
+      refreshSessions();
+    };
+    void doSend().catch((err) =>
+      pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    );
+  }, [pushToast, refreshSessions]);
+
+  const onAbort = useCallback(() => {
+    const sp = useApp.getState().currentSessionPath;
+    if (!sp) return;
+    useApp.getState().setAborting(true);
+    useApp.getState().setStreaming(false);
+    void rpc.abort(sp)
+      .then(() => {
+        setTimeout(() => {
+          if (useApp.getState().isAborting) useApp.getState().setAborting(false);
+        }, 3000);
+      })
+      .catch(() => {
+        useApp.getState().setAborting(false);
+      });
+  }, []);
+
+  const onNewSession = useCallback(async (cwd?: string) => {
+    useApp.getState().setMainView('chat');
+    const st = useApp.getState();
+    const targetCwd = cwd ?? st.currentWorkspace()?.cwd;
+    if (!targetCwd) {
+      pushToast('请先选择或新建一个工作空间', 'error');
+      return;
+    }
+    const targetMode = st.workspaces.find((w) => w.cwd === targetCwd)?.approvalMode ?? 'write';
+    const target = st.workspaces.find((w) => w.cwd === targetCwd);
+    if (target && st.currentWorkspaceId !== target.id) {
+      st.setCurrentWorkspaceId(target.id);
+      st.persistWorkspaces();
+    }
+    try {
+      pushToast('正在新建会话…', 'info');
+      // 多进程：spawn 不带 -c（新 .jsonl），主进程 listSessions 解析新 path 返回
+      const { sessionPath } = await rpc.newSessionForCwd(targetCwd, targetMode);
+      await resolveAndSelectNewSession(sessionPath);
+    } catch (e) {
+      pushToast(`新建会话失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
+  }, [pushToast, resolveAndSelectNewSession]);
+
+  const onSelectSession = useCallback((s: SessionSummary) => {
+    useApp.getState().setMainView('chat');
+    const st = useApp.getState();
+    const targetKey = cwdKey(s.cwd);
+    const targetWs = st.workspaces.find((w) => cwdKey(w.cwd) === targetKey);
+    if (targetWs && st.currentWorkspaceId !== targetWs.id) {
+      st.setCurrentWorkspaceId(targetWs.id);
+      st.persistWorkspaces();
+      if (targetWs.collapsed) st.toggleWorkspaceCollapsed(targetWs.id);
+    }
+    // 多进程：切会话 = 切显示指针，**不切任何进程的 current**。
+    // 各会话独立进程，互不中断。显示该会话缓冲（或磁盘历史），同步全局 isStreaming。
+    useApp.getState().setCurrentSessionPath(s.path);
+    const stNow = useApp.getState();
+    const ps = stNow.procStateMap[s.path];
+    useApp.getState().setState({
+      messages: stNow.sessionsMap[s.path] ?? [],
+      isStreaming: ps?.isStreaming ?? false,
+      isAborting: ps?.isAborting ?? false,
+      // 切会话时清 ompExited（新会话未退出）
+      ompExited: false,
+    });
+    // 若该会话从未缓冲过，从磁盘读历史
+    if (!stNow.sessionsMap[s.path]) {
+      useApp.getState().loadSessionMessages(s.path);
+    }
+    // 若进程未在线，懒拉起（带 -c 续接，用户切来即续接，不必等发消息）
+    if (!ps || ps.status !== 'online') {
+      const approvalMode = targetWs?.approvalMode ?? 'write';
+      void rpc.acquire(s.path, s.cwd, approvalMode).catch((e) =>
+        pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
+      );
+    } else if (s.path === useApp.getState().currentSessionPath) {
+      // 已在线：刷新状态栏（model/thinking 等可能与其他会话不同）
+      void refreshState(s.path);
+    }
+  }, [pushToast, refreshState]);
+
+  const onDeleteSession = useCallback((s: SessionSummary) => {
+    // 删除会话：先释放该会话的进程（避免占用池），再删磁盘文件
+    void rpc.release(s.path).catch(() => undefined);
+    void window.omp.deleteSession(s.path).then(refreshSessions).catch(() => undefined);
+  }, [refreshSessions]);
+
+  // ---- 会话右键操作（透传给 SessionList）----
+  const onRenameSession = useCallback((s: SessionSummary) => {
+    const name = window.prompt('新名称', s.title);
+    if (name && name.trim()) {
+      const sp = useApp.getState().currentSessionPath ?? s.path;
+      void rpc.setSessionName(sp, name.trim()).then(() => {
+        refreshSessions();
+      }).catch(() => undefined);
+    }
+  }, [refreshSessions]);
+
+  const onBranchSession = useCallback((s: SessionSummary) => {
+    useApp.getState().setMainView('chat');
+    void window.omp.getSessionUserEntries(s.path).then((entries) => {
+      if (entries.length === 0) {
+        pushToast('该会话没有可用的分叉点（无 user 消息）', 'error');
+        return;
+      }
+      const entryId = entries[entries.length - 1].id;
+      const approvalMode = useApp.getState().workspaces.find((w) => cwdKey(w.cwd) === cwdKey(s.cwd))?.approvalMode ?? 'write';
+      // 拉起该会话的进程（branch 作用于该进程的 current = s.path），不调 switchSession
+      void rpc.acquire(s.path, s.cwd, approvalMode).then(() => {
+        void rpc.branch(s.path, entryId).then((r) => {
+          if (r.success && r.data) {
+            const d = r.data as { text?: string; cancelled?: boolean };
+            if (d.cancelled) { pushToast('分叉已取消', 'info'); return; }
+            if (d.text) useApp.getState().setDraftInput(d.text);
+            useApp.getState().setCurrentSessionPath(s.path);
+            void refreshSessions();
+            useApp.getState().loadSessionMessages(s.path);
+            pushToast('分叉成功，可编辑消息后重新发送', 'info');
+          } else {
+            pushToast(`分叉失败：${r.error ?? '未知错误'}`, 'error');
+          }
+        }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+      }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+    }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+  }, [pushToast, refreshSessions]);
+
+  const onCopySessionId = useCallback((s: SessionSummary) => {
+    void window.omp.copyText(s.id)
+      .then(() => pushToast(`已复制 Session ID：${s.id}`, 'info'))
+      .catch(() => pushToast('复制失败', 'error'));
+  }, [pushToast]);
+
+  const onOpenSessionDir = useCallback((s: SessionSummary) => {
+    void window.omp.showItemInFolder(s.path)
+      .catch((e) => pushToast(`打开目录失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+  }, [pushToast]);
+
+  const onExportSession = useCallback(async (s: SessionSummary) => {
+    try {
+      const savePath = await window.omp.showSaveDialog(`${s.title.replace(/[/\\?%*:|"<>]/g, '_')}.html`);
+      if (!savePath) return;
+      const approvalMode = useApp.getState().workspaces.find((w) => cwdKey(w.cwd) === cwdKey(s.cwd))?.approvalMode ?? 'write';
+      // 拉起该会话进程，export_html 作用于该进程的 current = s.path
+      await rpc.acquire(s.path, s.cwd, approvalMode);
+      const r = await rpc.exportHtml(s.path, savePath);
+      if (r.success) {
+        const d = r.data as { path?: string } | undefined;
+        pushToast(`已导出: ${d?.path ?? savePath}`, 'info');
+      } else {
+        pushToast(`导出失败: ${r.error ?? '未知错误'}`, 'error');
+      }
+    } catch (e) {
+      pushToast(`导出失败: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
+  }, [pushToast]);
+
+  // ---- M5: 工作空间操作 ----
+  const onSelectWorkspace = useCallback((ws: Workspace) => {
+    const st = useApp.getState();
+    st.setCurrentWorkspaceId(ws.id);
+    st.persistWorkspaces();
+    // 多进程：不再 restart omp。切工作空间只是 UI 高亮 + 刷新会话列表。
+    // 该工作空间下的会话按需 lazy acquire（用户点会话时拉起，各自独立进程）。
+    refreshSessions();
+  }, [refreshSessions]);
+
+  // 切换当前工作空间的权限模式：持久化 + release 该工作空间所有在线进程（下次 acquire 用新 mode spawn）。
+  const onChangeApprovalMode = useCallback((mode: ApprovalMode) => {
+    const st = useApp.getState();
+    const ws = st.currentWorkspace();
+    if (!ws) return;
+    st.setWorkspaceApprovalMode(ws.id, mode);
+    const label = mode === 'yolo' ? 'YOLO · 全自动' : mode === 'always-ask' ? 'Always Ask · 每次询问' : 'Write · 默认';
+    pushToast(`权限模式已切换为「${label}」，新会话生效`, 'info');
+    // release 该工作空间下所有在线进程，下次 acquire 用新 mode spawn
+    for (const s of st.sessions) {
+      if (cwdKey(s.cwd) === cwdKey(ws.cwd)) {
+        const ps = st.procStateMap[s.path];
+        if (ps && ps.status === 'online') {
+          void rpc.release(s.path).catch(() => undefined);
+          st.setProcState(s.path, { status: 'offline' });
+        }
+      }
+    }
+  }, [pushToast]);
+
+  const onAddWorkspace = useCallback((cwd: string) => {
+    const id = makeWorkspaceId(cwd);
+    const st = useApp.getState();
+    if (st.workspaces.some((w) => w.id === id)) {
+      const existing = st.workspaces.find((w) => w.id === id)!;
+      onSelectWorkspace(existing);
+      return;
+    }
+    if (st.archived.some((w) => w.id === id)) {
+      st.restoreWorkspace(id);
+    } else {
+      st.upsertWorkspace({
+        id,
+        cwd,
+        displayName: basename(cwd),
+        collapsed: false,
+        createdAt: Date.now(),
+        approvalMode: 'write',
+      });
+    }
+    st.persistWorkspaces();
+    void onNewSession(cwd);
+  }, [onSelectWorkspace, onNewSession]);
+
+  const onRenameWorkspace = useCallback((ws: Workspace, newName: string) => {
+    useApp.getState().renameWorkspace(ws.id, newName);
+    useApp.getState().persistWorkspaces();
+  }, []);
+
+  const onArchiveWorkspace = useCallback((ws: Workspace) => {
+    const st = useApp.getState();
+    st.archiveWorkspace(ws.id);
+    st.persistWorkspaces();
+    const cur = st.currentWorkspace();
+    if (cur) {
+      onSelectWorkspace(cur);
+    } else {
+      pushToast('已归档最后一个工作空间', 'info');
+    }
+  }, [onSelectWorkspace, pushToast]);
+
+  const onRestoreWorkspace = useCallback((ws: Workspace) => {
+    const st = useApp.getState();
+    st.restoreWorkspace(ws.id);
+    st.persistWorkspaces();
+    onSelectWorkspace(ws);
+  }, [onSelectWorkspace, pushToast]);
+
+  const onDeleteArchivedWorkspace = useCallback(async (ws: Workspace) => {
+    try {
+      const sessions = await window.omp.listSessions(ws.cwd);
+      for (const s of sessions) {
+        await rpc.release(s.path).catch(() => undefined);
+        await window.omp.deleteSession(s.path).catch(() => undefined);
+      }
+    } catch {
+      /* 列表失败也无妨，继续删除归档记录 */
+    }
+    const st = useApp.getState();
+    st.deleteArchivedWorkspace(ws.id);
+    st.persistWorkspaces();
+    void refreshSessions();
+    pushToast(`已彻底删除「${ws.displayName}」及其会话记录`, 'info');
+  }, [pushToast, refreshSessions]);
+
+  const onToggleCollapsed = useCallback((ws: Workspace) => {
+    useApp.getState().toggleWorkspaceCollapsed(ws.id);
+    useApp.getState().persistWorkspaces();
+  }, []);
+
+  const currentUi = uiQueue[0];
+  const currentSessionPath = useApp((s) => s.currentSessionPath);
+  const sessions = useApp((s) => s.sessions);
+
+  const showTitleBar = window.omp.platform === 'win32';
+
+  return (
+    <div className={`app ${showTitleBar ? 'custom-titlebar' : ''}`}>
+      {showTitleBar && <TitleBar />}
+      <div className="app-body">
+        <WorkspaceList
+          allSessions={sessions}
+          currentSessionPath={currentSessionPath}
+          onSelectWorkspace={onSelectWorkspace}
+          onAddWorkspace={onAddWorkspace}
+          onRenameWorkspace={onRenameWorkspace}
+          onArchiveWorkspace={onArchiveWorkspace}
+          onRestoreWorkspace={onRestoreWorkspace}
+          onDeleteArchivedWorkspace={onDeleteArchivedWorkspace}
+          onToggleCollapsed={onToggleCollapsed}
+          onSelectSession={onSelectSession}
+          onRenameSession={onRenameSession}
+          onBranchSession={onBranchSession}
+          onExportSession={onExportSession}
+          onDeleteSession={onDeleteSession}
+          onCopySessionId={onCopySessionId}
+          onOpenSessionDir={onOpenSessionDir}
+          onNewSession={onNewSession}
+        />
+        <div className="main">
+        <div className="topbar">
+          <span className="topbar-title">OMP · Codex</span>
+          <div className="topbar-actions">
+            <button
+              className={`icon-btn ${rightPanel === 'files' ? 'active' : ''}`}
+              onClick={() => togglePanel('files')}
+              title="文件树"
+            >
+              📁
+            </button>
+            <button
+              className={`icon-btn ${rightPanel === 'diff' ? 'active' : ''}`}
+              onClick={() => togglePanel('diff')}
+              title="Diff 面板"
+            >
+              ⇔
+            </button>
+            <button
+              className={`icon-btn ${rightPanel === 'todo' ? 'active' : ''}`}
+              onClick={() => togglePanel('todo')}
+              title="Todo 列表"
+            >
+              ☑
+            </button>
+            <ThinkingPicker />
+            <PermissionPicker onChange={onChangeApprovalMode} />
+            <ModelPicker />
+          </div>
+        </div>
+        {mainView === 'skills' ? (
+          <SkillsPanel />
+        ) : (
+          <>
+            <ChatView />
+            <InputBox onSend={onSend} onAbort={onAbort} />
+            <StatusBar />
+          </>
+        )}
+      </div>
+
+      {/* 右栏面板 */}
+      {rightPanel !== 'off' && (
+        <div className="right-panel">
+          {rightPanel === 'files' && <FileTree cwd={getWorkDir()} />}
+          {rightPanel === 'diff' && (
+            <div className="diff-panel">
+              <div className="panel-header"><span>Diff</span></div>
+              <div className="panel-empty">点击工具卡中的文件变更以查看 diff</div>
+            </div>
+          )}
+          {rightPanel === 'todo' && <TodoPanel />}
+        </div>
+      )}
+      </div>
+
+      <SettingsPanel />
+
+      {currentUi && (
+        <PermissionModal
+          req={currentUi}
+          key={currentUi.id}
+        />
+      )}
+
+      <div className="toasts">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.level}`}>{t.text}</div>
+        ))}
+      </div>
+
+      {exited !== false && exited !== null && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-title">当前会话进程已退出</div>
+            <div className="modal-message">该会话的 omp 子进程退出（退出码 {exited}）。切换到其他会话可继续，或重新进入该会话会自动重新拉起。</div>
+          </div>
+        </div>
+      )}
+      {!ready && exited === false && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-title">正在连接 omp…</div>
+            <div className="modal-message">等待首个会话进程拉起（ready）。若长时间无响应，请检查 omp 路径配置。</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 process.cwd 兜底。 */
+function getWorkDir(): string {
+  const ws = useApp.getState().currentWorkspace();
+  if (ws?.cwd) return ws.cwd;
+  return process.cwd?.() ?? '';
+}
+
+/** 处理 extension_ui_request：需应答的入队（带 __sessionPath），单向的直接执行，cancel 的关对应 */
+function handleUiRequest(
+  req: RpcExtensionUIRequest & { __sessionPath?: string },
+  st: ReturnType<typeof useApp.getState>,
+  pushToast: (t: string, l?: string) => void,
+): void {
+  const method = req.method;
+
+  if (method === 'notify') {
+    pushToast(req.text ?? req.message ?? '', req.level ?? 'info');
+    return;
+  }
+  if (method === 'setWidget' || method === 'setTitle' || method === 'setStatus' || method === 'set_editor_text') {
+    return;
+  }
+  if (method === 'open_url') {
+    const url = req.launchUrl ?? req.url;
+    if (url) void window.omp.openExternal(url);
+    st.enqueueUi(toUiRequest(req));
+    return;
+  }
+  if (method === 'cancel') {
+    const target = req.targetId ?? req.id;
+    st.dequeueUi(target);
+    st.dequeueUi(req.id);
+    return;
+  }
+
+  if (method === 'confirm' || method === 'select' || method === 'input' || method === 'editor') {
+    st.enqueueUi(toUiRequest(req));
+    return;
+  }
+}
+
+function toUiRequest(req: RpcExtensionUIRequest & { __sessionPath?: string }): UiRequest {
+  return {
+    id: req.id,
+    method: req.method,
+    title: req.title,
+    message: req.message,
+    prompt: req.prompt,
+    options: req.options,
+    defaultValue: req.defaultValue,
+    placeholder: req.placeholder,
+    url: req.url,
+    launchUrl: req.launchUrl,
+    text: req.text,
+    level: req.level,
+    targetId: req.targetId,
+    sessionPath: req.__sessionPath,
+    raw: req,
+  };
+}
+
+// process polyfill for renderer
+const process = { cwd: () => { try { return (window as unknown as { __CWD__?: string }).__CWD__ ?? ''; } catch { return ''; } } };
