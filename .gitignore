@@ -40,4 +40,4 @@ Thumbs.db
 probe-omp.mjs
 
 # ===== Local sync helper (hardcodes /d/code/OMP-github path; not for public repo) =====
-/sync-to-github.sh
+/sync-to-github.ps1
