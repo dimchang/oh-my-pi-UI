@@ -26,6 +26,8 @@ jobs:
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
+    permissions:
+      contents: write   # 创建 GitHub Release 需要写权限（GITHUB_TOKEN 默认只有 read）
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
