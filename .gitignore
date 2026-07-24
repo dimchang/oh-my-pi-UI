@@ -38,3 +38,6 @@ Thumbs.db
 
 # ===== One-off debug probe (hardcodes local paths) =====
 probe-omp.mjs
+
+# ===== Local sync helper (hardcodes /d/code/OMP-github path; not for public repo) =====
+/sync-to-github.sh
