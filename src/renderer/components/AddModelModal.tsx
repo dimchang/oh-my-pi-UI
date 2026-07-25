@@ -16,6 +16,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
+import { cwdKey } from '../utils/path-key';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpProviderConfig } from '../../shared/ipc-channels';
 
@@ -223,11 +224,26 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     return cfg;
   }, [baseUrl, api, name, apiKey, parsedManualIds]);
 
-  /** 写 models.yml（多进程：新 acquire 的进程会读新配置，无需全局重启） */
+  /** 写 models.yml + 重载当前会话进程。
+   *  omp 的 ModelRegistry 只在进程启动时加载 models.yml，已在线进程看不到新 provider，
+   *  不重载的话 pollModels 查旧进程 registry 会永远轮到空列表（表现为"获取失败"）。
+   *  → 写盘后对当前会话进程 evict + 重新 acquire（-r 续接同一 JSONL），新进程即含新 provider。 */
   const writeAndRestart = useCallback(async (cfg: OmpProviderConfig) => {
     await window.omp.writeOmpProvider(pid.trim(), cfg);
-    // models.yml 已写入磁盘；后续 lazy acquire 的新进程会读到新 provider。
-    // 已在线的进程不重读（omp 启动时加载）；如需立即生效切回该会话触发重新 acquire。
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
+    // temp 新会话（__new_）尚未落盘，无法用 -r 续接，跳过重载（轮询将靠手动 ID fallback）
+    if (!sp || sp.startsWith('__new_')) return;
+    // 正在生成中不打断（evict 会杀掉进行中的 agent run）
+    if (st.procStateMap[sp]?.isStreaming) return;
+    const sess = st.sessions.find((x) => x.path === sp);
+    const cwd = sess?.cwd ?? st.currentWorkspace()?.cwd ?? '';
+    if (!cwd) return;
+    const approvalMode = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(cwd))?.approvalMode ?? 'write';
+    try {
+      await rpc.release(sp);                 // 杀旧进程（onExit 会短暂置 offline，onReady 恢复）
+      await rpc.acquire(sp, cwd, approvalMode); // -r 续接同一会话文件，重读 models.yml
+    } catch { /* 重载失败不阻塞保存流程；用户可在第 2 步点「重试获取」 */ }
   }, [pid]);
 
   /** 轮询 getAvailableModels 获取新 provider 的模型 */
