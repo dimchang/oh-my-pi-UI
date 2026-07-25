@@ -66,38 +66,9 @@ export function TitleBar(): React.ReactElement | null {
 
   const menus: MenuDef[] = [
     {
-      label: 'File',
-      items: [
-        { label: '退出 OMP', action: () => window.omp.closeWindow() },
-      ],
-    },
-    {
-      label: 'Edit',
-      items: [
-        { label: '剪切', action: () => document.execCommand('cut') },
-        { label: '复制', action: () => document.execCommand('copy') },
-        { label: '粘贴', action: () => document.execCommand('paste') },
-        { label: '全选', action: () => document.execCommand('selectAll') },
-      ],
-    },
-    {
-      label: 'View',
-      items: [
-        { label: '重新加载', action: () => window.omp.menuReload() },
-        { label: '强制重新加载', action: () => window.omp.menuForceReload() },
-        { separator: true, label: '' },
-        { label: '切换开发者工具', action: () => window.omp.menuToggleDevTools() },
-        { separator: true, label: '' },
-        { label: '实际大小', action: () => window.omp.menuResetZoom() },
-        { label: '放大', action: () => window.omp.menuZoomIn() },
-        { label: '缩小', action: () => window.omp.menuZoomOut() },
-        { separator: true, label: '' },
-        { label: '切换全屏', action: () => window.omp.menuToggleFullscreen() },
-      ],
-    },
-    {
       label: 'Window',
       items: [
+        { label: '切换开发者工具', action: () => window.omp.menuToggleDevTools() },
         { label: '设置', action: () => useApp.getState().setSettingsOpen(true) },
       ],
     },
