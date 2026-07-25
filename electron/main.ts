@@ -110,6 +110,9 @@ function loadWorkspacesFile(): WorkspacesFile {
       appearance: parsed.appearance && typeof parsed.appearance === 'object'
         ? (parsed.appearance as WorkspacesFile['appearance'])
         : undefined,
+      // 注意：本函数是"白名单式重建对象"，saveWorkspacesFile 里新增的字段必须在这里同步补上，
+      // 否则该字段会在下次启动被剥掉、随后任意一次 persist 被永久抹掉（hooks 曾踩此坑）。
+      hooks: Array.isArray(parsed.hooks) ? (parsed.hooks as WorkspacesFile['hooks']) : undefined,
     };
   } catch { return emptyWorkspacesFile(); }
 }
@@ -426,7 +429,7 @@ app.whenReady().then(() => {
 
   registerIpc();
   createWindow();
-  if (!USE_CUSTOM_TITLE_BAR) buildAppMenu();
+  buildAppMenu();
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
@@ -435,10 +438,15 @@ function buildAppMenu(): void {
   const isMac = process.platform === 'darwin';
   const template: MenuItemConstructorOptions[] = [
     ...(isMac ? ([{ role: 'appMenu' }] as MenuItemConstructorOptions[]) : []),
-    { label: 'File', submenu: [isMac ? { role: 'close' } : { role: 'quit' }] },
-    { role: 'editMenu' },
-    { label: 'View', submenu: [{ role: 'reload' }, { role: 'forceReload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
-    { role: 'windowMenu' },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'close' },
+        { type: 'separator' },
+        { role: 'toggleDevTools' },
+      ],
+    },
     { role: 'help', label: 'Help', submenu: [{ label: '关于 OMP UI', click: () => showAboutDialog() }] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
