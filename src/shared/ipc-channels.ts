@@ -56,6 +56,15 @@ export const IPC = {
   OmpExit: 'omp:exit', // ({ sessionPath: string; code: number | null }) — 某会话进程退出
   OmpStderr: 'omp:stderr', // ({ sessionPath: string; line: string })
   OmpNotFound: 'omp:not-found', // (message: string) — omp 未找到时通知渲染进程
+
+  // 钩子（Hooks）管理
+  OmpPickHookFiles: 'omp:pick-hook-files', // () => Promise<string[] | null> — 选择钩子 .ts 文件（多选）
+  OmpParseHookFiles: 'omp:parse-hook-files', // (paths: string[]) => Promise<HookFileInfo[]> — 静态解析钩子文件导出/事件
+
+  // 自定义 CSS 导入
+  OmpPickCssFile: 'omp:pick-css-file', // () => Promise<string | null> — 选择 .css 文件（单选）
+  OmpReadCssFile: 'omp:read-css-file', // (path: string) => Promise<{ content: string; error?: string }> — 读取 CSS 文件内容
+  OmpSyncCustomCss: 'omp:sync-custom-css', // (list: CustomCssConfig[]) => Promise<{ error?: string }> — 同步自定义 CSS 到 styles.css
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -102,6 +111,79 @@ export interface Workspace {
   approvalMode?: ApprovalMode;
 }
 
+/** 外观（系统风格）配置：由设置页写入，applyAppearance 注入为 :root 上的 CSS 变量。 */
+export interface AppearanceConfig {
+  /** 配色模式：system=跟随系统；light=浅色；dark=深色 */
+  mode?: 'system' | 'light' | 'dark';
+  /** 主字体（CSS font-family 字符串；留空=用主题默认） */
+  fontFamily?: string;
+  /** 字号（px） */
+  fontSize?: number;
+  /** 背景颜色（任意 CSS 颜色；留空=用主题默认） */
+  bgColor?: string;
+  /** 强调色（任意 CSS 颜色；留空=用主题默认） */
+  accentColor?: string;
+  /** 用户从 .css 文件导入的自定义样式（可多份，按顺序注入到 <head>，覆盖默认主题）。 */
+  customCss?: CustomCssConfig[];
+}
+
+/** 用户导入的自定义 CSS 配置（持久化到 workspaces.json，并通过 syncCustomCss 写入 styles.css）。
+ *  - embed：把源文件内容直接写入 styles.css 尾部；
+ *  - link：在 styles.css 顶部插入 @import url("file://...")。
+ *  禁用/移除时同步从 styles.css 中删除对应区块。 */
+export interface CustomCssConfig {
+  /** 唯一标识（用于在 styles.css 中标记区块） */
+  id: string;
+  /** 源文件绝对路径 */
+  path: string;
+  /** 导入方式：embed=内容写入 styles.css；link=styles.css 通过 @import 链接该文件 */
+  mode: 'embed' | 'link';
+  /** 是否启用（关闭时 styles.css 中不会保留该区块） */
+  enabled: boolean;
+  /** 展示名（一般是文件名 basename） */
+  name?: string;
+  /** @deprecated 旧版 embed 模式将内容保存在配置里；新版已迁移到 styles.css，此字段保留仅为兼容旧数据。 */
+  content?: string;
+}
+
+/** 钩子文件解析结果（主进程静态解析后回传渲染进程）。
+ *  omp 钩子 = 一个 .ts 文件，含 `export default function (pi: HookAPI) { pi.on(...) }`。
+ *  也支持多单元：文件用多个具名导出（export function hookA / export const hookB = ...）。 */
+export interface HookFileInfo {
+  /** 文件绝对路径 */
+  path: string;
+  /** 是否有默认导出（omp 钩子入口）。有 → 整文件是一个钩子（fileLevel）。 */
+  hasDefault: boolean;
+  /** 具名导出的函数/常量名（可能是多个钩子） */
+  namedHooks: string[];
+  /** 文件里 pi.on("event", ...) 订阅的事件名（仅展示用） */
+  events: string[];
+  /** 读取/解析失败时的错误信息 */
+  error?: string;
+}
+
+/** 钩子单元：UI 展示 + 启用开关的最小单位 */
+export interface HookUnit {
+  /** fileLevel=true 时 = 文件名；否则 = 具名导出名 */
+  name: string;
+  /** true=整文件默认导出（一个钩子，开关=是否加载该文件）；false=具名导出（多单元之一） */
+  fileLevel: boolean;
+  /** pi.on 事件名（展示用；多单元文件无法细分到具体单元） */
+  events?: string[];
+}
+
+/** 一个钩子文件的配置（持久化到 workspaces.json） */
+export interface HookFileConfig {
+  /** 文件绝对路径 */
+  path: string;
+  /** 是否启用（master 开关） */
+  enabled: boolean;
+  /** 解析出的钩子单元（导入时由主进程解析结果填充，存盘保留便于直接渲染） */
+  units: HookUnit[];
+  /** 多单元文件：被启用的单元名列表（fileLevel 文件忽略）。省略=全部启用。 */
+  enabledUnits?: string[];
+}
+
 /** 持久化到 userData/workspaces.json 的完整文件结构 */
 export interface WorkspacesFile {
   /** 版本号，便于未来迁移 */
@@ -122,6 +204,14 @@ export interface WorkspacesFile {
    *  undefined 或空数组 = 未配置过 → ModelPicker 显示全部模型；
    *  非空 = 只显示白名单里的模型（当前正在用的模型始终显示，避免"选中的被藏"）。 */
   enabledModels?: string[];
+  /** 系统提示词：新建会话时通过 --append-system-prompt 注入到 omp 进程。
+   *  仅作用于"新开"的会话（acquireNew），续接/恢复的历史会话不重新注入。 */
+  systemPrompt?: string;
+  /** 外观（系统风格）配置：配色模式 / 字体 / 字号 / 背景色 / 强调色。 */
+  appearance?: AppearanceConfig;
+  /** 钩子（Hooks）配置：导入的 .ts 钩子文件列表，含每个文件的启用状态与单元开关。
+   *  启动时按启用集合向 omp 进程追加 --hook=<path>（多单元文件会生成过滤后的包装文件）。 */
+  hooks?: HookFileConfig[];
 }
 
 // ---- 模型配置：omp 原生 ~/.omp/agent/models.yml ----
@@ -224,4 +314,16 @@ export interface OmpApi {
   menuZoomOut(): Promise<void>;
   menuToggleFullscreen(): Promise<void>;
   menuShowAbout(): Promise<void>;
+
+  // 钩子（Hooks）管理
+  pickHookFiles(): Promise<string[] | null>;
+  parseHookFiles(paths: string[]): Promise<HookFileInfo[]>;
+
+  // 自定义 CSS 导入
+  /** 弹出文件选择框选一个 .css 文件，返回绝对路径（取消返回 null） */
+  pickCssFile(): Promise<string | null>;
+  /** 读取指定 CSS 文件内容 */
+  readCssFile(path: string): Promise<{ content: string; error?: string }>;
+  /** 把当前自定义 CSS 列表同步到 styles.css（embed=写入内容；link=顶部 @import；禁用项移除） */
+  syncCustomCss(list: CustomCssConfig[]): Promise<{ error?: string }>;
 }

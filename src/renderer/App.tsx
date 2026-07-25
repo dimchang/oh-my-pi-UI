@@ -15,6 +15,7 @@ import { TitleBar } from './components/TitleBar';
 import { TodoPanel } from './components/TodoPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
+import { applyAppearance, syncCustomCss } from './store';
 import type { OmpFrame, RpcExtensionUIRequest, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
 
@@ -24,12 +25,11 @@ export default function App(): React.ReactElement {
   const uiQueue = useApp((s) => s.uiQueue);
   const rightPanel = useApp((s) => s.rightPanel);
   const mainView = useApp((s) => s.mainView);
-  const [toasts, setToasts] = useState<Array<{ id: number; text: string; level: string }>>([]);
+  const toasts = useApp((s) => s.toasts);
 
+  // 全局 toast 改为走 store（pushToast 在 rpc-client / PermissionModal 等任意组件可用）。
   const pushToast = useCallback((text: string, level = 'info') => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, text, level }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5000);
+    useApp.getState().pushToast(text, level);
   }, []);
 
   const togglePanel = useCallback((panel: 'files' | 'diff' | 'todo') => {
@@ -109,7 +109,13 @@ export default function App(): React.ReactElement {
     const procStateMap = { ...st.procStateMap };
     delete procStateMap[cur];
     if (ps) procStateMap[newest.path] = ps;
-    st.setState({ sessionsMap, procStateMap, currentSessionPath: newest.path });
+    // 关键：pending UI 请求（如工具确认弹窗）也带着旧 __new_ temp key，
+    // 若不重定向会指向已离线的旧进程 → 用户点确认报 "omp process not online"。
+    // 这里把 uiQueue 里 sessionPath===cur 的请求一并改到真实 path（主进程 renameKey 已同步迁移 pin）。
+    const uiQueue = st.uiQueue.map((q) =>
+      q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
+    );
+    st.setState({ sessionsMap, procStateMap, currentSessionPath: newest.path, uiQueue });
     void rpc.renameKey(cur, newest.path);
   }, []);
 
@@ -126,6 +132,10 @@ export default function App(): React.ReactElement {
   const loadAndReconcileWorkspaces = useCallback((): void => {
     void window.omp.getWorkspaces().then((file) => {
       useApp.getState().setWorkspacesFile(file);
+      // 恢复上次的外观配置（背景色 / 字体 / 字号 / 配色模式）
+      applyAppearance(useApp.getState().appearance);
+      // 把自定义 CSS 列表同步到 styles.css（embed 写入内容；link 插入 @import）
+      void syncCustomCss(useApp.getState().appearance?.customCss);
       const st = useApp.getState();
       const sessions = st.sessions;
       const existingCwds = new Set(st.workspaces.map((w) => cwdKey(w.cwd)));
@@ -235,29 +245,6 @@ export default function App(): React.ReactElement {
     }
   }, [workspacesLoaded]);
 
-  // 启动时加载会话列表，初始化首个显示会话（取 currentWorkspace 下 mtime 最大者，懒 acquire）
-  useEffect(() => {
-    if (!workspacesLoaded) return;
-    void refreshSessions().then(() => {
-      loadAndReconcileWorkspaces();
-      const st = useApp.getState();
-      const cwd = st.currentWorkspace()?.cwd;
-      if (cwd) {
-        const newest = st.sessions
-          .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
-          .sort((a, b) => b.mtime - a.mtime)[0];
-        if (newest) {
-          st.setCurrentSessionPath(newest.path);
-          st.loadSessionMessages(newest.path);
-          // 懒拉起该会话的进程（带 -c 续接历史）
-          const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
-          void rpc.acquire(newest.path, cwd, approvalMode).catch((e) =>
-            pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
-          );
-        }
-      }
-    });
-  }, [workspacesLoaded, refreshSessions, pushToast]);
 
   // ---- 键盘快捷键 ----
   useEffect(() => {
@@ -333,6 +320,34 @@ export default function App(): React.ReactElement {
       pushToast(`新建会话失败：${e instanceof Error ? e.message : String(e)}`, 'error');
     }
   }, [pushToast, resolveAndSelectNewSession]);
+
+  // 启动时加载会话列表，初始化首个显示会话（取 currentWorkspace 下 mtime 最大者，懒 acquire）
+  useEffect(() => {
+    if (!workspacesLoaded) return;
+    void refreshSessions().then(() => {
+      loadAndReconcileWorkspaces();
+      const st = useApp.getState();
+      const cwd = st.currentWorkspace()?.cwd;
+      if (cwd) {
+        const newest = st.sessions
+          .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (newest) {
+          st.setCurrentSessionPath(newest.path);
+          st.loadSessionMessages(newest.path);
+          // 懒拉起该会话的进程（带 -c 续接历史）
+          const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+          void rpc.acquire(newest.path, cwd, approvalMode).catch((e) =>
+            pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
+          );
+        } else {
+          // 当前工作空间没有任何会话（例如用户手动清空了 .omp/agent/sessions）：
+          // 必须新建一个会话并拉起进程，否则 ready 永远不会变 true，UI 会卡死。
+          void onNewSession(cwd);
+        }
+      }
+    });
+  }, [workspacesLoaded, refreshSessions, pushToast, onNewSession]);
 
   const onSelectSession = useCallback((s: SessionSummary) => {
     useApp.getState().setMainView('chat');

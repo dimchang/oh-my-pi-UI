@@ -41,6 +41,21 @@ export class OmpProcessPool {
   private entries = new Map<string, PoolEntry>();
   /** 同一 sessionPath 正在 spawn 时复用同一个 Promise，避免重复拉起。 */
   private spawning = new Map<string, Promise<PoolEntry>>();
+  /** 有未应答 UI 请求（工具确认 / 选择 / 输入弹窗等）的会话 → refcount。
+   *  LRU 淘汰时跳过 pinned 会话，避免杀掉"正在等用户确认"的进程
+   *  （那种进程不输出帧，lastActiveAt 很旧，会被误判为最闲而被淘汰）。 */
+  private pinned = new Map<string, number>();
+
+  /** 标记某会话有未应答 UI 请求（防止被 LRU 淘汰）。可重复调用（refcount）。 */
+  pin(sessionPath: string): void {
+    this.pinned.set(sessionPath, (this.pinned.get(sessionPath) ?? 0) + 1);
+  }
+  /** 解除一个 UI 请求的 pin（应答后调用）。refcount 归零才真正释放。 */
+  unpin(sessionPath: string): void {
+    const n = (this.pinned.get(sessionPath) ?? 0) - 1;
+    if (n <= 0) this.pinned.delete(sessionPath);
+    else this.pinned.set(sessionPath, n);
+  }
 
   constructor(
     private ompPath: string,
@@ -78,7 +93,7 @@ export class OmpProcessPool {
    *  - 已 online → 直接返回（更新 lastActiveAt）。
    *  - 池满 → 先 LRU 淘汰最久未活跃的 idle 进程。
    *  - spawn 带 -c：resume 该 sessionPath 的历史（用户切回旧会话续接）。 */
-  async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'write'): Promise<PoolEntry> {
+  async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'write', hooks?: string[]): Promise<PoolEntry> {
     const existing = this.entries.get(sessionPath);
     if (existing && existing.status === 'online') {
       existing.lastActiveAt = Date.now();
@@ -90,7 +105,7 @@ export class OmpProcessPool {
     // 历史会话（磁盘文件存在）→ -r resume 指定文件；
     // 否则（tempKey 或文件不存在，如新建会话）→ 全新 spawn（不带 -r/-c）
     const resumePath = sessionPath && fs.existsSync(sessionPath) ? sessionPath : undefined;
-    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, resumePath);
+    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, resumePath, undefined, hooks);
     this.spawning.set(sessionPath, p);
     try {
       return await p;
@@ -100,12 +115,14 @@ export class OmpProcessPool {
   }
 
   /** 新建会话：spawn 不带 -c（开新 .jsonl），ready 后由调用方 listSessions
-   *  解析真实 path 再 renameKey(tempKey, realPath)。tempKey 用临时占位。 */
-  async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'write'): Promise<PoolEntry> {
+   *  解析真实 path 再 renameKey(tempKey, realPath)。tempKey 用临时占位。
+   *  systemPrompt 非空时通过 --append-system-prompt 注入到该新会话。
+   *  hooks 非空时逐个通过 --hook=<path> 注入（全局钩子）。 */
+  async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'write', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
     const pending = this.spawning.get(tempKey);
     if (pending) return pending;
     if (this.onlineCount() >= this.maxPool) this.evictLRU();
-    const p = this.spawnEntry(tempKey, cwd, approvalMode, /*continueSession*/ false);
+    const p = this.spawnEntry(tempKey, cwd, approvalMode, /*continueSession*/ false, undefined, systemPrompt, hooks);
     this.spawning.set(tempKey, p);
     try {
       return await p;
@@ -122,6 +139,13 @@ export class OmpProcessPool {
     this.entries.delete(oldKey);
     e.sessionPath = newKey;
     this.entries.set(newKey, e);
+    // 迁移 pin 引用：未应答 UI 请求（工具确认弹窗等）必须随会话一起转移，
+    // 否则新 key 不再被 pinned，会在用户犹豫期间被 LRU 误杀 → "omp process not online"。
+    const pc = this.pinned.get(oldKey);
+    if (pc !== undefined) {
+      this.pinned.delete(oldKey);
+      this.pinned.set(newKey, pc);
+    }
     return e;
   }
 
@@ -144,17 +168,20 @@ export class OmpProcessPool {
   evict(sessionPath: string): void {
     const e = this.entries.get(sessionPath);
     if (!e) return;
+    this.pinned.delete(sessionPath); // 释放可能的 pin（被显式 evict 的会话不再受保护）
     e.status = 'evicted';
     e.router.rejectAll('evicted by pool');
     try { e.proc.kill(); } catch { /* noop */ }
     this.entries.delete(sessionPath);
   }
 
-  /** LRU 淘汰：找 lastActiveAt 最小的 online 进程杀掉。不淘汰 spawning 状态的。 */
+  /** LRU 淘汰：找 lastActiveAt 最小的 online 进程杀掉。不淘汰 spawning 状态的，
+   *  也不淘汰有未应答 UI 请求（pinned）的会话——那种会话正等用户确认，杀掉会让弹窗失效。 */
   private evictLRU(): void {
     let victim: PoolEntry | undefined;
     for (const e of this.entries.values()) {
       if (e.status !== 'online') continue;
+      if (this.pinned.has(e.sessionPath)) continue; // 有未应答 UI 请求 → 禁止淘汰
       if (!victim || e.lastActiveAt < victim.lastActiveAt) victim = e;
     }
     if (victim) {
@@ -180,6 +207,8 @@ export class OmpProcessPool {
     approvalMode: ApprovalMode,
     continueSession: boolean,
     resumeSession?: string,
+    systemPrompt?: string,
+    hooks?: string[],
   ): Promise<PoolEntry> {
     return new Promise<PoolEntry>((resolve, reject) => {
       if (!fs.existsSync(cwd)) {
@@ -198,7 +227,7 @@ export class OmpProcessPool {
         }
       }, SPAWN_TIMEOUT_MS);
       const proc = new OmpProcess(
-        { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession },
+        { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession, systemPrompt, hooks },
         {
           onReady: () => {
             if (ctx.entry) ctx.entry.status = 'online';

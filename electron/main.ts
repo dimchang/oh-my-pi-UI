@@ -10,14 +10,14 @@ import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 import { OmpProcessPool } from './omp-pool';
 import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
 import { readModelsConfig, writeProvider, deleteProvider } from './omp-config';
 import { IPC } from '../src/shared/ipc-channels';
-import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig } from '../src/shared/ipc-channels';
+import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -106,6 +106,10 @@ function loadWorkspacesFile(): WorkspacesFile {
       enabledModels: Array.isArray(parsed.enabledModels)
         ? (parsed.enabledModels as unknown[]).filter((x): x is string => typeof x === 'string')
         : undefined,
+      systemPrompt: typeof parsed.systemPrompt === 'string' ? parsed.systemPrompt : undefined,
+      appearance: parsed.appearance && typeof parsed.appearance === 'object'
+        ? (parsed.appearance as WorkspacesFile['appearance'])
+        : undefined,
     };
   } catch { return emptyWorkspacesFile(); }
 }
@@ -150,13 +154,119 @@ function createWindow(): void {
   }
 }
 
+/** 定位 styles.css：优先开发源码路径，其次打包输出路径。 */
+function findStylesCssPath(): string | null {
+  const candidates = [
+    path.join(__dirname, '..', '..', 'src', 'renderer', 'styles.css'),
+    path.join(__dirname, '..', '..', 'out', 'renderer', 'styles.css'),
+    path.join(__dirname, '..', 'renderer', 'styles.css'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** 移除 styles.css 中所有 OMP-UI 自定义 CSS 区块。 */
+function stripCustomCssBlocks(css: string): string {
+  const lines = css.split('\n');
+  const out: string[] = [];
+  let inBlock = false;
+  let currentId: string | null = null;
+  for (const line of lines) {
+    const beginMatch = line.match(/\/\* OMP-UI-CUSTOM-CSS-BEGIN: ([\w-]+) mode=(embed|link) path="([^"]*)" \*\//);
+    if (beginMatch) {
+      inBlock = true;
+      currentId = beginMatch[1];
+      continue;
+    }
+    const endMatch = line.match(/\/\* OMP-UI-CUSTOM-CSS-END: ([\w-]+) \*\//);
+    if (endMatch && endMatch[1] === currentId) {
+      inBlock = false;
+      currentId = null;
+      continue;
+    }
+    if (!inBlock) out.push(line);
+  }
+  return out.join('\n');
+}
+
+/** 生成一个自定义 CSS 区块。 */
+function buildCustomCssBlock(c: CustomCssConfig): string | null {
+  if (c.mode === 'link') {
+    const fileUrl = pathToFileURL(c.path).href;
+    return `/* OMP-UI-CUSTOM-CSS-BEGIN: ${c.id} mode=link path="${c.path.replace(/"/g, '\\"')}" */\n@import url("${fileUrl}");\n/* OMP-UI-CUSTOM-CSS-END: ${c.id} */`;
+  }
+  try {
+    const content = fs.readFileSync(c.path, 'utf8');
+    return `/* OMP-UI-CUSTOM-CSS-BEGIN: ${c.id} mode=embed path="${c.path.replace(/"/g, '\\"')}" */\n${content}\n/* OMP-UI-CUSTOM-CSS-END: ${c.id} */`;
+  } catch {
+    return null;
+  }
+}
+
+/** 把自定义 CSS 列表同步到 styles.css。
+ *  - embed：内容追加到文件尾部；
+ *  - link：@import 插入到文件顶部（@charset 之后、其他规则之前）；
+ *  - 禁用/不存在的条目会被移除。 */
+function syncCustomCss(list: CustomCssConfig[]): { error?: string } {
+  const stylesPath = findStylesCssPath();
+  if (!stylesPath) return { error: '未找到 styles.css（开发态应为 src/renderer/styles.css，打包后应为 out/renderer/styles.css）' };
+  try {
+    let css = fs.readFileSync(stylesPath, 'utf8');
+    css = stripCustomCssBlocks(css);
+
+    const enabled = (list ?? []).filter((c) => c && c.enabled);
+    const imports: string[] = [];
+    const embeds: string[] = [];
+    for (const c of enabled) {
+      const block = buildCustomCssBlock(c);
+      if (!block) continue;
+      if (c.mode === 'link') imports.push(block);
+      else embeds.push(block);
+    }
+
+    // 把 link 的 @import 放在文件顶部（CSS 规范要求在其他规则之前）
+    if (imports.length > 0) {
+      const lines = css.split('\n');
+      let insertIdx = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (!t) continue;
+        if (t.startsWith('/*') && t.endsWith('*/')) continue;
+        if (t.startsWith('@charset')) continue;
+        insertIdx = i;
+        break;
+      }
+      lines.splice(insertIdx, 0, imports.join('\n\n') + '\n');
+      css = lines.join('\n');
+    }
+
+    // embed 追加到文件末尾
+    if (embeds.length > 0) {
+      css = css.trimEnd() + '\n\n' + embeds.join('\n\n') + '\n';
+    }
+
+    fs.writeFileSync(stylesPath, css, 'utf8');
+    return {};
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 function registerIpc(): void {
   // ---- 多进程 RPC 路由 ----
   ipcMain.handle(IPC.RpcSend, async (_e, sessionPath: string, cmd: RpcCommand) => {
     if (!pool) throw new Error('pool not initialized');
     // extension_ui_response 无需等待 response（应答帧），直接 write
     if (cmd.type === 'extension_ui_response') {
-      pool.write(sessionPath, cmd as ExtensionUIResponseCommand);
+      try {
+        pool.write(sessionPath, cmd as ExtensionUIResponseCommand);
+      } finally {
+        // 不论成败都释放该会话的 UI pin（应答已结束）。
+        // 失败（进程已离线）时 IPC 会 reject，由渲染端弹错提示，不静默吞掉。
+        pool.unpin(sessionPath);
+      }
       return { type: 'response', command: 'extension_ui_response', success: true };
     }
     return pool.send(sessionPath, cmd);
@@ -164,7 +274,9 @@ function registerIpc(): void {
 
   ipcMain.handle(IPC.OmpAcquire, async (_e, sessionPath: string, cwd: string, approvalMode?: ApprovalMode) => {
     if (!pool) throw new Error('pool not initialized');
-    await pool.acquire(sessionPath, cwd, approvalMode ?? 'write');
+    // 钩子是全局的，续接/恢复的历史会话也一并加载（读取持久化配置，解析出 --hook 参数）。
+    const hooks = resolveHookArgs(loadWorkspacesFile().hooks);
+    await pool.acquire(sessionPath, cwd, approvalMode ?? 'write', hooks);
   });
 
   ipcMain.handle(IPC.OmpNewSession, async (_e, cwd: string, approvalMode?: ApprovalMode) => {
@@ -172,7 +284,11 @@ function registerIpc(): void {
     // 新建会话：spawn 不带 -r/-c（新 .jsonl），用 tempKey 绑定。
     // 真实 path 在首条消息 agent_end 后落盘，renderer refreshSessions 时迁移 tempKey→realPath。
     const tempKey = '__new_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
-    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'write');
+    // 读取持久化的系统提示词 + 钩子，注入到新会话。
+    const wf = loadWorkspacesFile();
+    const systemPrompt = wf.systemPrompt;
+    const hooks = resolveHookArgs(wf.hooks);
+    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'write', systemPrompt, hooks);
     return { sessionPath: tempKey };
   });
 
@@ -222,6 +338,44 @@ function registerIpc(): void {
     return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
   });
 
+  // ---- 钩子（Hooks）管理 ----
+  ipcMain.handle(IPC.OmpPickHookFiles, async () => {
+    if (!mainWindow) return null;
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择钩子文件（.ts）',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'TypeScript', extensions: ['ts'] }],
+    });
+    return r.canceled || r.filePaths.length === 0 ? null : r.filePaths;
+  });
+  ipcMain.handle(IPC.OmpParseHookFiles, async (_e, paths: string[]) => {
+    if (!Array.isArray(paths)) return [];
+    return paths.map((p) => parseHookFile(p));
+  });
+
+  // ---- 自定义 CSS 导入 ----
+  ipcMain.handle(IPC.OmpPickCssFile, async () => {
+    if (!mainWindow) return null;
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择 CSS 文件（.css）',
+      properties: ['openFile'],
+      filters: [{ name: 'CSS', extensions: ['css'] }],
+    });
+    return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
+  });
+  ipcMain.handle(IPC.OmpReadCssFile, async (_e, filePath: string) => {
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      return { content };
+    } catch (e: any) {
+      return { content: '', error: String(e?.message ?? e) };
+    }
+  });
+  ipcMain.handle(IPC.OmpSyncCustomCss, async (_e, list: CustomCssConfig[]) => {
+    if (!Array.isArray(list)) return { error: 'invalid list' };
+    return syncCustomCss(list);
+  });
+
   // ---- 模型配置 ----
   ipcMain.handle(IPC.OmpModelsRead, async () => readModelsConfig());
   ipcMain.handle(IPC.OmpModelsWriteProvider, async (_e, id: string, cfg: OmpProviderConfig) => { writeProvider(id, cfg); });
@@ -255,9 +409,17 @@ app.whenReady().then(() => {
 
   // 初始化进程池
   pool = new OmpProcessPool(ompPath, {
-    onFrame: (sessionPath, frame) => sendToRenderer(IPC.RpcEvent, { ...(frame as object), __sessionPath: sessionPath }),
+    onFrame: (sessionPath, frame) => {
+      // 交互式 UI 请求（confirm/select/input/editor/open_url）入队等用户应答：
+      // pin 该会话，防止它在用户犹豫期间被 LRU 淘汰（等待中不输出帧，会被误判最闲）。
+      const fr = frame as { type?: string; method?: string };
+      if (fr.type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
+        pool?.pin(sessionPath);
+      }
+      sendToRenderer(IPC.RpcEvent, { ...(frame as object), __sessionPath: sessionPath });
+    },
     onReady: (sessionPath) => sendToRenderer(IPC.RpcReady, sessionPath),
-    onExit: (sessionPath, code) => sendToRenderer(IPC.OmpExit, { sessionPath, code }),
+    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
     onStderr: (sessionPath, line) => sendToRenderer(IPC.OmpStderr, { sessionPath, line }),
     onLog: (line) => { /* pool 内部日志（如 LRU 淘汰），静默 */ },
   });
@@ -315,4 +477,81 @@ function listDir(dirPath: string): FileEntry[] {
     result.sort((a, b) => { if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; return a.name.localeCompare(b.name); });
     return result;
   } catch { return []; }
+}
+
+// ---- 钩子（Hooks）静态解析 + 参数解析 ----
+
+/** 静态解析一个 .ts 钩子文件：默认导出 / 具名导出 / pi.on 事件名。不执行代码。 */
+function parseHookFile(filePath: string): HookFileInfo {
+  const base: HookFileInfo = { path: filePath, hasDefault: false, namedHooks: [], events: [] };
+  try {
+    const src = fs.readFileSync(filePath, 'utf8');
+    // 去掉块注释与行注释，避免误匹配（保留换行以不影响后续按行匹配）
+    const noComments = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])(\/\/.*)$/gm, '$1');
+    // 默认导出（函数 / 类 / 箭头 / 标识符）
+    base.hasDefault =
+      /export\s+default\s+(?:async\s+)?(?:function|class|\()/.test(noComments) ||
+      /export\s+default\s+[\w$]/.test(noComments);
+    // 具名导出（函数 / const / let / var）
+    const namedRe = /export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g;
+    const named = new Set<string>();
+    let m: RegExpExecArray | null;
+    while ((m = namedRe.exec(noComments))) {
+      const name = m[1] || m[2];
+      if (name) named.add(name);
+    }
+    base.namedHooks = [...named];
+    // pi.on("event", ...) 事件名
+    const evtRe = /pi\s*\.\s*on\s*\(\s*['"]([\w-]+)['"]/g;
+    const events = new Set<string>();
+    while ((m = evtRe.exec(noComments))) events.add(m[1]);
+    base.events = [...events];
+  } catch (e) {
+    base.error = e instanceof Error ? e.message : String(e);
+  }
+  return base;
+}
+
+/** 把持久化的钩子配置解析成 omp 启动参数 `--hook=<path>` 列表。
+ *  - 整文件默认导出（fileLevel）→ 直接传原文件。
+ *  - 多单元（具名导出）→ 生成过滤包装文件（只调用启用的单元），传包装文件。
+ *  包装文件写到 userData/hook-cache，每次解析时覆盖。 */
+function resolveHookArgs(hooks?: HookFileConfig[]): string[] {
+  if (!hooks || hooks.length === 0) return [];
+  const args: string[] = [];
+  const cacheDir = path.join(app.getPath('userData'), 'hook-cache');
+  try { fs.mkdirSync(cacheDir, { recursive: true }); } catch { /* noop */ }
+  for (const cfg of hooks) {
+    if (!cfg.enabled || !cfg.units || cfg.units.length === 0) continue;
+    const fileLevelUnit = cfg.units.find((u) => u.fileLevel);
+    if (fileLevelUnit) {
+      args.push(cfg.path); // 整文件一个钩子：直接传原文件
+      continue;
+    }
+    // 多单元：取启用的单元名（省略 enabledUnits = 全部启用）
+    const enabled = cfg.enabledUnits && cfg.enabledUnits.length
+      ? cfg.enabledUnits
+      : cfg.units.map((u) => u.name);
+    const active = enabled.filter((n) => cfg.units.some((u) => u.name === n));
+    if (active.length === 0) continue;
+    const importPath = JSON.stringify(cfg.path);
+    const calls = active
+      .map((n) => `  if (typeof __mod[${JSON.stringify(n)}] === "function") __mod[${JSON.stringify(n)}](pi);`)
+      .join('\n');
+    const wrapper =
+      `// AUTO-GENERATED by OMP-UI — do not edit\n` +
+      `import * as __mod from ${importPath};\n` +
+      `export default function (pi: any) {\n${calls}\n}\n`;
+    // 文件名用路径 hash，稳定且避免特殊字符
+    let h = 0;
+    for (let i = 0; i < cfg.path.length; i++) h = (h * 31 + cfg.path.charCodeAt(i)) | 0;
+    const outPath = path.join(cacheDir, `${Math.abs(h).toString(36)}.ts`);
+    try {
+      fs.writeFileSync(outPath, wrapper, 'utf8');
+      args.push(outPath);
+    } catch { /* 写失败则跳过该文件 */ }
+  }
+  return args;
 }

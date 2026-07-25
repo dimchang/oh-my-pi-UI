@@ -3,7 +3,7 @@
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { IPC, type OmpApi, type FileEntry, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig } from '../src/shared/ipc-channels';
+import { IPC, type OmpApi, type FileEntry, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig } from '../src/shared/ipc-channels';
 import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -65,6 +65,15 @@ const api: OmpApi = {
   menuZoomOut: () => ipcRenderer.invoke(IPC.MenuZoomOut),
   menuToggleFullscreen: () => ipcRenderer.invoke(IPC.MenuToggleFullscreen),
   menuShowAbout: () => ipcRenderer.invoke(IPC.MenuShowAbout),
+
+  // 钩子（Hooks）管理
+  pickHookFiles: () => ipcRenderer.invoke(IPC.OmpPickHookFiles),
+  parseHookFiles: (paths: string[]) => ipcRenderer.invoke(IPC.OmpParseHookFiles, paths),
+
+  // 自定义 CSS 导入
+  pickCssFile: () => ipcRenderer.invoke(IPC.OmpPickCssFile),
+  readCssFile: (path: string) => ipcRenderer.invoke(IPC.OmpReadCssFile, path),
+  syncCustomCss: (list: CustomCssConfig[]) => ipcRenderer.invoke(IPC.OmpSyncCustomCss, list),
 };
 
 contextBridge.exposeInMainWorld('omp', api);

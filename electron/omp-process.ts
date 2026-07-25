@@ -18,12 +18,16 @@ export interface OmpProcessOptions {
   approvalMode?: ApprovalMode;
   /** true 时加 --no-session（内存会话不写盘，用于调试握手） */
   noSession?: boolean;
+  /** 系统提示词：新建会话时通过 --append-system-prompt 注入（仅新建会话，不用于续接/恢复）。 */
+  systemPrompt?: string;
   logDir?: string;
   /** 重启时带 -c 继续上一个会话（用于同 cwd 切权限模式，保留会话上下文） */
   continueSession?: boolean;
   /** resume 指定 path 的历史会话（-r <path>）。多进程池 acquire 历史会话时用。
    *  与 continueSession 互斥：resumeSession 优先。 */
   resumeSession?: string;
+  /** 钩子文件绝对路径列表，逐个通过 --hook=<path> 注入 omp（全局钩子，每个进程都加载）。 */
+  hooks?: string[];
 }
 
 export interface OmpProcessEvents {
@@ -219,6 +223,14 @@ export class OmpProcess {
     if (this.opts.noSession) args.push('--no-session');
     if (this.opts.resumeSession) args.push('-r', this.opts.resumeSession);
     else if (this.opts.continueSession) args.push('-c');
+    // 系统提示词：仅新建会话（acquireNew，不带 -r/-c）时注入。续接/恢复的历史会话不重复注入。
+    if (this.opts.systemPrompt && this.opts.systemPrompt.trim()) {
+      args.push('--append-system-prompt', this.opts.systemPrompt.trim());
+    }
+    // 钩子：全局加载，每个 omp 进程都注入（--hook 可重复多次）
+    if (this.opts.hooks && this.opts.hooks.length) {
+      for (const h of this.opts.hooks) args.push('--hook', h);
+    }
 
     // 日志
     try {

@@ -50,11 +50,14 @@ export const rpc = {
   respondUI: (sessionPath: string, resp: { id: string; value?: string; confirmed?: boolean; cancelled?: boolean }) =>
     window.omp.send(sessionPath, { type: 'extension_ui_response', ...resp } as RpcCommand),
 
-  /** 应答并出队（UI 请求闭环） */
-  respondUIAndDequeue: (sessionPath: string, resp: { id: string; value?: string; confirmed?: boolean; cancelled?: boolean }) => {
-    void window.omp.send(sessionPath, { type: 'extension_ui_response', ...resp } as RpcCommand);
-    void import('./store').then(({ useApp }) => useApp.getState().dequeueUi(resp.id));
-  },
+  /** 应答并出队（UI 请求闭环）。
+   *  返回 Promise：成功才出队；失败时 reject，交由调用方（PermissionModal）弹错提示，
+   *  且保持弹窗不关闭，让用户重新进入该会话后可重试。 */
+  respondUIAndDequeue: (sessionPath: string, resp: { id: string; value?: string; confirmed?: boolean; cancelled?: boolean }) =>
+    window.omp.send(sessionPath, { type: 'extension_ui_response', ...resp } as RpcCommand)
+      .then(() => {
+        void import('./store').then(({ useApp }) => useApp.getState().dequeueUi(resp.id));
+      }),
 
   // ---- 进程池 ----
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>

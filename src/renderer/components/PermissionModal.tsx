@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import type { UiRequest } from '../store';
+import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 
 /**
@@ -24,9 +25,18 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   const [selected, setSelected] = useState<string>(normOptions[0]?.value ?? '');
   const [always, setAlways] = useState(false);
 
-  const respond = (payload: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
+  const respond = async (payload: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
     // 多进程：UI 请求带 sessionPath，应答路由回该会话的进程
-    rpc.respondUIAndDequeue(req.sessionPath ?? '', { id: req.id, ...payload });
+    try {
+      await rpc.respondUIAndDequeue(req.sessionPath ?? '', { id: req.id, ...payload });
+    } catch (e) {
+      // 进程已离线（被 LRU 淘汰 / 崩溃 / temp→real 迁移没跟上）：
+      // 不要静默关弹窗，提示用户重新进入该会话后再试。
+      useApp.getState().pushToast(
+        `操作未送达：${e instanceof Error ? e.message : String(e)}。请重新进入该会话后重试。`,
+        'error',
+      );
+    }
   };
 
   const renderBody = () => {

@@ -98,12 +98,7 @@ export function TitleBar(): React.ReactElement | null {
     {
       label: 'Window',
       items: [
-        { label: '最小化', action: () => window.omp.minimizeWindow() },
-        { label: isMaximized ? '还原' : '最大化', action: () => window.omp.maximizeWindow() },
-        { separator: true, label: '' },
-        { label: '配置', action: () => useApp.getState().setSettingsOpen(true) },
-        { separator: true, label: '' },
-        { label: '关闭', action: () => window.omp.closeWindow() },
+        { label: '设置', action: () => useApp.getState().setSettingsOpen(true) },
       ],
     },
     {

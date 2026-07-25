@@ -1,6 +1,6 @@
 {
   "name": "omp-gui",
-  "version": "0.2.2",
+  "version": "0.2.8",
   "description": "Windows GUI for oh-my-pi (omp), Codex-style, via omp --mode rpc-ui",
   "main": "out/main/index.js",
   "author": "OMP-UI",

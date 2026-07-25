@@ -15,7 +15,7 @@ import type {
   ThinkingLevel,
   TodoPhase,
 } from '../shared/rpc-types';
-import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode } from '../shared/ipc-channels';
+import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual } from './utils/path-key';
 
 export type PartKind = 'text' | 'thinking' | 'tool';
@@ -122,6 +122,17 @@ interface AppState {
   /** 勾/取消勾一个模型（allKeys = 当前全部模型 key，用于"首次取消勾选"时把白名单初始化为全集再剔除） */
   toggleEnabledModel(key: string, allKeys: string[]): void;
 
+  // ---- 系统提示词 / 外观 ----
+  /** 系统提示词：新建会话时注入。改了即持久化。 */
+  systemPrompt?: string;
+  setSystemPrompt(v: string): void;
+  /** 外观（系统风格）配置。改了即持久化并实时应用。 */
+  appearance?: AppearanceConfig;
+  setAppearance(v: AppearanceConfig): void;
+  /** 钩子（Hooks）配置：导入的 .ts 钩子文件列表 + 启用状态。改了即持久化。 */
+  hooks?: HookFileConfig[];
+  setHooks(v: HookFileConfig[]): void;
+
   setReady(v: boolean): void;
   setOmpExited(code: number | null): void;
   setStreaming(v: boolean): void;
@@ -187,6 +198,11 @@ interface AppState {
   // 进程池状态
   /** 部分更新某会话的进程状态（合并写入） */
   setProcState(sessionPath: string, partial: Partial<ProcState>): void;
+
+  // ---- 轻量全局 toast（供 RPC 失败等场景在任意组件里弹提示）----
+  toasts: Array<{ id: number; text: string; level: string }>;
+  pushToast(text: string, level?: string): void;
+  dismissToast(id: number): void;
 }
 
 let seq = 0;
@@ -197,6 +213,15 @@ let userSeq = 0;
  * 自己的（说明用户在等待期间又触发了新的加载），就丢弃本次结果，避免旧回调覆盖新数据。
  */
 let loadEpoch = 0;
+
+/** 给旧版 customCss 条目生成稳定 id。 */
+function cssId(path: string, mode: string): string {
+  let h = 0;
+  const s = `${mode}:${path}`;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return `css-${Math.abs(h).toString(36)}`;
+}
+
 
 /** 把 omp 的全量 content[] 映射为 UI parts（text/thinking）。
  *  实测 content type 有：text / output_text（assistant 正文）/ thinking / toolCall。
@@ -223,6 +248,7 @@ export const useApp = create<AppState>((set, get) => ({
   messages: [],
   sessionsMap: {},
   procStateMap: {},
+  toasts: [],
   slashCommands: [],
   sessions: [],
   uiQueue: [],
@@ -237,6 +263,8 @@ export const useApp = create<AppState>((set, get) => ({
   settingsOpen: false,
   settingsTab: 'model',
   enabledModels: undefined,
+  systemPrompt: undefined,
+  appearance: undefined,
 
   setReady: (v) => set({ ready: v }),
   setMainView: (v) => set({ mainView: v }),
@@ -269,6 +297,22 @@ export const useApp = create<AppState>((set, get) => ({
       next = has ? cur.filter((k) => k !== key) : [...cur, key];
     }
     set({ enabledModels: next });
+    get().persistWorkspaces();
+  },
+
+  // ---- 系统提示词 / 外观 ----
+  setSystemPrompt: (v) => {
+    set({ systemPrompt: v });
+    get().persistWorkspaces();
+  },
+  setAppearance: (v) => {
+    set({ appearance: v });
+    applyAppearance(v);
+    void syncCustomCss(v?.customCss);
+    get().persistWorkspaces();
+  },
+  setHooks: (v) => {
+    set({ hooks: v });
     get().persistWorkspaces();
   },
   setOmpExited: (code) => set({ ompExited: code, isStreaming: false, isAborting: false }),
@@ -329,6 +373,21 @@ export const useApp = create<AppState>((set, get) => ({
       );
       migratedCurrentId = matched?.id ?? null;
     }
+    // 旧版 customCss 没有 id 字段，补上稳定 id，便于 styles.css 区块管理
+    const normalizedCustomCss: CustomCssConfig[] | undefined = (() => {
+      const list = file.appearance?.customCss;
+      if (!list || list.length === 0) return undefined;
+      let changed = false;
+      const out = list.map((c) => {
+        if (c.id) return c;
+        changed = true;
+        return { ...c, id: cssId(c.path, c.mode) };
+      });
+      return changed ? out : list;
+    })();
+    const migratedAppearance: AppearanceConfig | undefined = normalizedCustomCss
+      ? { ...file.appearance, customCss: normalizedCustomCss }
+      : file.appearance;
     set({
       workspaces: migratedWorkspaces,
       archived: migratedArchived,
@@ -337,12 +396,16 @@ export const useApp = create<AppState>((set, get) => ({
       removedCwds: file.removedCwds ?? [],
       lastModel: file.lastModel,
       enabledModels: file.enabledModels,
+      systemPrompt: file.systemPrompt,
+      appearance: migratedAppearance,
+      hooks: file.hooks,
     });
-    // 若发生过迁移（任何 id 改了格式），立即写回磁盘，下次启动就直接是新格式
+    // 若发生过迁移（任何 id 改了格式）或 customCss 补上 id，立即写回磁盘
     const dirty =
       migratedWorkspaces.some((w, i) => w.id !== file.workspaces[i]?.id) ||
       migratedArchived.some((w, i) => w.id !== (file.archived ?? [])[i]?.id) ||
-      migratedCurrentId !== file.currentId;
+      migratedCurrentId !== file.currentId ||
+      normalizedCustomCss !== file.appearance?.customCss;
     if (dirty) get().persistWorkspaces();
   },
 
@@ -440,6 +503,9 @@ export const useApp = create<AppState>((set, get) => ({
       removedCwds: s.removedCwds,
       lastModel: s.lastModel,
       enabledModels: s.enabledModels,
+      systemPrompt: s.systemPrompt,
+      appearance: s.appearance,
+      hooks: s.hooks,
     };
     // 动态 import 避免循环依赖（rpc-client 也 import store）
     void import('./rpc-client').then(({ rpc }) => {
@@ -472,6 +538,15 @@ export const useApp = create<AppState>((set, get) => ({
         } as ProcState,
       },
     })),
+
+  pushToast: (text, level = 'info') => {
+    const id = Date.now() + Math.random();
+    set((s) => ({ toasts: [...s.toasts, { id, text, level }] }));
+    setTimeout(() => {
+      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+    }, 5000);
+  },
+  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
   loadSessionMessages: (path) => {
     // 从磁盘读历史（进程未拉起时显示磁盘内容）
@@ -719,4 +794,67 @@ function updateToolInBuffer(
       p.kind === 'tool' && p.toolCallId === toolCallId ? fn(p) : p,
     ),
   }));
+}
+
+/**
+ * 把外观配置应用到 :root 上的内联 CSS 变量（最高优先级，覆盖样式表里的主题 token）。
+ * 设置页每次改动都会调用；App 启动时也调用一次以恢复上次配置。
+ *  - mode：system=移除 data-mode（跟随系统媒体查询）；light/dark=设置 data-mode 属性。
+ *  - fontFamily / fontSize / bgColor / accentColor：留空则清除对应变量，回退主题默认。
+ */
+export function applyAppearance(a?: AppearanceConfig | null): void {
+  const root = document.documentElement;
+  if (!root) return;
+  if (a?.mode && a.mode !== 'system') root.setAttribute('data-mode', a.mode);
+  else root.removeAttribute('data-mode');
+
+  if (a?.fontFamily) root.style.setProperty('--app-font-family', a.fontFamily);
+  else root.style.removeProperty('--app-font-family');
+
+  if (a?.fontSize && a.fontSize > 0) {
+    root.style.setProperty('--app-font-size', `${a.fontSize}px`);
+    root.style.setProperty('--msg-font-size', `${a.fontSize}px`);
+  } else {
+    root.style.removeProperty('--app-font-size');
+    root.style.removeProperty('--msg-font-size');
+  }
+
+  if (a?.bgColor) {
+    root.style.setProperty('--app-bg', a.bgColor);
+    root.style.setProperty('--bg', a.bgColor);
+  } else {
+    root.style.removeProperty('--app-bg');
+    root.style.removeProperty('--bg');
+  }
+
+  if (a?.accentColor) {
+    root.style.setProperty('--accent', a.accentColor);
+    root.style.setProperty('--accent-brand', a.accentColor);
+    root.style.setProperty('--accent-main-000', a.accentColor);
+    root.style.setProperty('--accent-main-100', a.accentColor);
+  } else {
+    root.style.removeProperty('--accent');
+    root.style.removeProperty('--accent-brand');
+    root.style.removeProperty('--accent-main-000');
+    root.style.removeProperty('--accent-main-100');
+  }
+}
+
+/**
+ * 把用户导入的自定义 CSS 列表同步到 styles.css 源文件。
+ * - embed：主进程把源文件内容写入 styles.css 尾部；
+ * - link：主进程在 styles.css 顶部插入 @import url("file://...")；
+ * - 禁用/不存在的条目会被移除。
+ * 启动时调用一次，确保旧数据（或外部改动）与 styles.css 保持一致。
+ */
+export async function syncCustomCss(list?: CustomCssConfig[] | null): Promise<void> {
+  if (typeof window === 'undefined' || !window.omp?.syncCustomCss) return;
+  try {
+    const r = await window.omp.syncCustomCss(list ?? []);
+    if (r?.error) {
+      console.error('[syncCustomCss]', r.error);
+    }
+  } catch (e) {
+    console.error('[syncCustomCss]', e);
+  }
 }
