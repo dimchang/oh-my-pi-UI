@@ -1,6 +1,5 @@
-import React, { useEffect } from 'react';
+import React from 'react';
 import { useApp } from '../store';
-import { rpc } from '../rpc-client';
 
 export const StatusBar: React.FC = () => {
   const ready = useApp((s) => s.ready);
@@ -14,16 +13,8 @@ export const StatusBar: React.FC = () => {
   const isRetrying = useApp((s) => s.isRetrying);
   const currentWorkspace = useApp((s) => s.currentWorkspace());
 
-  useEffect(() => {
-    if (!ready) return;
-    const sp = useApp.getState().currentSessionPath;
-    if (!sp) return;
-    void rpc.getSessionStats(sp).then((r) => {
-      if (r.success && r.data) {
-        useApp.getState().setState({ sessionStats: r.data as Record<string, unknown> });
-      }
-    }).catch(() => undefined);
-  }, [ready]);
+  // sessionStats 不再在这里一次性拉取：改由 App.refreshState 统一驱动
+  // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
 
   const dot = exited !== false && exited !== null ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
   const statusText =

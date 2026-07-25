@@ -13,14 +13,18 @@ export const ModelPicker: React.FC = () => {
   const ref = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (!ready) return;
+  const fetchModels = React.useCallback(() => {
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
     void rpc.getAvailableModels(sp).then((r) => {
       if (r.success && r.data) setModels(r.data.models ?? []);
     }).catch(() => undefined);
-  }, [ready]);
+  }, []);
+
+  // 首次 ready 预热一次（让首次打开下拉不白屏）
+  useEffect(() => {
+    if (ready) fetchModels();
+  }, [ready, fetchModels]);
 
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {
@@ -30,14 +34,16 @@ export const ModelPicker: React.FC = () => {
     return () => document.removeEventListener('mousedown', onDoc);
   }, []);
 
-  // 打开时自动 focus 搜索框
+  // 打开时自动 focus 搜索框 + 重新拉取模型列表
+  // （omp 端或 GUI 内新增模型后无需重启即可看到）
   useEffect(() => {
     if (open) {
       setQuery('');
+      fetchModels();
       // 等下一帧再 focus，input 已经被挂载
       requestAnimationFrame(() => searchRef.current?.focus());
     }
-  }, [open]);
+  }, [open, fetchModels]);
 
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase();

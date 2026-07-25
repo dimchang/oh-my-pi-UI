@@ -42,6 +42,13 @@ export default function App(): React.ReactElement {
   const refreshState = useCallback((sessionPath?: string): Promise<void> => {
     const sp = sessionPath ?? useApp.getState().currentSessionPath;
     if (!sp) return Promise.resolve();
+    // 会话统计（tokens/费用/消息数）与 get_state 并行拉取；
+    // 仅当返回时该会话仍是当前显示会话才写入，避免切会话后串数据。
+    void rpc.getSessionStats(sp).then((sr) => {
+      if (sr.success && sr.data && sp === useApp.getState().currentSessionPath) {
+        useApp.getState().setState({ sessionStats: sr.data });
+      }
+    }).catch(() => undefined);
     return rpc.getState(sp).then((r) => {
       if (r.success && r.data) {
         const d = r.data as RpcSessionState;
@@ -124,6 +131,8 @@ export default function App(): React.ReactElement {
     useApp.getState().setCurrentSessionPath(newSessionPath);
     useApp.getState().setProcState(newSessionPath, { status: 'online' });
     useApp.getState().resetChat();
+    // 新会话统计从零开始，先清掉旧会话残留（refreshState 会重新拉取）
+    useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined });
     await refreshSessions();
     await refreshState(newSessionPath);
   }, [refreshSessions, refreshState]);
@@ -370,6 +379,10 @@ export default function App(): React.ReactElement {
       isAborting: ps?.isAborting ?? false,
       // 切会话时清 ompExited（新会话未退出）
       ompExited: false,
+      // 清掉上一会话的统计/窗口用量，避免在新会话状态栏上串数据；
+      // 新值由 refreshState（在线立即 / 懒拉起后 onReady）重新拉取。
+      sessionStats: undefined,
+      contextUsage: undefined,
     });
     // 若该会话从未缓冲过，从磁盘读历史
     if (!stNow.sessionsMap[s.path]) {
