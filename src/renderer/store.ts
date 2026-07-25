@@ -35,6 +35,17 @@ export interface ThinkingPart { kind: 'thinking'; text: string; }
 
 export type MessagePart = TextPart | ThinkingPart | ToolPart;
 
+/**
+ * 从 UI 请求里提取工具名，作为"始终允许"缓存的 key。
+ * omp 的 confirm 请求把工具名 + 命令塞在 title 里（用 \n 分隔），工具名是第一行。
+ * 无法解析时返回 null（此时不启用自动放行）。
+ */
+export function toolNameOf(req: UiRequest): string | null {
+  const raw = req.title ?? req.message ?? '';
+  const firstLine = raw.split('\n')[0]?.trim();
+  return firstLine ? firstLine : null;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'tool' | string;
@@ -92,6 +103,9 @@ interface AppState {
   sessions: SessionSummary[];
   currentSessionPath?: string;
   uiQueue: UiRequest[]; // extension_ui_request 待应答队列（单队列顺序展示）
+  /** per-session 工具级"始终允许"缓存：key = `${sessionPath}::${toolName.toLowerCase()}`，命中即自动放行。
+   *  仅 confirm 类请求生效；值恒为 true（拒绝不缓存，避免误伤）。见 handleUiRequest 自动放行逻辑。 */
+  permAllow: Record<string, boolean>;
   stderrTail: string[];
 
   // M4: 增强状态
@@ -144,6 +158,9 @@ interface AppState {
   applyAgentEvent(frame: Record<string, unknown>): void;
   enqueueUi(req: UiRequest): void;
   dequeueUi(id: string): void;
+  /** 写入/读取 per-session 工具级"始终允许"缓存（自动放行用） */
+  setPermAllow(sessionPath: string, toolName: string): void;
+  isPermAllowed(sessionPath: string, toolName: string): boolean;
 
   setSessions(list: SessionSummary[]): void;
   setCurrentSessionPath(p?: string): void;
@@ -252,6 +269,7 @@ export const useApp = create<AppState>((set, get) => ({
   slashCommands: [],
   sessions: [],
   uiQueue: [],
+  permAllow: {},
   stderrTail: [],
   todoPhases: [],
   isCompacting: false,
@@ -516,6 +534,15 @@ export const useApp = create<AppState>((set, get) => ({
   enqueueUi: (req) =>
     set((s) => (s.uiQueue.some((q) => q.id === req.id) ? s : { uiQueue: [...s.uiQueue, req] })),
   dequeueUi: (id) => set((s) => ({ uiQueue: s.uiQueue.filter((q) => q.id !== id) })),
+
+  setPermAllow: (sessionPath, toolName) => {
+    const key = `${sessionPath}::${toolName.toLowerCase()}`;
+    set((s) => ({ permAllow: { ...s.permAllow, [key]: true } }));
+  },
+  isPermAllowed: (sessionPath, toolName) => {
+    const key = `${sessionPath}::${toolName.toLowerCase()}`;
+    return get().permAllow[key] === true;
+  },
 
   resetChat: () => {
     const st = get();

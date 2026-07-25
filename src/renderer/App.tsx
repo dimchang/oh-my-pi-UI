@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { useApp, type UiRequest } from './store';
+import { useApp, type UiRequest, toolNameOf } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -718,6 +718,16 @@ function handleUiRequest(
   }
 
   if (method === 'confirm' || method === 'select' || method === 'input' || method === 'editor') {
+    // confirm 类：先查 per-session 工具级"始终允许"缓存，命中则宿主侧自动放行（不弹窗）。
+    // select/input/editor 需要用户主动输入，不走自动放行。
+    if (method === 'confirm') {
+      const ui = toUiRequest(req);
+      const tool = toolNameOf(ui);
+      if (tool && st.isPermAllowed(req.__sessionPath ?? '', tool)) {
+        void rpc.respondUI(req.__sessionPath ?? '', { id: req.id, confirmed: true });
+        return;
+      }
+    }
     st.enqueueUi(toUiRequest(req));
     return;
   }

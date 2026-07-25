@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as readline from 'readline';
 import type { SessionSummary } from '../shared/ipc-channels';
 import type { SessionHeader, AgentMessage, ReplayMessage } from '../shared/rpc-types';
 
@@ -46,12 +47,30 @@ function readSessionHeader(filePath: string): SessionHeader | null {
   }
 }
 
+/** 只读文件头部最多 maxBytes（默认 256KB），不把整个会话文件读进内存。
+ *  用于 titleFallback 兜底——只需要前几条消息就能拿到标题，无需全量加载数十 MB 文件。 */
+function readHead(filePath: string, maxBytes = 256 * 1024): string {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(maxBytes);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.toString('utf8', 0, n);
+  } catch {
+    return '';
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* noop */ }
+    }
+  }
+}
+
 function titleFallback(header: SessionHeader, filePath: string): string {
   if (header.title && header.title.trim()) return header.title.trim();
-  // 读首条 user 消息前 40 字兜底：扫前若干行找 message/user
+  // 读首条 user 消息前 40 字兜底：只扫文件头部（最多 256KB），不读全文件
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    const lines = content.split('\n').slice(0, 50);
+    const head = readHead(filePath);
+    const lines = head.split('\n').slice(0, 50);
     for (const ln of lines) {
       if (!ln.trim()) continue;
       try {
@@ -123,32 +142,30 @@ export function deleteSession(filePath: string): void {
  *  用于「切换会话看历史时不中断正在生成的会话」——此时 omp current 仍是旧会话，
  *  get_messages 拿不到目标会话，只能从磁盘还原。返回 AgentMessage[]，renderer 侧
  *  用 contentToParts 转成 ChatMessage。 */
-export function readSessionMessages(filePath: string): ReplayMessage[] {
+export async function readSessionMessages(filePath: string): Promise<ReplayMessage[]> {
+  // 基于 readline 流逐行解析：内存只保留单行 + 增量 toolMeta/out，且解析过程让出事件循环，
+  // 避免 readFileSync 把数十 MB 文件一次性读进内存并阻塞主进程事件循环（导致 UI 冻结）。
+  // 单遍前向扫描：tool_execution_start 总是先于对应 toolResult 出现，边扫边建 toolMeta。
+  const toolMeta = new Map<string, { toolName?: string; args?: unknown }>();
+  const out: ReplayMessage[] = [];
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    // 第一遍：收集 tool_execution_start 的参数（如 read 的 path），按 toolCallId 索引。
-    // 这些 custom 帧之前被整体丢弃，导致历史回放里 toolResult 拿不到 args、也无法重建 ToolCard。
-    const toolMeta = new Map<string, { toolName?: string; args?: unknown }>();
-    const lines = content.split('\n');
-    for (const ln of lines) {
+    const rl = readline.createInterface({
+      input: fs.createReadStream(filePath),
+      crlfDelay: Infinity,
+    });
+    for await (const ln of rl) {
       if (!ln.trim()) continue;
       try {
         const entry = JSON.parse(ln) as {
           type?: string;
           customType?: string;
           data?: { toolCallId?: string; toolName?: string; args?: unknown };
+          message?: AgentMessage & { toolCallId?: string };
         };
         if (entry.type === 'custom' && entry.customType === 'tool_execution_start' && entry.data?.toolCallId) {
           toolMeta.set(entry.data.toolCallId, { toolName: entry.data.toolName, args: entry.data.args });
+          continue;
         }
-      } catch { /* ignore */ }
-    }
-    // 第二遍：把所有 message 帧转为 ReplayMessage，给 toolResult 补上匹配的 args。
-    const out: ReplayMessage[] = [];
-    for (const ln of lines) {
-      if (!ln.trim()) continue;
-      try {
-        const entry = JSON.parse(ln) as { type?: string; message?: AgentMessage & { toolCallId?: string } };
         if (entry && entry.type === 'message' && entry.message) {
           const m = entry.message;
           if (m.role === 'toolResult' && m.toolCallId) {
@@ -160,19 +177,24 @@ export function readSessionMessages(filePath: string): ReplayMessage[] {
         }
       } catch { /* 跳过损坏行 */ }
     }
-    return out;
+    rl.close();
   } catch {
     return [];
   }
+  return out;
 }
 
 /** 读 session JSONL，返回所有 user 消息的 entry id + 文本（按出现顺序）。
- *  供分叉（branch）功能使用：branch 需要 user message 的 entryId 作为分叉点。 */
-export function readUserEntries(filePath: string): { id: string; text: string }[] {
+ *  供分叉（branch）功能使用：branch 需要 user message 的 entryId 作为分叉点。
+ *  同样改为 readline 流式解析，避免大文件全量读入阻塞主进程。 */
+export async function readUserEntries(filePath: string): Promise<{ id: string; text: string }[]> {
+  const out: { id: string; text: string }[] = [];
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    const out: { id: string; text: string }[] = [];
-    for (const ln of content.split('\n')) {
+    const rl = readline.createInterface({
+      input: fs.createReadStream(filePath),
+      crlfDelay: Infinity,
+    });
+    for await (const ln of rl) {
       if (!ln.trim()) continue;
       try {
         const entry = JSON.parse(ln) as {
@@ -189,8 +211,9 @@ export function readUserEntries(filePath: string): { id: string; text: string }[
         }
       } catch { /* 跳过损坏行 */ }
     }
-    return out;
+    rl.close();
   } catch {
     return [];
   }
+  return out;
 }

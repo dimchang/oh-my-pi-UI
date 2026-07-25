@@ -36,8 +36,9 @@ Thumbs.db
 # ===== Local tooling data (project memory / skills, not source) =====
 .workbuddy/
 
-# ===== One-off debug probe (hardcodes local paths) =====
+# ===== One-off debug probes (hardcode local paths, throwaway) =====
 probe-omp.mjs
+probe-*.mjs
 
 # ===== Local sync helper (hardcodes /d/code/OMP-github path; not for public repo) =====
 /sync-to-github.ps1

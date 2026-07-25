@@ -1,11 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import type { UiRequest } from '../store';
-import { useApp } from '../store';
+import { useApp, toolNameOf } from '../store';
 import { rpc } from '../rpc-client';
 
 /**
  * PermissionModal — 按 extension_ui_request.method 渲染 confirm/select/input/editor。
  * 单队列顺序展示（store.uiQueue[0]），cancel 帧由 App 负责关对应 modal。
+ *
+ * "始终允许"链路：confirm 勾选后，应答成功即把 工具名 写入 per-session 缓存（store.permAllow）；
+ * 下次同一会话同一工具的 confirm 在 handleUiRequest 里命中缓存、自动放行、不弹窗。
+ * 失败时不丢队列（保持弹窗），改为内联错误 + "重试/关闭"，避免单模态死锁卡住后续 UI 请求。
  */
 export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   /** 把 omp 的 option 统一规整成 {value, label, description} 形态
@@ -24,20 +28,29 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   const [inputVal, setInputVal] = useState(req.defaultValue ?? '');
   const [selected, setSelected] = useState<string>(normOptions[0]?.value ?? '');
   const [always, setAlways] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const lastPayload = React.useRef<{ value?: string; confirmed?: boolean; cancelled?: boolean }>({});
 
   const respond = async (payload: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
-    // 多进程：UI 请求带 sessionPath，应答路由回该会话的进程
+    lastPayload.current = payload;
+    setErr(null);
     try {
       await rpc.respondUIAndDequeue(req.sessionPath ?? '', { id: req.id, ...payload });
+      // 成功：respondUIAndDequeue 已自动 dequeue。若勾选"始终允许"则写入缓存。
+      if (payload.confirmed && always) {
+        const tool = toolNameOf(req);
+        if (tool) useApp.getState().setPermAllow(req.sessionPath ?? '', tool);
+      }
     } catch (e) {
-      // 进程已离线（被 LRU 淘汰 / 崩溃 / temp→real 迁移没跟上）：
-      // 不要静默关弹窗，提示用户重新进入该会话后再试。
-      useApp.getState().pushToast(
-        `操作未送达：${e instanceof Error ? e.message : String(e)}。请重新进入该会话后重试。`,
-        'error',
+      // 进程已离线（被 LRU 淘汰 / 崩溃 / temp→real 迁移没跟上）：保持弹窗，给重试/关闭。
+      setErr(
+        `操作未送达：${e instanceof Error ? e.message : String(e)}。可点"重试"再试，或点"关闭"关闭此弹窗（关闭后需重新进入该会话才能再次操作）。`,
       );
     }
   };
+
+  const onClose = () => useApp.getState().dequeueUi(req.id);
+  const onRetry = () => void respond(lastPayload.current);
 
   const renderBody = () => {
     switch (req.method) {
@@ -131,7 +144,17 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
     <div className="modal-overlay">
       <div className="modal">
         <ModalTitle req={req} />
-        {renderBody()}
+        {err ? (
+          <div className="modal-message" style={{ color: 'var(--accent-danger, #e5484d)' }}>{err}</div>
+        ) : (
+          renderBody()
+        )}
+        {err && (
+          <div className="modal-actions">
+            <button className="btn" onClick={onClose}>关闭</button>
+            <button className="btn btn-primary" onClick={onRetry}>重试</button>
+          </div>
+        )}
       </div>
     </div>
   );

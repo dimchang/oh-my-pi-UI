@@ -8,6 +8,59 @@ function formatSize(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * 递归节点组件（模块顶层，稳定类型引用）。
+ * 之前 DirChildren 定义在 FileTree 函数体内，每次 FileTree 重渲染都会生成新的函数引用，
+ * React 按组件类型比对会把它当成"新类型"，整体卸载重建其子树——已展开目录的 kids 状态
+ * 丢失、重新 listFiles 拉取。提到顶层后，父级重渲染不再触发展开目录的重建。
+ * expanded / onToggle 通过 props 传入，数据变化时正常重渲染但不卸载。
+ */
+const EntryNode: React.FC<{
+  entry: FileEntry;
+  depth: number;
+  expanded: Set<string>;
+  onToggle: (entry: FileEntry) => void;
+}> = ({ entry, depth, expanded, onToggle }) => {
+  const isOpen = expanded.has(entry.path);
+  const icon = entry.isDir ? (isOpen ? '📂' : '📁') : '📄';
+  return (
+    <div key={entry.path}>
+      <div
+        className="ft-item"
+        style={{ paddingLeft: 12 + depth * 16 }}
+        onClick={() => onToggle(entry)}
+        title={entry.path}
+      >
+        <span className="ft-icon">{icon}</span>
+        <span className="ft-name">{entry.name}</span>
+        {!entry.isDir && <span className="ft-size">{formatSize(entry.size)}</span>}
+      </div>
+      {entry.isDir && isOpen && (
+        <DirChildren dir={entry.path} depth={depth + 1} expanded={expanded} onToggle={onToggle} />
+      )}
+    </div>
+  );
+};
+
+const DirChildren: React.FC<{
+  dir: string;
+  depth: number;
+  expanded: Set<string>;
+  onToggle: (entry: FileEntry) => void;
+}> = ({ dir, depth, expanded, onToggle }) => {
+  const [kids, setKids] = useState<FileEntry[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void window.omp.listFiles(dir).then((list) => {
+      if (alive) setKids(list);
+    }).catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [dir]);
+  return <>{kids.map((e) => <EntryNode key={e.path} entry={e} depth={depth} expanded={expanded} onToggle={onToggle} />)}</>;
+};
+
 export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -35,36 +88,6 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
     });
   }, []);
 
-  const renderEntry = (entry: FileEntry, depth: number): React.ReactElement => {
-    const isOpen = expanded.has(entry.path);
-    const icon = entry.isDir ? (isOpen ? '📂' : '📁') : '📄';
-    return (
-      <div key={entry.path}>
-        <div
-          className="ft-item"
-          style={{ paddingLeft: 12 + depth * 16 }}
-          onClick={() => toggle(entry)}
-          title={entry.path}
-        >
-          <span className="ft-icon">{icon}</span>
-          <span className="ft-name">{entry.name}</span>
-          {!entry.isDir && <span className="ft-size">{formatSize(entry.size)}</span>}
-        </div>
-        {entry.isDir && isOpen && (
-          <DirChildren dir={entry.path} depth={depth + 1} />
-        )}
-      </div>
-    );
-  };
-
-  const DirChildren: React.FC<{ dir: string; depth: number }> = ({ dir, depth }) => {
-    const [kids, setKids] = useState<FileEntry[]>([]);
-    useEffect(() => {
-      void window.omp.listFiles(dir).then(setKids).catch(() => undefined);
-    }, [dir]);
-    return <>{kids.map((e) => renderEntry(e, depth))}</>;
-  };
-
   return (
     <div className="file-tree">
       <div className="panel-header">
@@ -77,7 +100,7 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
         <div className="panel-empty">空目录</div>
       ) : (
         <div className="ft-list">
-          {entries.map((e) => renderEntry(e, 1))}
+          {entries.map((e) => <EntryNode key={e.path} entry={e} depth={1} expanded={expanded} onToggle={toggle} />)}
         </div>
       )}
     </div>
