@@ -14,6 +14,8 @@ export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () =>
   const draftInput = useApp((s) => s.draftInput);
   const setDraftInput = useApp((s) => s.setDraftInput);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // 提交防重复：onSend 把状态切到 streaming 有一帧延迟，期间按两次 Enter 会重复发送
+  const submittingRef = useRef(false);
 
   // 一次性输入回填（分叉等场景）：draftInput 非空时填入 textarea 并立即消费
   useEffect(() => {
@@ -33,7 +35,7 @@ export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () =>
 
   const slashMatch = useMemo(() => {
     if (!draft.startsWith('/')) return null;
-    const q = draft.slice(1).split(/\s/)[0].toLowerCase();
+    const q = (draft.slice(1).split(/\s/)[0] ?? '').toLowerCase();
     const list = slashCommands.filter(
       (c) => c.name.toLowerCase().startsWith(q) || c.aliases?.some((a) => a.toLowerCase().startsWith(q)),
     );
@@ -50,10 +52,13 @@ export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () =>
 
   const submit = () => {
     const text = draft.trim();
-    if (!text || !ready || isStreaming || isAborting) return;
+    if (!text || !ready || isStreaming || isAborting || submittingRef.current) return;
+    submittingRef.current = true;
     setDraft('');
     requestAnimationFrame(autoGrow);
     onSend(text);
+    // 释放：等状态切到 streaming 或超时后允许再次发送（避免异常时永久锁死）
+    setTimeout(() => { submittingRef.current = false; }, 500);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -63,7 +68,7 @@ export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () =>
       if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
         e.preventDefault();
         const c = slashMatch.list[selIdx];
-        setDraft('/' + c.name + ' ');
+        if (c) setDraft('/' + c.name + ' ');
         return;
       }
     }

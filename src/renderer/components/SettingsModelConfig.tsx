@@ -14,10 +14,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 import { AddModelModal } from './AddModelModal';
+import { modelKey } from '../utils/path-key';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpModelsConfig } from '../../shared/ipc-channels';
-
-export const modelKey = (m: { provider: string; id: string }): string => `${m.provider}/${m.id}`;
 
 export const SettingsModelConfig: React.FC = () => {
   const ready = useApp((s) => s.ready);
@@ -30,18 +29,32 @@ export const SettingsModelConfig: React.FC = () => {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
 
+  // 递增请求序号：并发 refresh 时，只有最新一次请求能落下 loading=false / 数据，
+  // 避免旧请求晚到时把新数据覆盖掉（并发 loading 错乱）。
+  const refreshSeq = React.useRef(0);
+
   const refresh = useCallback(() => {
+    const mySeq = ++refreshSeq.current;
     setLoading(true);
     setError('');
     const sp = useApp.getState().currentSessionPath ?? '';
-    void Promise.all([
+    void Promise.allSettled([
       rpc.getAvailableModels(sp).then((r) => {
-        if (r.success && r.data) setModels(r.data.models ?? []);
+        if (r.success && r.data) return r.data.models ?? [];
+        return [] as ModelInfo[];
       }),
-      window.omp.readModelsConfig().then(setYmlConfig),
-    ]).catch((e) => {
-      setError(e instanceof Error ? e.message : String(e));
-    }).finally(() => setLoading(false));
+      window.omp.readModelsConfig(),
+    ]).then(([modelsRes, ymlRes]) => {
+      // 不是最新请求：丢弃结果，避免覆盖新数据
+      if (mySeq !== refreshSeq.current) return;
+      const modelsList = modelsRes.status === 'fulfilled' ? (modelsRes.value as ModelInfo[]) : [];
+      const yml = ymlRes.status === 'fulfilled' ? (ymlRes.value as OmpModelsConfig) : { providers: {} };
+      setModels(modelsList);
+      setYmlConfig(yml);
+      setLoading(false);
+    }).catch(() => {
+      if (mySeq === refreshSeq.current) setLoading(false);
+    });
   }, []);
 
   useEffect(() => {
@@ -103,8 +116,8 @@ export const SettingsModelConfig: React.FC = () => {
     try {
       await window.omp.deleteOmpProvider(pid);
       const st = useApp.getState();
-      if (st.enabledModels?.some((k) => k.startsWith(`${pid}/`))) {
-        st.setEnabledModels(st.enabledModels.filter((k) => !k.startsWith(`${pid}/`)));
+      if (st.enabledModels?.some((k) => k.startsWith(`${pid}\u0000`))) {
+        st.setEnabledModels(st.enabledModels.filter((k) => !k.startsWith(`${pid}\u0000`)));
       }
       // 多进程：models.yml 已保存，新 acquire 的进程会读新配置。
       // 已在线的进程不重读（omp 启动时读 models.yml）；如需立即生效切回该会话触发重新 acquire。

@@ -16,7 +16,7 @@ import type {
   TodoPhase,
 } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
-import { cwdKey, pathsEqual } from './utils/path-key';
+import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 
 export type PartKind = 'text' | 'thinking' | 'tool';
 
@@ -41,8 +41,16 @@ export type MessagePart = TextPart | ThinkingPart | ToolPart;
  * 无法解析时返回 null（此时不启用自动放行）。
  */
 export function toolNameOf(req: UiRequest): string | null {
-  const raw = req.title ?? req.message ?? '';
-  const firstLine = raw.split('\n')[0]?.trim();
+  // 优先读结构化字段：部分 confirm 请求在 raw 上直接带 tool / toolName 字段
+  const raw = req.raw as { tool?: unknown; toolName?: unknown } | undefined;
+  if (raw) {
+    if (typeof raw.tool === 'string' && raw.tool.trim()) return raw.tool.trim();
+    if (typeof raw.toolName === 'string' && raw.toolName.trim()) return raw.toolName.trim();
+  }
+  // 回退：omp 把工具名 + 命令塞进 title 首行（\n 分隔），首行即工具名。
+  // 该解析较脆弱（依赖文案格式），仅作为结构化字段缺失时的兜底。
+  const text = req.title ?? req.message ?? '';
+  const firstLine = text.split('\n')[0]?.trim();
   return firstLine ? firstLine : null;
 }
 
@@ -230,13 +238,25 @@ let userSeq = 0;
  * 自己的（说明用户在等待期间又触发了新的加载），就丢弃本次结果，避免旧回调覆盖新数据。
  */
 let loadEpoch = 0;
+/** toast 自增 id 计数器：避免 Date.now()+Math.random() 可能的碰撞，且手动关闭后超时回调按 id 过滤无副作用。 */
+let toastSeq = 0;
 
-/** 给旧版 customCss 条目生成稳定 id。 */
+/** 给旧版 customCss 条目生成稳定 id。
+ *  使用 FNV-1a 32-bit 哈希 + 多轮混合，碰撞率远低于原先的 h*31。纯函数。 */
 function cssId(path: string, mode: string): string {
-  let h = 0;
   const s = `${mode}:${path}`;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return `css-${Math.abs(h).toString(36)}`;
+  let h = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193); // FNV prime
+  }
+  // 多轮混合进一步降低碰撞
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x2c1b3c6d);
+  h ^= h >>> 12;
+  h = Math.imul(h, 0x297a2d39);
+  h ^= h >>> 15;
+  return `css-${(h >>> 0).toString(16)}`;
 }
 
 
@@ -302,13 +322,14 @@ export const useApp = create<AppState>((set, get) => ({
     get().persistWorkspaces();
   },
 
-  toggleEnabledModel: (key, _allKeys) => {
+  toggleEnabledModel: (key, allKeys) => {
     const cur = get().enabledModels;
     let next: string[] | undefined;
     if (cur === undefined) {
-      // 首次操作：从"显示全部"切换到白名单模式
-      // 用户取消勾选一个 → 激活白名单但为空（全部不选），用户再逐个勾选
-      next = [];
+      // 首次操作：从"显示全部"切换到白名单模式。
+      // 先用 allKeys 初始化全集，再剔除本次取消的 key，避免"首次取消就丢失全部模型"。
+      const all = allKeys && allKeys.length ? allKeys : [];
+      next = all.filter((k) => k !== key);
     } else {
       // 已在白名单模式：toggle 该 key
       const has = cur.includes(key);
@@ -406,6 +427,21 @@ export const useApp = create<AppState>((set, get) => ({
     const migratedAppearance: AppearanceConfig | undefined = normalizedCustomCss
       ? { ...file.appearance, customCss: normalizedCustomCss }
       : file.appearance;
+    // 旧版 enabledModels 用 provider/id 的 '/' 分隔（modelKey 改版前写法），
+    // 新 modelKey 用 \u0000 分隔；把老 key 规整成新格式，避免升级后白名单“整体消失”。
+    const migratedEnabledModels: string[] | undefined = (() => {
+      const list = file.enabledModels;
+      if (!list) return undefined;
+      let changed = false;
+      const out = list.map((k) => {
+        if (k.includes('\u0000')) return k; // 已是新格式
+        const slash = k.indexOf('/');
+        if (slash < 0) return k; // 无法识别，保留原值
+        changed = true;
+        return modelKey({ provider: k.slice(0, slash), id: k.slice(slash + 1) });
+      });
+      return changed ? out : list;
+    })();
     set({
       workspaces: migratedWorkspaces,
       archived: migratedArchived,
@@ -413,7 +449,7 @@ export const useApp = create<AppState>((set, get) => ({
       workspacesLoaded: true,
       removedCwds: file.removedCwds ?? [],
       lastModel: file.lastModel,
-      enabledModels: file.enabledModels,
+      enabledModels: migratedEnabledModels,
       systemPrompt: file.systemPrompt,
       appearance: migratedAppearance,
       hooks: file.hooks,
@@ -423,7 +459,8 @@ export const useApp = create<AppState>((set, get) => ({
       migratedWorkspaces.some((w, i) => w.id !== file.workspaces[i]?.id) ||
       migratedArchived.some((w, i) => w.id !== (file.archived ?? [])[i]?.id) ||
       migratedCurrentId !== file.currentId ||
-      normalizedCustomCss !== file.appearance?.customCss;
+      normalizedCustomCss !== file.appearance?.customCss ||
+      migratedEnabledModels !== file.enabledModels;
     if (dirty) get().persistWorkspaces();
   },
 
@@ -527,7 +564,9 @@ export const useApp = create<AppState>((set, get) => ({
     };
     // 动态 import 避免循环依赖（rpc-client 也 import store）
     void import('./rpc-client').then(({ rpc }) => {
-      void rpc.saveWorkspaces(file).catch(() => undefined);
+      void rpc.saveWorkspaces(file).catch((e) =>
+        get().pushToast(`保存工作空间配置失败：${e instanceof Error ? e.message : String(e)}`, 'error'),
+      );
     });
   },
 
@@ -567,9 +606,10 @@ export const useApp = create<AppState>((set, get) => ({
     })),
 
   pushToast: (text, level = 'info') => {
-    const id = Date.now() + Math.random();
+    const id = ++toastSeq;
     set((s) => ({ toasts: [...s.toasts, { id, text, level }] }));
     setTimeout(() => {
+      // 按 id 精确过滤：手动关闭后此处仍为 no-op，无重复删除副作用
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, 5000);
   },
@@ -630,7 +670,9 @@ export const useApp = create<AppState>((set, get) => ({
           set({ sessionsMap });
         }
       });
-    }).catch(() => undefined);
+    }).catch((e) =>
+      get().pushToast(`读取会话消息失败：${e instanceof Error ? e.message : String(e)}`, 'error'),
+    );
   },
 
   appendUserMessage: (text) => {
@@ -657,12 +699,17 @@ export const useApp = create<AppState>((set, get) => ({
     // 不再依赖 ompCurrentPath 猜测（那是单进程时代的 hack）。
     const targetPath = (frame.__sessionPath as string | undefined) ?? '';
     if (!targetPath) return; // 无会话标记的帧丢弃（不应发生）
-    let buffer = s.sessionsMap[targetPath] ? [...s.sessionsMap[targetPath]] : [];
     const isDisplay = targetPath === (s.currentSessionPath ?? '');
     // per-session 流式状态（后台会话独立维护，不污染全局 isStreaming）
     let procStreaming = s.procStateMap[targetPath]?.isStreaming ?? false;
     let procAborting = s.procStateMap[targetPath]?.isAborting ?? false;
     const type = frame.type as string;
+
+    // 惰性复制：仅当真正要修改 buffer 时才复制原数组，避免每个事件都复制。
+    let buffer: ChatMessage[] | null = null;
+    const getBuf = (): ChatMessage[] =>
+      (buffer ??= s.sessionsMap[targetPath] ? [...s.sessionsMap[targetPath]] : []);
+    let bufferTouched = false;
 
     switch (type) {
       case 'agent_start': {
@@ -678,15 +725,19 @@ export const useApp = create<AppState>((set, get) => ({
         const msg = frame.message as AgentMessage;
         if (!msg) break;
         if (msg.role === 'user') break; // user 消息由本地输入 push
-        buffer.push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true });
+        getBuf().push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true });
+        bufferTouched = true;
         break;
       }
       case 'message_update': {
         const msg = frame.message as AgentMessage;
         if (!msg || msg.role !== 'assistant') break;
-        for (let i = buffer.length - 1; i >= 0; i--) {
-          if (buffer[i].role === 'assistant' && buffer[i].streaming) {
-            buffer[i] = { ...buffer[i], parts: contentToParts(msg) };
+        const buf = getBuf();
+        for (let i = buf.length - 1; i >= 0; i--) {
+          const m = buf[i];
+          if (m && m.role === 'assistant' && m.streaming) {
+            buf[i] = { ...m, parts: contentToParts(msg) };
+            bufferTouched = true;
             break;
           }
         }
@@ -703,15 +754,18 @@ export const useApp = create<AppState>((set, get) => ({
         if (parts.length === 0 && errorText) {
           parts = [{ kind: 'text', text: `⚠️ **模型请求失败**\n\n${errorText}\n\n请检查模型是否可用（右上角切换模型），或查看 .temp/omp-stderr-*.log。` }];
         }
-        for (let i = buffer.length - 1; i >= 0; i--) {
-          if (buffer[i].role === msg.role && (buffer[i].streaming || msg.role === 'user')) {
-            buffer[i] = {
-              ...buffer[i],
+        const buf = getBuf();
+        for (let i = buf.length - 1; i >= 0; i--) {
+          const m = buf[i];
+          if (m && m.role === msg.role && (m.streaming || msg.role === 'user')) {
+            buf[i] = {
+              ...m,
               parts,
               streaming: false,
               usage: msg.usage ? { totalTokens: msg.usage.totalTokens, duration: msg.duration } : undefined,
               error: errorText,
             };
+            bufferTouched = true;
             break;
           }
         }
@@ -722,45 +776,52 @@ export const useApp = create<AppState>((set, get) => ({
         const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
         const args = frame.args;
         const part = { kind: 'tool', toolCallId, toolName, status: 'running', args } as ToolPart;
+        const buf = getBuf();
         let appended = false;
-        for (let i = buffer.length - 1; i >= 0; i--) {
-          if (buffer[i].role === 'assistant') {
-            buffer[i] = { ...buffer[i], parts: [...buffer[i].parts, part] };
+        for (let i = buf.length - 1; i >= 0; i--) {
+          const m = buf[i];
+          if (m && m.role === 'assistant') {
+            buf[i] = { ...m, parts: [...m.parts, part] };
             appended = true;
             break;
           }
         }
-        if (!appended) buffer.push({ id: nid(), role: 'assistant', parts: [part] });
+        if (!appended) buf.push({ id: nid(), role: 'assistant', parts: [part] });
+        bufferTouched = true;
         break;
       }
       case 'tool_execution_update': {
         const toolCallId = frame.toolCallId as string;
         const partial = frame.partialResult;
-        buffer = updateToolInBuffer(buffer, toolCallId, (p) => ({
+        const buf = getBuf();
+        buffer = updateToolInBuffer(buf, toolCallId, (p) => ({
           ...p,
           partial: typeof partial === 'string' ? (p.partial ?? '') + partial : p.partial,
         }));
+        bufferTouched = true;
         break;
       }
       case 'tool_execution_end': {
         const toolCallId = frame.toolCallId as string;
         const isError = Boolean(frame.isError);
         const result = frame.result;
-        buffer = updateToolInBuffer(buffer, toolCallId, (p) => ({
+        const buf = getBuf();
+        buffer = updateToolInBuffer(buf, toolCallId, (p) => ({
           ...p,
           status: isError ? 'error' : 'done',
           result,
         }));
+        bufferTouched = true;
         break;
       }
       // ---- M4: 压缩 / 重试 / Todo：仅当前显示会话才更新全局 UI 状态（后台会话不污染）----
       case 'auto_compaction_start': {
         if (isDisplay) set({ isCompacting: true, compactionInfo: '压缩上下文中…' });
-        break;
+        return;
       }
       case 'auto_compaction_end': {
         if (isDisplay) set({ isCompacting: false, compactionInfo: '' });
-        break;
+        return;
       }
       case 'auto_retry_start': {
         if (isDisplay) {
@@ -768,45 +829,50 @@ export const useApp = create<AppState>((set, get) => ({
           const max = (frame.maxAttempts ?? frame.maxRetries ?? '?') as number | string;
           set({ isRetrying: true, retryInfo: `重试中 (${attempt}/${max})…` });
         }
-        break;
+        return;
       }
       case 'auto_retry_end': {
         if (isDisplay) set({ isRetrying: false, retryInfo: '' });
-        break;
+        return;
       }
       case 'todo_reminder': {
         if (isDisplay) {
           const todoPhases = (frame.todoPhases ?? frame.phases) as TodoPhase[] | undefined;
           if (todoPhases) set({ todoPhases });
         }
-        break;
+        return;
       }
       case 'todo_auto_clear': {
         if (isDisplay) set({ todoPhases: [] });
-        break;
+        return;
       }
       default:
-        break;
+        // 未知类型：不复制、不写入，直接返回原引用，避免无谓的 set / 渲染
+        return;
     }
 
-    const sessionsMap = { ...s.sessionsMap, [targetPath]: buffer };
-    // 更新该会话的 per-session 进程状态
-    const procStateMap = {
-      ...s.procStateMap,
-      [targetPath]: {
-        ...(s.procStateMap[targetPath] ?? { status: 'online' as const, isStreaming: false, isAborting: false }),
-        status: 'online' as const,
-        isStreaming: procStreaming,
-        isAborting: procAborting,
-      } as ProcState,
+    const updates: Partial<AppState> = {
+      // 更新该会话的 per-session 进程状态（agent_start/agent_end 会用到）
+      procStateMap: {
+        ...s.procStateMap,
+        [targetPath]: {
+          ...(s.procStateMap[targetPath] ?? { status: 'online' as const, isStreaming: false, isAborting: false }),
+          status: 'online' as const,
+          isStreaming: procStreaming,
+          isAborting: procAborting,
+        } as ProcState,
+      },
     };
-    if (isDisplay) {
-      // 显示的就是在跑的会话：同步 messages + 全局 isStreaming/isAborting 供 ChatView/InputBox
-      set({ sessionsMap, procStateMap, messages: buffer, isStreaming: procStreaming, isAborting: procAborting });
-    } else {
-      // 后台会话在累积：只更新缓冲 + per-session 状态，不碰 messages / 全局 isStreaming
-      set({ sessionsMap, procStateMap });
+    if (bufferTouched) {
+      updates.sessionsMap = { ...s.sessionsMap, [targetPath]: buffer! };
+      if (isDisplay) updates.messages = buffer!;
     }
+    if (isDisplay) {
+      // 显示的就是在跑的会话：同步全局 isStreaming/isAborting 供 ChatView/InputBox
+      updates.isStreaming = procStreaming;
+      updates.isAborting = procAborting;
+    }
+    set(updates);
   },
 }));
 

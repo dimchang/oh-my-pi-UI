@@ -13,7 +13,7 @@ export const IPC = {
   OmpRenameKey: 'omp:rename-key',    // (oldKey: string, newKey: string) => Promise<void> — 新进程落盘后把临时 key 换成真实 sessionPath
   SessionList: 'session:list', // (cwd?: string) => Promise<SessionSummary[]>
   SessionDelete: 'session:delete', // (path: string) => Promise<void>
-  SessionMessages: 'session:messages', // (path: string) => Promise<AgentMessage[]>
+  SessionMessages: 'session:messages', // (path: string) => Promise<ReplayMessage[]>
   SessionUserEntries: 'session:user-entries', // (path: string) => Promise<{id:string;text:string}[]> — 分叉用，取 user entry id + 文本
   GetOmpInfo: 'omp:info', // () => Promise<{path:string; version:string}>
   OpenExternal: 'shell:open-external', // (url: string) => Promise<void>
@@ -222,7 +222,9 @@ export interface OmpModelDefinition {
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
-  [k: string]: unknown;
+  // issue 90: 用显式 extra 字段收集未知字段，替代过度宽松的 [k:string]:unknown 索引签名
+  // （索引签名会让所有属性访问退化为 unknown 且无法捕获 typo）
+  extra?: Record<string, unknown>;
 }
 
 /** models.yml 的 providers.<id> 结构（对齐 omp 17.x models-config-schema，GUI 只读写关心的字段，未知字段透传保留） */
@@ -240,7 +242,8 @@ export interface OmpProviderConfig {
   discovery?: { type: string; [k: string]: unknown };
   /** 手动声明的模型列表（可选，与 discovery 二选一或并存） */
   models?: OmpModelDefinition[];
-  [k: string]: unknown;
+  // issue 90: 未知字段收进显式 extra，替代宽松索引签名（写回时展开）
+  extra?: Record<string, unknown>;
 }
 
 /** models.yml 顶层结构 */
@@ -286,7 +289,8 @@ export interface OmpApi {
   onStderr(cb: (payload: { sessionPath: string; line: string }) => void): () => void;
   onNotFound(cb: (message: string) => void): () => void;
   /** 通知主进程 renderer 就绪（多进程下不再直接起 omp，仅标记可响应 acquire） */
-  notifyReady(initialCwd?: string): Promise<void>;
+  /** 通知主进程 renderer 就绪（issue 85：handler 为无参 no-op，不再接收 initialCwd 死参） */
+  notifyReady(): Promise<void>;
 
   // M5: 工作空间
   getWorkspaces(): Promise<WorkspacesFile>;

@@ -8,6 +8,7 @@
 
 import React, { useState } from 'react';
 import { useApp } from '../store';
+import { cwdKey } from '../utils/path-key';
 import type { HookFileConfig, HookFileInfo, HookUnit } from '../../shared/ipc-channels';
 
 function basename(p: string): string {
@@ -39,14 +40,15 @@ export const SettingsHooks: React.FC = () => {
       const paths = await window.omp.pickHookFiles();
       if (!paths || paths.length === 0) return;
       const infos = await window.omp.parseHookFiles(paths);
-      const existing = new Set(hooks.map((h) => h.path));
+      // 路径去重前先归一化（小写 + 统一分隔符），避免 Windows 上 C:\a.ts / c:/a.ts / C:/a.ts 被当成不同文件
+      const existing = new Set(hooks.map((h) => cwdKey(h.path)));
       const next: HookFileConfig[] = [...hooks];
       for (const info of infos) {
         if (info.error) {
           setError(`解析失败：${basename(info.path)} — ${info.error}`);
           continue;
         }
-        if (existing.has(info.path)) continue; // 去重：已导入过
+        if (existing.has(cwdKey(info.path))) continue; // 去重：已导入过（归一化比较）
         const units = buildUnits(info);
         next.push({
           path: info.path,

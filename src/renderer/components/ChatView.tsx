@@ -5,7 +5,7 @@ import { useApp, type ChatMessage } from '../store';
 import { ToolCard } from './ToolCard';
 
 /** 正文里 markdown 代码块默认折叠（超过 ~6 行时收起） */
-const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown }> = ({ children }) => {
+const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown }> = ({ children, node: _node }) => {
   const [expanded, setExpanded] = useState(false);
   const [needsCollapse, setNeedsCollapse] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
@@ -52,7 +52,7 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
                 key={i}
                 remarkPlugins={[remarkGfm]}
                 components={{
-                  pre: ({ children, ...props }) => (
+                  pre: ({ node: _node, children, ...props }) => (
                     <CollapsibleCodeBlock key={i} {...props}>{children}</CollapsibleCodeBlock>
                   ),
                 }}

@@ -11,6 +11,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { randomUUID, createHash } from 'crypto';
 
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 import { OmpProcessPool } from './omp-pool';
@@ -53,7 +54,7 @@ function resolveOmpVersion(p: string): string {
     const out = execSync(`"${p}" --version`, { encoding: 'utf8', timeout: 5000 });
     const firstLine = out.split(/\r?\n/)[0]?.trim() ?? '';
     const m = firstLine.match(/(?:^|\s)(?:omp\/|v)?(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/i);
-    if (m) return m[1];
+    if (m?.[1]) return m[1];
     return firstLine || '';
   } catch { return ''; }
 }
@@ -69,7 +70,6 @@ function readUiVersion(): string {
   } catch { return 'unknown'; }
 }
 const UI_VERSION = readUiVersion();
-const WORK_DIR = process.env.OMP_WORKDIR ?? process.cwd();
 
 let mainWindow: BrowserWindow | null = null;
 let pool: OmpProcessPool | null = null;
@@ -81,46 +81,75 @@ function emptyWorkspacesFile(): WorkspacesFile {
   return { version: 1, workspaces: [], currentId: null };
 }
 
-function loadWorkspacesFile(): WorkspacesFile {
+/** 简单的内存缓存：workspaces.json 内容几乎只在用户操作时变化，避免每次 IPC 都重读磁盘。
+ *  以文件 mtime 作为失效判断（无 fs.watch 复杂度，但能保证修改后立即可见）。 */
+let wsCache: { mtimeMs: number; data: WorkspacesFile } | null = null;
+
+/** 手动结构校验 + 白名单式重建：JSON.parse 失败时回退默认；字段不合法（如 workspaces
+ *  不是数组、元素缺 id/cwd）也回退默认，避免脏数据污染运行时。 */
+function parseWorkspacesFile(raw: string): WorkspacesFile {
+  let parsed: any;
   try {
-    if (!fs.existsSync(WORKSPACES_FILE)) return emptyWorkspacesFile();
-    const raw = fs.readFileSync(WORKSPACES_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<WorkspacesFile>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.workspaces)) return emptyWorkspacesFile();
-    return {
-      version: 1,
-      workspaces: parsed.workspaces,
-      currentId: parsed.currentId ?? null,
-      archived: Array.isArray(parsed.archived) ? parsed.archived : [],
-      removedCwds: Array.isArray(parsed.removedCwds)
-        ? (parsed.removedCwds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [],
-      lastModel: parsed.lastModel && typeof parsed.lastModel === 'object'
-        ? {
-            provider: String((parsed.lastModel as { provider?: unknown }).provider ?? ''),
-            id: String((parsed.lastModel as { id?: unknown }).id ?? ''),
-            name: typeof (parsed.lastModel as { name?: unknown }).name === 'string'
-              ? (parsed.lastModel as { name: string }).name : undefined,
-          }
-        : undefined,
-      enabledModels: Array.isArray(parsed.enabledModels)
-        ? (parsed.enabledModels as unknown[]).filter((x): x is string => typeof x === 'string')
-        : undefined,
-      systemPrompt: typeof parsed.systemPrompt === 'string' ? parsed.systemPrompt : undefined,
-      appearance: parsed.appearance && typeof parsed.appearance === 'object'
-        ? (parsed.appearance as WorkspacesFile['appearance'])
-        : undefined,
-      // 注意：本函数是"白名单式重建对象"，saveWorkspacesFile 里新增的字段必须在这里同步补上，
-      // 否则该字段会在下次启动被剥掉、随后任意一次 persist 被永久抹掉（hooks 曾踩此坑）。
-      hooks: Array.isArray(parsed.hooks) ? (parsed.hooks as WorkspacesFile['hooks']) : undefined,
-    };
-  } catch { return emptyWorkspacesFile(); }
+    parsed = JSON.parse(raw);
+  } catch {
+    return emptyWorkspacesFile();
+  }
+  if (!parsed || typeof parsed !== 'object') return emptyWorkspacesFile();
+  if (parsed.version !== 1 || !Array.isArray(parsed.workspaces)) return emptyWorkspacesFile();
+  for (const w of parsed.workspaces) {
+    if (!w || typeof w !== 'object') return emptyWorkspacesFile();
+    if (typeof w.id !== 'string' || typeof w.cwd !== 'string') return emptyWorkspacesFile();
+  }
+  return {
+    version: 1,
+    workspaces: parsed.workspaces,
+    currentId: parsed.currentId ?? null,
+    archived: Array.isArray(parsed.archived) ? parsed.archived : [],
+    removedCwds: Array.isArray(parsed.removedCwds)
+      ? (parsed.removedCwds as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [],
+    lastModel: parsed.lastModel && typeof parsed.lastModel === 'object'
+      ? {
+          provider: String((parsed.lastModel as { provider?: unknown }).provider ?? ''),
+          id: String((parsed.lastModel as { id?: unknown }).id ?? ''),
+          name: typeof (parsed.lastModel as { name?: unknown }).name === 'string'
+            ? (parsed.lastModel as { name: string }).name : undefined,
+        }
+      : undefined,
+    enabledModels: Array.isArray(parsed.enabledModels)
+      ? (parsed.enabledModels as unknown[]).filter((x): x is string => typeof x === 'string')
+      : undefined,
+    systemPrompt: typeof parsed.systemPrompt === 'string' ? parsed.systemPrompt : undefined,
+    appearance: parsed.appearance && typeof parsed.appearance === 'object'
+      ? (parsed.appearance as WorkspacesFile['appearance'])
+      : undefined,
+    // 注意：本函数是"白名单式重建对象"，saveWorkspacesFile 里新增的字段必须在这里同步补上，
+    // 否则该字段会在下次启动被剥掉、随后任意一次 persist 被永久抹掉（hooks 曾踩此坑）。
+    hooks: Array.isArray(parsed.hooks) ? (parsed.hooks as WorkspacesFile['hooks']) : undefined,
+  };
 }
 
-function saveWorkspacesFile(file: WorkspacesFile): void {
+async function loadWorkspacesFile(): Promise<WorkspacesFile> {
   try {
-    fs.mkdirSync(path.dirname(WORKSPACES_FILE), { recursive: true });
-    fs.writeFileSync(WORKSPACES_FILE, JSON.stringify(file, null, 2), 'utf8');
+    const st = await fs.promises.stat(WORKSPACES_FILE);
+    if (wsCache && wsCache.mtimeMs === st.mtimeMs) return wsCache.data;
+    const raw = await fs.promises.readFile(WORKSPACES_FILE, 'utf8');
+    const data = parseWorkspacesFile(raw);
+    wsCache = { mtimeMs: st.mtimeMs, data };
+    return data;
+  } catch (e) {
+    // 文件不存在（ENOENT）或解析/读取失败 → 回退空配置；不要抛出以免 IPC handler reject。
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') wsCache = null;
+    return emptyWorkspacesFile();
+  }
+}
+
+async function saveWorkspacesFile(file: WorkspacesFile): Promise<void> {
+  try {
+    await fs.promises.mkdir(path.dirname(WORKSPACES_FILE), { recursive: true });
+    await fs.promises.writeFile(WORKSPACES_FILE, JSON.stringify(file, null, 2), 'utf8');
+    // 写入后让下次 load 重新读取（mtime 已变，这里顺手清掉避免同 tick 内读到旧缓存）。
+    wsCache = null;
   } catch (e) {
     sendToRenderer(IPC.OmpStderr, { sessionPath: '', line: `[workspaces-save-error] ${e instanceof Error ? e.message : String(e)}` });
   }
@@ -142,7 +171,11 @@ function createWindow(): void {
     titleBarStyle: USE_CUSTOM_TITLE_BAR ? 'hidden' : 'default',
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.mjs'),
-      contextIsolation: true, nodeIntegration: false, sandbox: false,
+      contextIsolation: true, nodeIntegration: false,
+      // sandbox 保持关闭：preload 通过 contextBridge 暴露的 API 依赖 Node 能力
+      // （fs/path 等仅在主进程使用，但 IPC 通道与部分能力需要非沙箱上下文；
+      // 若未来 preload 完全不触碰 Node API，可开启 sandbox: true 进一步收紧）。
+      sandbox: false,
     },
   });
   mainWindow.on('closed', () => { mainWindow = null; });
@@ -157,100 +190,109 @@ function createWindow(): void {
   }
 }
 
-/** 定位 styles.css：优先开发源码路径，其次打包输出路径。 */
-function findStylesCssPath(): string | null {
-  const candidates = [
-    path.join(__dirname, '..', '..', 'src', 'renderer', 'styles.css'),
-    path.join(__dirname, '..', '..', 'out', 'renderer', 'styles.css'),
-    path.join(__dirname, '..', 'renderer', 'styles.css'),
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
+/** 自定义 CSS 持久化文件：不再污染源码 styles.css（开发态会被 git 跟踪、
+ *  打包态在 asar 里只读），统一写入 userData 下的 custom.css，运行时通过
+ *  webContents.insertCSS 注入渲染进程，对外行为（自定义样式生效）保持一致。 */
+function customCssPath(): string {
+  return path.join(app.getPath('userData'), 'custom.css');
 }
 
-/** 移除 styles.css 中所有 OMP-UI 自定义 CSS 区块。 */
+/** 移除指定文件里所有 OMP-UI 自定义 CSS 区块，保留用户手动内容（含未闭合区块，见上方实现）。 */
 function stripCustomCssBlocks(css: string): string {
   const lines = css.split('\n');
   const out: string[] = [];
   let inBlock = false;
   let currentId: string | null = null;
+  let blockLines: string[] = []; // 当前未闭合区块内的行，EOF 时若仍未闭合则回写，避免吞掉用户 CSS
   for (const line of lines) {
     const beginMatch = line.match(/\/\* OMP-UI-CUSTOM-CSS-BEGIN: ([\w-]+) mode=(embed|link) path="([^"]*)" \*\//);
     if (beginMatch) {
       inBlock = true;
-      currentId = beginMatch[1];
+      currentId = beginMatch[1] ?? null;
+      blockLines = [];
       continue;
     }
     const endMatch = line.match(/\/\* OMP-UI-CUSTOM-CSS-END: ([\w-]+) \*\//);
     if (endMatch && endMatch[1] === currentId) {
       inBlock = false;
       currentId = null;
+      blockLines = [];
       continue;
     }
     if (!inBlock) out.push(line);
+    else blockLines.push(line); // 临时缓冲，闭合即丢弃；未闭合则 EOF 回写
   }
+  // 文件结束仍处未闭合区块：把缓冲的内容原样保留，宁可留着也别吞掉用户 CSS。
+  if (inBlock) out.push(...blockLines);
   return out.join('\n');
 }
 
-/** 生成一个自定义 CSS 区块。 */
-function buildCustomCssBlock(c: CustomCssConfig): string | null {
+/** 生成一个自定义 CSS 区块（异步读取 embed 源文件）。 */
+async function buildCustomCssBlock(c: CustomCssConfig): Promise<string | null> {
   if (c.mode === 'link') {
     const fileUrl = pathToFileURL(c.path).href;
     return `/* OMP-UI-CUSTOM-CSS-BEGIN: ${c.id} mode=link path="${c.path.replace(/"/g, '\\"')}" */\n@import url("${fileUrl}");\n/* OMP-UI-CUSTOM-CSS-END: ${c.id} */`;
   }
   try {
-    const content = fs.readFileSync(c.path, 'utf8');
+    const content = await fs.promises.readFile(c.path, 'utf8');
     return `/* OMP-UI-CUSTOM-CSS-BEGIN: ${c.id} mode=embed path="${c.path.replace(/"/g, '\\"')}" */\n${content}\n/* OMP-UI-CUSTOM-CSS-END: ${c.id} */`;
   } catch {
     return null;
   }
 }
 
-/** 把自定义 CSS 列表同步到 styles.css。
- *  - embed：内容追加到文件尾部；
- *  - link：@import 插入到文件顶部（@charset 之后、其他规则之前）；
- *  - 禁用/不存在的条目会被移除。 */
-function syncCustomCss(list: CustomCssConfig[]): { error?: string } {
-  const stylesPath = findStylesCssPath();
-  if (!stylesPath) return { error: '未找到 styles.css（开发态应为 src/renderer/styles.css，打包后应为 out/renderer/styles.css）' };
+/** 上次 insertCSS 返回的 key，更新时先移除旧样式再注入新样式。 */
+let injectedCssKey: string | null = null;
+
+/** 把合并后的自定义 CSS 注入渲染进程（运行时生效，无需改 renderer 的 import）。 */
+async function injectCustomCss(css: string): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const wc = mainWindow.webContents;
   try {
-    let css = fs.readFileSync(stylesPath, 'utf8');
-    css = stripCustomCssBlocks(css);
+    if (injectedCssKey !== null) {
+      await wc.removeInsertedCSS(injectedCssKey);
+      injectedCssKey = null;
+    }
+  } catch { /* 旧 key 可能已随页面重载失效，忽略 */ }
+  if (!css) return;
+  try {
+    injectedCssKey = await wc.insertCSS(css);
+  } catch { /* 注入失败不阻断主流程 */ }
+}
+
+/** 把自定义 CSS 列表同步到 userData/custom.css，并运行时注入渲染进程。
+ *  - embed：读取源文件内容写入区块；
+ *  - link：区块内 @import 该文件；
+ *  - 禁用/不存在的条目会被移除；
+ *  - 同时保留用户在该文件手动追加的、非 OMP-UI 区块的内容（stripCustomCssBlocks）。 */
+async function syncCustomCss(list: CustomCssConfig[]): Promise<{ error?: string }> {
+  const target = customCssPath();
+  try {
+    // 1) 读取已有文件，剥离旧区块，保留用户手动内容
+    let base = '';
+    try { base = await fs.promises.readFile(target, 'utf8'); } catch { /* 文件不存在视为空 */ }
+    base = stripCustomCssBlocks(base);
 
     const enabled = (list ?? []).filter((c) => c && c.enabled);
     const imports: string[] = [];
     const embeds: string[] = [];
     for (const c of enabled) {
-      const block = buildCustomCssBlock(c);
+      const block = await buildCustomCssBlock(c);
       if (!block) continue;
       if (c.mode === 'link') imports.push(block);
       else embeds.push(block);
     }
 
-    // 把 link 的 @import 放在文件顶部（CSS 规范要求在其他规则之前）
-    if (imports.length > 0) {
-      const lines = css.split('\n');
-      let insertIdx = 0;
-      for (let i = 0; i < lines.length; i++) {
-        const t = lines[i].trim();
-        if (!t) continue;
-        if (t.startsWith('/*') && t.endsWith('*/')) continue;
-        if (t.startsWith('@charset')) continue;
-        insertIdx = i;
-        break;
-      }
-      lines.splice(insertIdx, 0, imports.join('\n\n') + '\n');
-      css = lines.join('\n');
-    }
+    let combined = base.trimEnd();
+    if (imports.length > 0) combined += (combined ? '\n\n' : '') + imports.join('\n\n');
+    if (embeds.length > 0) combined += (combined ? '\n\n' : '') + embeds.join('\n\n');
+    combined = (combined + '\n').trimEnd() + '\n';
 
-    // embed 追加到文件末尾
-    if (embeds.length > 0) {
-      css = css.trimEnd() + '\n\n' + embeds.join('\n\n') + '\n';
-    }
+    await fs.promises.mkdir(path.dirname(target), { recursive: true });
+    await fs.promises.writeFile(target, combined, 'utf8');
 
-    fs.writeFileSync(stylesPath, css, 'utf8');
+    // 2) 运行时注入，使样式立即生效（也解决打包态 asar 内 styles.css 只读无法写入的问题）
+    await injectCustomCss(imports.join('\n') + '\n' + embeds.join('\n'));
     return {};
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
@@ -278,7 +320,8 @@ function registerIpc(): void {
   ipcMain.handle(IPC.OmpAcquire, async (_e, sessionPath: string, cwd: string, approvalMode?: ApprovalMode) => {
     if (!pool) throw new Error('pool not initialized');
     // 钩子是全局的，续接/恢复的历史会话也一并加载（读取持久化配置，解析出 --hook 参数）。
-    const hooks = resolveHookArgs(loadWorkspacesFile().hooks);
+    const wf = await loadWorkspacesFile();
+    const hooks = await resolveHookArgs(wf.hooks, sessionPath);
     await pool.acquire(sessionPath, cwd, approvalMode ?? 'write', hooks);
   });
 
@@ -286,11 +329,12 @@ function registerIpc(): void {
     if (!pool) throw new Error('pool not initialized');
     // 新建会话：spawn 不带 -r/-c（新 .jsonl），用 tempKey 绑定。
     // 真实 path 在首条消息 agent_end 后落盘，renderer refreshSessions 时迁移 tempKey→realPath。
-    const tempKey = '__new_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    // 用 crypto.randomUUID 作 key，杜绝 Date.now + 4 位随机的碰撞可能（issue 79）。
+    const tempKey = '__new_' + randomUUID();
     // 读取持久化的系统提示词 + 钩子，注入到新会话。
-    const wf = loadWorkspacesFile();
+    const wf = await loadWorkspacesFile();
     const systemPrompt = wf.systemPrompt;
-    const hooks = resolveHookArgs(wf.hooks);
+    const hooks = await resolveHookArgs(wf.hooks, tempKey);
     await pool.acquireNew(tempKey, cwd, approvalMode ?? 'write', systemPrompt, hooks);
     return { sessionPath: tempKey };
   });
@@ -304,19 +348,22 @@ function registerIpc(): void {
   });
 
   ipcMain.handle(IPC.SessionList, async (_e, cwd?: string) => listSessions(cwd));
-  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => { deleteSession(p); });
+  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => { await deleteSession(p); });
   ipcMain.handle(IPC.SessionMessages, async (_e, p: string) => readSessionMessages(p));
   ipcMain.handle(IPC.SessionUserEntries, async (_e, p: string) => readUserEntries(p));
 
   ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown' }));
 
   ipcMain.handle(IPC.OpenExternal, async (_e, url: string) => {
-    if (/^https?:\/\//i.test(url)) await shell.openExternal(url);
-    else { const res = await shell.openPath(url); if (res) throw new Error(res); }
+    // 只允许 http/https，其余（file://、自定义协议、裸路径）一律拒绝，避免借 IPC 打开任意资源。
+    if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
+    await shell.openExternal(url);
   });
   ipcMain.handle(IPC.ClipboardWriteText, async (_e, text: string) => { clipboard.writeText(String(text ?? '')); });
   ipcMain.handle(IPC.ShowItemInFolder, async (_e, fullPath: string) => {
-    if (fullPath && fs.existsSync(fullPath)) shell.showItemInFolder(path.normalize(fullPath));
+    let exists = false;
+    try { exists = (await fs.promises.stat(fullPath)).isFile(); } catch { exists = false; }
+    if (fullPath && exists) shell.showItemInFolder(path.normalize(fullPath));
     else { const dir = path.dirname(fullPath || ''); const res = await shell.openPath(dir); if (res) throw new Error(res); }
   });
   ipcMain.handle(IPC.ShowSaveDialog, async (_e, defaultPath?: string) => {
@@ -324,16 +371,23 @@ function registerIpc(): void {
     const r = await dialog.showSaveDialog(mainWindow, { defaultPath: defaultPath ?? 'session.html', filters: [{ name: 'HTML', extensions: ['html'] }] });
     return r.canceled ? null : (r.filePath ?? null);
   });
-  ipcMain.handle(IPC.ListFiles, async (_e, dirPath: string) => listDir(dirPath));
+  ipcMain.handle(IPC.ListFiles, async (_e, dirPath: string) => {
+    // 仅允许枚举已注册 workspace 目录（workspaces.json 中的 cwd）之内的路径（issue 2）。
+    if (!dirPath || !(await isWithinWorkspaces(dirPath))) {
+      sendToRenderer(IPC.OmpStderr, { sessionPath: '', line: '[list-files] blocked: path is not inside any registered workspace' });
+      return [];
+    }
+    return listDir(dirPath);
+  });
 
   // renderer 就绪（多进程下不再直接起 omp，仅标记；renderer 按需 acquire）
   ipcMain.handle(IPC.RendererReady, async () => { /* no-op: pool 按需 lazy acquire */ });
 
   // ---- 工作空间 ----
-  ipcMain.handle(IPC.WorkspacesGet, async () => loadWorkspacesFile());
+  ipcMain.handle(IPC.WorkspacesGet, async () => await loadWorkspacesFile());
   ipcMain.handle(IPC.WorkspacesSave, async (_e, file: WorkspacesFile) => {
     if (!file || file.version !== 1) throw new Error('invalid workspaces file');
-    saveWorkspacesFile(file);
+    await saveWorkspacesFile(file);
   });
   ipcMain.handle(IPC.DialogOpenDir, async (_e, defaultPath?: string) => {
     if (!mainWindow) return null;
@@ -353,7 +407,7 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.OmpParseHookFiles, async (_e, paths: string[]) => {
     if (!Array.isArray(paths)) return [];
-    return paths.map((p) => parseHookFile(p));
+    return await Promise.all(paths.map((p) => parseHookFile(p)));
   });
 
   // ---- 自定义 CSS 导入 ----
@@ -368,7 +422,15 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.OmpReadCssFile, async (_e, filePath: string) => {
     try {
-      const content = fs.readFileSync(filePath, 'utf8');
+      // 安全校验（issue 1）：renderer 传入任意路径可读文件。
+      // 采用"限定为 .css 扩展名 + 拒绝路径穿越"的保守策略：
+      //   - 扩展名必须是 .css（杜绝读取 /etc/passwd 等任意文件）；
+      //   - 路径中不得出现 '..' 段（杜绝 ../../ 逃逸到 allowed 目录之外）。
+      if (typeof filePath !== 'string' || !filePath) return { content: '', error: 'invalid path' };
+      if (path.extname(filePath).toLowerCase() !== '.css') return { content: '', error: 'only .css files are allowed' };
+      const normalized = path.normalize(filePath);
+      if (filePath.includes('..') || normalized.includes('..')) return { content: '', error: 'path traversal is not allowed' };
+      const content = await fs.promises.readFile(filePath, 'utf8');
       return { content };
     } catch (e: any) {
       return { content: '', error: String(e?.message ?? e) };
@@ -376,13 +438,13 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.OmpSyncCustomCss, async (_e, list: CustomCssConfig[]) => {
     if (!Array.isArray(list)) return { error: 'invalid list' };
-    return syncCustomCss(list);
+    return await syncCustomCss(list);
   });
 
   // ---- 模型配置 ----
-  ipcMain.handle(IPC.OmpModelsRead, async () => readModelsConfig());
-  ipcMain.handle(IPC.OmpModelsWriteProvider, async (_e, id: string, cfg: OmpProviderConfig) => { writeProvider(id, cfg); });
-  ipcMain.handle(IPC.OmpModelsDeleteProvider, async (_e, id: string) => { deleteProvider(id); });
+  ipcMain.handle(IPC.OmpModelsRead, async () => await readModelsConfig());
+  ipcMain.handle(IPC.OmpModelsWriteProvider, async (_e, id: string, cfg: OmpProviderConfig) => { await writeProvider(id, cfg); });
+  ipcMain.handle(IPC.OmpModelsDeleteProvider, async (_e, id: string) => { await deleteProvider(id); });
 
   // ---- 自定义标题栏 ----
   if (USE_CUSTOM_TITLE_BAR) {
@@ -495,15 +557,34 @@ async function listDir(dirPath: string): Promise<FileEntry[]> {
 
 // ---- 钩子（Hooks）静态解析 + 参数解析 ----
 
+/** 判断 dirPath 是否位于已注册 workspace（workspaces.json 中的 cwd）目录之内。
+ *  比较前把两边 realpath + 小写归一化，容忍大小写不敏感文件系统（如 Windows）。 */
+async function isWithinWorkspaces(dirPath: string): Promise<boolean> {
+  let target: string;
+  try {
+    target = (await fs.promises.realpath(dirPath)).toLowerCase();
+  } catch {
+    try { target = path.resolve(dirPath).toLowerCase(); } catch { return false; }
+  }
+  const wf = await loadWorkspacesFile();
+  for (const w of wf.workspaces) {
+    let base: string;
+    try { base = (await fs.promises.realpath(w.cwd)).toLowerCase(); } catch { base = path.resolve(w.cwd).toLowerCase(); }
+    if (target === base || target.startsWith(base + path.sep)) return true;
+  }
+  return false;
+}
+
 /** 静态解析一个 .ts 钩子文件：默认导出 / 具名导出 / pi.on 事件名。不执行代码。 */
-function parseHookFile(filePath: string): HookFileInfo {
+async function parseHookFile(filePath: string): Promise<HookFileInfo> {
   const base: HookFileInfo = { path: filePath, hasDefault: false, namedHooks: [], events: [] };
   try {
-    const src = fs.readFileSync(filePath, 'utf8');
-    // 去掉块注释与行注释，避免误匹配（保留换行以不影响后续按行匹配）
+    const src = await fs.promises.readFile(filePath, 'utf8');
+    // 去掉块注释；行注释仅剥离"行首（允许前导空白）的 //"（保守策略，issue 80）：
+    // 避免误伤字符串里的 URL（如 "https://..."）或含 // 的合法内容。
     const noComments = src
       .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|[^:])(\/\/.*)$/gm, '$1');
+      .replace(/^\s*\/\/.*$/gm, '');
     // 默认导出（函数 / 类 / 箭头 / 标识符）
     base.hasDefault =
       /export\s+default\s+(?:async\s+)?(?:function|class|\()/.test(noComments) ||
@@ -520,7 +601,7 @@ function parseHookFile(filePath: string): HookFileInfo {
     // pi.on("event", ...) 事件名
     const evtRe = /pi\s*\.\s*on\s*\(\s*['"]([\w-]+)['"]/g;
     const events = new Set<string>();
-    while ((m = evtRe.exec(noComments))) events.add(m[1]);
+    while ((m = evtRe.exec(noComments))) { if (m[1]) events.add(m[1]); }
     base.events = [...events];
   } catch (e) {
     base.error = e instanceof Error ? e.message : String(e);
@@ -538,17 +619,24 @@ function hookWrapperName(hookPath: string): string {
   return `${sanitized.slice(-120)}-${Math.abs(h).toString(36)}.ts`;
 }
 
+/** 每个 session 独立的 hook 缓存子目录（以 session 路径的 sha1 命名），
+ *  使并发 acquire 时各 session 只清理自己的目录，杜绝误删他人刚写入的 wrapper（issue 3）。 */
+function sessionHookCacheDir(sessionPath: string): string {
+  const h = createHash('sha1').update(sessionPath).digest('hex');
+  return path.join(app.getPath('userData'), 'hook-cache', h);
+}
+
 /** 把持久化的钩子配置解析成 omp 启动参数 `--hook=<path>` 列表。
  *  - 整文件默认导出（fileLevel）→ 直接传原文件。
  *  - 多单元（具名导出）→ 生成过滤包装文件（只调用启用的单元），传包装文件。
- *  包装文件写到 userData/hook-cache；每次解析后清理"不在本次期望集合"的陈旧文件
- *  （不整目录清空——避免与刚 resolve 完、尚未 spawn 完成的进程产生竞态）。 */
-function resolveHookArgs(hooks?: HookFileConfig[]): string[] {
+ *  包装文件写到 userData/hook-cache/<session-hash>/；每次解析后只清理"本 session
+ *  子目录"内不在本次期望集合的陈旧文件（不碰其他 session，避免并发竞态）。 */
+async function resolveHookArgs(hooks?: HookFileConfig[], sessionPath?: string): Promise<string[]> {
   const args: string[] = [];
-  const cacheDir = path.join(app.getPath('userData'), 'hook-cache');
+  const cacheDir = sessionPath ? sessionHookCacheDir(sessionPath) : path.join(app.getPath('userData'), 'hook-cache');
   const expected = new Set<string>();
   if (hooks && hooks.length > 0) {
-    try { fs.mkdirSync(cacheDir, { recursive: true }); } catch { /* noop */ }
+    try { await fs.promises.mkdir(cacheDir, { recursive: true }); } catch { /* noop */ }
     for (const cfg of hooks) {
       if (!cfg.enabled || !cfg.units || cfg.units.length === 0) continue;
       const fileLevelUnit = cfg.units.find((u) => u.fileLevel);
@@ -573,17 +661,18 @@ function resolveHookArgs(hooks?: HookFileConfig[]): string[] {
       const fileName = hookWrapperName(cfg.path);
       const outPath = path.join(cacheDir, fileName);
       try {
-        fs.writeFileSync(outPath, wrapper, 'utf8');
+        await fs.promises.writeFile(outPath, wrapper, 'utf8');
         expected.add(fileName);
         args.push(outPath);
       } catch { /* 写失败则跳过该文件 */ }
     }
   }
-  // 清理废弃包装文件：删除钩子 / 改路径 / 清空全部钩子后，孤儿 .ts 不再残留
+  // 仅清理本 session 子目录下的废弃 wrapper（不影响其他 session，避免并发竞态）
   try {
-    for (const f of fs.readdirSync(cacheDir)) {
+    const files = await fs.promises.readdir(cacheDir);
+    for (const f of files) {
       if (!expected.has(f)) {
-        try { fs.unlinkSync(path.join(cacheDir, f)); } catch { /* noop */ }
+        try { await fs.promises.unlink(path.join(cacheDir, f)); } catch { /* noop */ }
       }
     }
   } catch { /* 目录不存在则无需清理 */ }

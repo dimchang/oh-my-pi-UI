@@ -9,6 +9,7 @@ import { spawn, spawnSync, execSync, type ChildProcessWithoutNullStreams } from 
 import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
+import { StringDecoder } from 'string_decoder';
 import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
 import type { ApprovalMode } from '../src/shared/ipc-channels';
 
@@ -129,12 +130,16 @@ export class OmpProcess {
   private rl: readline.Interface | null = null;
   private readyFired = false;
   private logStream: fs.WriteStream | null = null;
+  /** stderr 跨 chunk 解码器：避免多字节 UTF-8 字符被 chunk 边界截断导致乱码（issue 27）。 */
+  private stderrDecoder: StringDecoder | null = null;
   /** 兜底强杀计时器（kill 时安排，1500ms 后 SIGKILL）。存引用以便复用时清理；
    *  关键：只针对当时被 kill 的那个 child 实例，且它仍未退出才强杀，避免误杀 PID 被复用后的新进程。 */
   private pendingKillTimer: NodeJS.Timeout | null = null;
   /** restart() 进行中时保存其 reject，供 handleExit 检测新 omp 在 ready 前就死了的情况，
    *  立即拒绝 restart Promise（不等 timeout），并阻止 exit 冒泡到上层（避免双重 spawn）。 */
   private restartReject: ((err: Error) => void) | null = null;
+  /** restart() 进行中时保存其 resolve：新进程 ready 后一次性兑现，不修改共享的 events.onReady（issue 26）。 */
+  private restartResolve: (() => void) | null = null;
 
   constructor(
     private opts: OmpProcessOptions,
@@ -179,39 +184,47 @@ export class OmpProcess {
         return;
       }
       let settled = false;
-      const done = (fn: () => void) => {
+      // 防御：若新 omp 始终不 ready（慢 / 卡死），30s 后 reject。
+      const timeout = setTimeout(() => {
         if (settled) return;
         settled = true;
+        this.restartResolve = null;
         this.restartReject = null;
+        reject(new Error('omp restart timeout'));
+      }, 30000);
+      // 用一次性 Promise 兑现（不修改共享的 this.events.onReady，避免竞态，issue 26）：
+      //   - 新进程 ready → handleReady 内检测到 restartResolve 则兑现；
+      //   - 新进程在 ready 前死 → handleExit 内 restartReject 立即拒绝。
+      this.restartResolve = () => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
-        fn();
+        this.restartReject = null;
+        this.events.onRestarted?.();
+        resolve();
       };
-      // 防御：若新 omp 始终不 ready（慢 / 卡死），30s 后 reject。
-      const timeout = setTimeout(() => done(() => reject(new Error('omp restart timeout'))), 30000);
-      // 新 omp 在 ready 前死了 → handleExit 用此回调立即拒绝
-      this.restartReject = (err) => done(() => reject(err));
+      this.restartReject = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.restartResolve = null;
+        reject(err);
+      };
 
       this.opts.cwd = newCwd;
-      const prevOnReady = this.events.onReady;
-      // 用一次性包装 onReady：拿到 ready 后恢复原 handler 并 resolve
-      this.events.onReady = () => {
-        this.events.onReady = prevOnReady;
-        prevOnReady();
-        this.events.onRestarted?.();
-        done(resolve);
-      };
       try {
         this.kill();
       } catch (e) {
-        this.events.onReady = prevOnReady;
-        done(() => reject(e));
-        return;
+        this.restartResolve = null;
+        this.restartReject = null;
+        return reject(e);
       }
       try {
         this.start();
       } catch (e) {
-        this.events.onReady = prevOnReady;
-        done(() => reject(e));
+        this.restartResolve = null;
+        this.restartReject = null;
+        return reject(e);
       }
     });
   }
@@ -232,12 +245,14 @@ export class OmpProcess {
       for (const h of this.opts.hooks) args.push('--hook', h);
     }
 
-    // 日志
+    // 日志（按日轮转 + 旧文件清理，issue 82）
     try {
       const dir = this.opts.logDir ?? path.join(process.cwd(), '.temp');
       fs.mkdirSync(dir, { recursive: true });
       const day = new Date().toISOString().slice(0, 10);
       this.logStream = fs.createWriteStream(path.join(dir, `omp-stderr-${day}.log`), { flags: 'a' });
+      // 删除超过保留期的旧 stderr 日志，避免无限增长（best-effort，异步不阻塞 spawn）。
+      void OmpProcess.pruneOldStderrLogs(dir);
     } catch {
       this.logStream = null;
     }
@@ -268,14 +283,22 @@ export class OmpProcess {
       this.events.onFrame(frame);
     });
 
+    // 用 StringDecoder 增量解码：多字节 UTF-8 字符跨 chunk 边界时不会产生乱码（issue 27）
+    this.stderrDecoder = new StringDecoder('utf8');
     this.child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
+      const text = this.stderrDecoder!.write(chunk);
+      if (!text) return;
       this.logStream?.write(`[${new Date().toISOString()}] ${text}`);
       text.split(/\r?\n/).forEach((ln) => ln && this.events.onStderr(ln));
     });
 
     this.child.on('error', (err) => {
       this.events.onStderr(`[spawn-error] ${err.message}`);
+    });
+
+    // stdin 管道断裂（EPIPE 等）时若无 error 监听会以 unhandled 'error' 事件 crash 主进程（issue 25）
+    this.child.stdin.on('error', (err) => {
+      this.events.onStderr(`[stdin-error] ${err.message}`);
     });
 
     this.child.on('exit', this.handleExit);
@@ -300,7 +323,10 @@ export class OmpProcess {
     if (!this.child || !this.child.stdin.writable) {
       throw new Error('omp process not running');
     }
-    this.child.stdin.write(JSON.stringify(cmd) + '\n');
+    // 带错误回调：写入失败（管道断裂）时记入 stderr 日志而非抛出 unhandled 'error'（issue 25）
+    this.child.stdin.write(JSON.stringify(cmd) + '\n', (err) => {
+      if (err) this.events.onStderr(`[stdin-write-error] ${err.message}`);
+    });
   }
 
   kill(sync = false): void {
@@ -330,5 +356,32 @@ export class OmpProcess {
     this.child = null;
     this.logStream?.end();
     this.logStream = null;
+  }
+
+  /** stderr 日志保留天数（issue 82）：按日轮转文件名 omp-stderr-YYYY-MM-DD.log，
+   *  超过此天数的旧文件在下次 spawn 时删除，防止 .temp 无限增长。 */
+  private static readonly LOG_RETENTION_DAYS = 7;
+
+  /** 删除超过保留期的 omp-stderr-YYYY-MM-DD.log 旧日志（issue 82）。
+   *  用文件名里的日期判断年龄（不依赖 mtime，重命名/复制也稳）；best-effort：
+   *  任何 I/O 失败都吞掉，绝不影响进程启动。 */
+  private static async pruneOldStderrLogs(dir: string): Promise<void> {
+    try {
+      const cutoff = Date.now() - OmpProcess.LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+      const files = await fs.promises.readdir(dir);
+      for (const name of files) {
+        const m = /^omp-stderr-(\d{4}-\d{2}-\d{2})\.log$/.exec(name);
+        if (!m) continue;
+        const t = Date.parse(`${m[1]}T00:00:00Z`);
+        if (Number.isNaN(t) || t >= cutoff) continue;
+        try {
+          await fs.promises.unlink(path.join(dir, name));
+        } catch {
+          /* 单个文件删除失败（占用/权限）忽略，不影响其它文件与启动 */
+        }
+      }
+    } catch {
+      /* 目录不存在/读取失败等，忽略 */
+    }
   }
 }

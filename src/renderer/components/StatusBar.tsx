@@ -11,14 +11,15 @@ export const StatusBar: React.FC = () => {
   const stats = useApp((s) => s.sessionStats);
   const isCompacting = useApp((s) => s.isCompacting);
   const isRetrying = useApp((s) => s.isRetrying);
-  const currentWorkspace = useApp((s) => s.currentWorkspace());
+  // 直接从 selector 参数 s 中 find，避免在 selector 内调用 get() 破坏响应式订阅
+  const currentWorkspace = useApp((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId) ?? null);
 
   // sessionStats 不再在这里一次性拉取：改由 App.refreshState 统一驱动
   // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
 
-  const dot = exited !== false && exited !== null ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
+  const dot = typeof exited === 'number' ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
   const statusText =
-    exited !== false && exited !== null ? `omp 已退出 (${exited})`
+    typeof exited === 'number' ? `omp 已退出 (${exited})`
       : isCompacting ? '压缩中'
       : isRetrying ? '重试中'
       : isStreaming ? '生成中'
@@ -43,10 +44,10 @@ export const StatusBar: React.FC = () => {
       )}
       {thinking && <span className="status-item">思考: {thinking}</span>}
       <span className="status-spacer" />
-      {stats?.totalTokens !== undefined && (
+      {stats?.totalTokens !== undefined && Number.isFinite(stats.totalTokens) && (
         <span className="status-item" title={`${stats.messageCount ?? 0} 条消息`}>
           会话: {(stats.totalTokens / 1000).toFixed(1)}k tokens
-          {stats.totalCost !== undefined && ` · ¥${stats.totalCost.toFixed(4)}`}
+          {stats.totalCost !== undefined && Number.isFinite(stats.totalCost) && ` · ¥${stats.totalCost.toFixed(4)}`}
         </span>
       )}
       {usage && (

@@ -13,11 +13,27 @@ interface MenuDef {
   items: MenuItem[];
 }
 
+// 模块级常量：不随每次 render 重建，避免菜单定义对象反复分配导致不必要的重渲染
+const MENUS: MenuDef[] = [
+  {
+    label: 'Window',
+    items: [
+      { label: '切换开发者工具', action: () => window.omp.menuToggleDevTools() },
+      { label: '设置', action: () => useApp.getState().setSettingsOpen(true) },
+    ],
+  },
+  {
+    label: 'Help',
+    items: [
+      { label: '关于 OMP UI', action: () => window.omp.menuShowAbout() },
+    ],
+  },
+];
+
 export function TitleBar(): React.ReactElement | null {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [isMaximized, setIsMaximized] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
-  const menuTimerRef = useRef<number | null>(null);
 
   // 监听最大化状态变化
   useEffect(() => {
@@ -51,10 +67,7 @@ export function TitleBar(): React.ReactElement | null {
   }, []);
 
   const handleMenuEnter = useCallback((label: string) => {
-    if (menuTimerRef.current) {
-      window.clearTimeout(menuTimerRef.current);
-      menuTimerRef.current = null;
-    }
+    // 鼠标移到另一个菜单上时，若已有菜单打开则切换到悬停的菜单
     if (activeMenu) {
       setActiveMenu(label);
     }
@@ -64,26 +77,10 @@ export function TitleBar(): React.ReactElement | null {
     setActiveMenu((prev) => (prev === label ? null : label));
   }, []);
 
-  const menus: MenuDef[] = [
-    {
-      label: 'Window',
-      items: [
-        { label: '切换开发者工具', action: () => window.omp.menuToggleDevTools() },
-        { label: '设置', action: () => useApp.getState().setSettingsOpen(true) },
-      ],
-    },
-    {
-      label: 'Help',
-      items: [
-        { label: '关于 OMP UI', action: () => window.omp.menuShowAbout() },
-      ],
-    },
-  ];
-
   return (
     <div ref={barRef} className="titlebar">
       <div className="titlebar-menus">
-        {menus.map((menu) => (
+        {MENUS.map((menu) => (
           <div
             key={menu.label}
             className={`titlebar-menu ${activeMenu === menu.label ? 'open' : ''}`}

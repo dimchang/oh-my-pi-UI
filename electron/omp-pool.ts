@@ -50,9 +50,12 @@ export class OmpProcessPool {
   pin(sessionPath: string): void {
     this.pinned.set(sessionPath, (this.pinned.get(sessionPath) ?? 0) + 1);
   }
-  /** 解除一个 UI 请求的 pin（应答后调用）。refcount 归零才真正释放。 */
+  /** 解除一个 UI 请求的 pin（应答后调用）。refcount 归零才真正释放。
+   *  幂等：若已不在 pinned 表中（已被 onExit 释放过），直接忽略，避免计数 -1（issue 23）。 */
   unpin(sessionPath: string): void {
-    const n = (this.pinned.get(sessionPath) ?? 0) - 1;
+    const cur = this.pinned.get(sessionPath);
+    if (cur === undefined) return; // 已释放（如进程已退出）→ 幂等 no-op
+    const n = cur - 1;
     if (n <= 0) this.pinned.delete(sessionPath);
     else this.pinned.set(sessionPath, n);
   }
@@ -101,7 +104,13 @@ export class OmpProcessPool {
     }
     const pending = this.spawning.get(sessionPath);
     if (pending) return pending;
-    if (this.onlineCount() >= this.maxPool) this.evictLRU();
+    if (this.onlineCount() >= this.maxPool) {
+      // 池已满：尝试 LRU 淘汰。若全部 online 进程都被 pin（等用户确认），
+      // 无法安全淘汰——拒绝本次 acquire，保证池大小永不超过 maxPool（issue 24）。
+      if (!this.evictLRU()) {
+        throw new Error('进程池已满且所有会话都在等待用户确认，无法新建会话（请先关闭或回应某个会话）');
+      }
+    }
     // 历史会话（磁盘文件存在）→ -r resume 指定文件；
     // 否则（tempKey 或文件不存在，如新建会话）→ 全新 spawn（不带 -r/-c）
     const resumePath = sessionPath && fs.existsSync(sessionPath) ? sessionPath : undefined;
@@ -121,7 +130,11 @@ export class OmpProcessPool {
   async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'write', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
     const pending = this.spawning.get(tempKey);
     if (pending) return pending;
-    if (this.onlineCount() >= this.maxPool) this.evictLRU();
+    if (this.onlineCount() >= this.maxPool) {
+      if (!this.evictLRU()) {
+        throw new Error('进程池已满且所有会话都在等待用户确认，无法新建会话（请先关闭或回应某个会话）');
+      }
+    }
     const p = this.spawnEntry(tempKey, cwd, approvalMode, /*continueSession*/ false, undefined, systemPrompt, hooks);
     this.spawning.set(tempKey, p);
     try {
@@ -176,8 +189,9 @@ export class OmpProcessPool {
   }
 
   /** LRU 淘汰：找 lastActiveAt 最小的 online 进程杀掉。不淘汰 spawning 状态的，
-   *  也不淘汰有未应答 UI 请求（pinned）的会话——那种会话正等用户确认，杀掉会让弹窗失效。 */
-  private evictLRU(): void {
+   *  也不淘汰有未应答 UI 请求（pinned）的会话——那种会话正等用户确认，杀掉会让弹窗失效。
+   *  @returns 是否成功淘汰了一个进程。若所有 online 进程都被 pin（等用户确认），返回 false。 */
+  private evictLRU(): boolean {
     let victim: PoolEntry | undefined;
     for (const e of this.entries.values()) {
       if (e.status !== 'online') continue;
@@ -187,7 +201,9 @@ export class OmpProcessPool {
     if (victim) {
       this.events.onLog(`[pool] LRU evict ${victim.sessionPath}`);
       this.evict(victim.sessionPath);
+      return true;
     }
+    return false;
   }
 
   /** 杀掉所有进程（app 退出时用，同步等死透）。 */
@@ -242,7 +258,13 @@ export class OmpProcessPool {
           },
           onFrame: (frame) => ctx.router?.dispatch(frame),
           onExit: (code) => {
-            if (ctx.entry) ctx.entry.status = 'evicted';
+            if (ctx.entry) {
+              ctx.entry.status = 'evicted';
+              // 进程退出（无论就绪前还是之后）都必须从 entries 移除，否则会残留
+              // status='evicted' 的僵尸 entry（issue 77）。注意用 entry 当前的
+              // sessionPath（renameKey 后已更新），确保删对 key。
+              this.entries.delete(ctx.entry.sessionPath);
+            }
             ctx.router?.rejectAll(`omp exited (code=${code})`);
             if (!settled) {
               settled = true;

@@ -36,7 +36,8 @@ const api: OmpApi = {
   onExit: (cb) => subscribe<{ sessionPath: string; code: number | null }>(IPC.OmpExit, cb),
   onStderr: (cb) => subscribe<{ sessionPath: string; line: string }>(IPC.OmpStderr, cb),
   onNotFound: (cb) => subscribe<string>(IPC.OmpNotFound, cb),
-  notifyReady: (initialCwd?: string) => ipcRenderer.invoke(IPC.RendererReady, initialCwd),
+  // issue 85: RendererReady handler 为无参 no-op（pool 按需 lazy acquire），不再传死参 initialCwd
+  notifyReady: () => ipcRenderer.invoke(IPC.RendererReady),
 
   // M5: 工作空间
   getWorkspaces: () => ipcRenderer.invoke(IPC.WorkspacesGet),

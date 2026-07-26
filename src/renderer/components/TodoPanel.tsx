@@ -32,11 +32,12 @@ export const TodoPanel: React.FC = () => {
         </span>
       </div>
       <div className="todo-list">
-        {phases.map((phase: TodoPhase, pi: number) => (
-          <div key={phase.phase ?? pi} className="todo-phase">
+        {phases.map((phase: TodoPhase) => (
+          // issue #105: 用稳定的内容派生 key（不含数组 index），重排序时不错乱 DOM 状态
+          <div key={`phase:${phase.phase ?? ''}`} className="todo-phase">
             <div className="todo-phase-title">{phase.phase}</div>
-            {phase.items?.map((item: TodoItem, ii: number) => (
-              <div key={ii} className="todo-item">
+            {phase.items?.map((item: TodoItem) => (
+              <div key={`item:${phase.phase ?? ''}:${item.content}`} className="todo-item">
                 <StatusIcon status={item.status} />
                 <span className="todo-text">{item.content}</span>
               </div>

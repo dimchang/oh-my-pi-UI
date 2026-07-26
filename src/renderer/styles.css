@@ -740,13 +740,13 @@ body {
   border-radius: var(--radius-md);
   padding: 12px 14px;
   overflow-x: auto;
-  font-family: var(--font-ui-sans);
+  font-family: var(--font-mono);
   font-size: inherit;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
 }
-.msg-body code { font-family: var(--font-ui-sans); font-size: inherit; }
+.msg-body code { font-family: var(--font-mono); font-size: inherit; }
 .msg-body :not(pre) > code {
   background: hsl(var(--bg-300) / 0.6);
   color: var(--text);
@@ -999,7 +999,7 @@ body {
   background: hsl(var(--bg-200));
   border: 1px solid hsl(var(--border-200));
   border-radius: var(--radius-sm);
-  color: hsl(var(--text-000));
+  color: hsl(var(--text-100));
   outline: none;
   box-sizing: border-box;
 }

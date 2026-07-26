@@ -25,7 +25,7 @@ export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void
     return () => document.removeEventListener('mousedown', onDoc);
   }, []);
 
-  const current = MODES.find((m) => m.value === mode) ?? MODES[1];
+  const current = MODES.find((m) => m.value === mode) ?? MODES[1] ?? MODES[0]!;
 
   const pick = (m: ApprovalMode) => {
     setOpen(false);
@@ -36,7 +36,7 @@ export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void
   return (
     <div className="model-picker" ref={ref}>
       <button className="btn" onClick={() => setOpen((o) => !o)} title="权限模式（按工作空间生效）">
-        权限: {current.label.split(' · ')[0]} ▾
+        权限: {current.label.split(' · ')[0] ?? current.label} ▾
       </button>
       {open && (
         <div className="model-menu">

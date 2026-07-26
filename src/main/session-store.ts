@@ -19,14 +19,15 @@ function sessionsRoot(): string {
 /** 读文件前 64KB，返回其中的 SessionHeader（type:"session" 的那一行）。
  *  实测：JSONL 首行可能是 {"type":"title"}，{"type":"session"} 在第二行及以后。
  *  所以不能只看首行，要扫前几行找 type:"session"。 */
-function readSessionHeader(filePath: string): SessionHeader | null {
-  let fd: number | null = null;
+async function readSessionHeader(filePath: string): Promise<SessionHeader | null> {
+  let fd: fs.promises.FileHandle | null = null;
   try {
-    fd = fs.openSync(filePath, 'r');
+    fd = await fs.promises.open(filePath, 'r');
     const buf = Buffer.alloc(64 * 1024);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    if (n === 0) return null;
-    const text = buf.toString('utf8', 0, n);
+    const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+    if (bytesRead === 0) return null;
+    // issue 34: 64KB 边界可能截断 UTF-8 多字节字符，用 TextDecoder 处理尾部不完整序列
+    const text = new TextDecoder('utf8').decode(buf.subarray(0, bytesRead));
     const lines = text.split('\n').slice(0, 20); // 只扫前 20 行足够
     for (const ln of lines) {
       if (!ln.trim()) continue;
@@ -38,38 +39,43 @@ function readSessionHeader(filePath: string): SessionHeader | null {
       } catch { /* skip */ }
     }
     return null;
-  } catch {
+  } catch (err) {
+    // issue 87: 不再静默吞没，便于排查扫盘失败
+    console.warn(`[session-store] readSessionHeader failed: ${filePath}`, err);
     return null;
   } finally {
     if (fd !== null) {
-      try { fs.closeSync(fd); } catch { /* noop */ }
+      try { await fd.close(); } catch { /* noop */ }
     }
   }
 }
 
 /** 只读文件头部最多 maxBytes（默认 256KB），不把整个会话文件读进内存。
  *  用于 titleFallback 兜底——只需要前几条消息就能拿到标题，无需全量加载数十 MB 文件。 */
-function readHead(filePath: string, maxBytes = 256 * 1024): string {
-  let fd: number | null = null;
+async function readHead(filePath: string, maxBytes = 256 * 1024): Promise<string> {
+  let fd: fs.promises.FileHandle | null = null;
   try {
-    fd = fs.openSync(filePath, 'r');
+    fd = await fs.promises.open(filePath, 'r');
     const buf = Buffer.alloc(maxBytes);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    return buf.toString('utf8', 0, n);
-  } catch {
+    const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+    // issue 34: 避免尾部多字节字符被截断
+    return new TextDecoder('utf8').decode(buf.subarray(0, bytesRead));
+  } catch (err) {
+    // issue 87: 不再静默吞没
+    console.warn(`[session-store] readHead failed: ${filePath}`, err);
     return '';
   } finally {
     if (fd !== null) {
-      try { fs.closeSync(fd); } catch { /* noop */ }
+      try { await fd.close(); } catch { /* noop */ }
     }
   }
 }
 
-function titleFallback(header: SessionHeader, filePath: string): string {
+async function titleFallback(header: SessionHeader, filePath: string): Promise<string> {
   if (header.title && header.title.trim()) return header.title.trim();
   // 读首条 user 消息前 40 字兜底：只扫文件头部（最多 256KB），不读全文件
   try {
-    const head = readHead(filePath);
+    const head = await readHead(filePath);
     const lines = head.split('\n').slice(0, 50);
     for (const ln of lines) {
       if (!ln.trim()) continue;
@@ -85,14 +91,18 @@ function titleFallback(header: SessionHeader, filePath: string): string {
   return '(untitled)';
 }
 
-export function listSessions(cwdFilter?: string): SessionSummary[] {
+export async function listSessions(cwdFilter?: string): Promise<SessionSummary[]> {
   const root = sessionsRoot();
-  if (!fs.existsSync(root)) return [];
+  try {
+    await fs.promises.access(root);
+  } catch {
+    return [];
+  }
 
   const out: SessionSummary[] = [];
   let dirs: fs.Dirent[];
   try {
-    dirs = fs.readdirSync(root, { withFileTypes: true });
+    dirs = await fs.promises.readdir(root, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -102,24 +112,25 @@ export function listSessions(cwdFilter?: string): SessionSummary[] {
     const sub = path.join(root, d.name);
     let files: string[];
     try {
-      files = fs.readdirSync(sub).filter((f) => f.endsWith('.jsonl'));
+      files = (await fs.promises.readdir(sub)).filter((f) => f.endsWith('.jsonl'));
     } catch {
       continue;
     }
     for (const f of files) {
       const fp = path.join(sub, f);
-      const header = readSessionHeader(fp);
+      const header = await readSessionHeader(fp);
       if (!header || typeof header.cwd !== 'string') continue;
-      if (cwdFilter && path.normalize(header.cwd) !== path.normalize(cwdFilter)) continue;
+      // issue 36: Windows 路径大小写不敏感，比较前小写归一化
+      if (cwdFilter && normalizePath(header.cwd) !== normalizePath(cwdFilter)) continue;
       let mtime = 0;
       try {
-        mtime = fs.statSync(fp).mtimeMs;
+        mtime = (await fs.promises.stat(fp)).mtimeMs;
       } catch { /* noop */ }
       out.push({
         path: fp,
         id: header.id ?? path.basename(f, '.jsonl'),
         cwd: header.cwd,
-        title: titleFallback(header, fp),
+        title: await titleFallback(header, fp),
         mtime,
       });
     }
@@ -129,13 +140,30 @@ export function listSessions(cwdFilter?: string): SessionSummary[] {
   return out;
 }
 
-export function deleteSession(filePath: string): void {
+/** issue 36: Windows 路径比较大小写不敏感，统一 normalize 后小写归一。 */
+function normalizePath(p: string): string {
+  const n = path.normalize(p);
+  return process.platform === 'win32' ? n.toLowerCase() : n;
+}
+
+export async function deleteSession(filePath: string): Promise<void> {
   const root = sessionsRoot();
-  const normalized = path.normalize(filePath);
-  if (!normalized.startsWith(path.normalize(root))) {
+  // issue 134-138: 解析真实路径（跟随 symlink/junction）后再比较边界，Windows 小写归一化，
+  // 防止恶意符号链接绕过 path.normalize 的检查删任意文件。
+  const rootReal = await fs.promises.realpath(root).catch(() => path.resolve(root));
+  const absTarget = path.resolve(filePath);
+  const targetReal = await fs.promises.realpath(absTarget).catch(() => absTarget);
+
+  const normRoot = process.platform === 'win32' ? rootReal.toLowerCase() : rootReal;
+  const normTarget = process.platform === 'win32' ? targetReal.toLowerCase() : targetReal;
+  const insideRoot = normTarget === normRoot || normTarget.startsWith(normRoot + path.sep);
+  if (!insideRoot) {
     throw new Error('refuse to delete outside sessions root');
   }
-  if (fs.existsSync(normalized)) fs.unlinkSync(normalized);
+  // issue 35: 去掉 existsSync 预检，直接 unlink 并吞掉 ENOENT，避免检查与删除之间的 TOCTOU 窗口
+  await fs.promises.unlink(absTarget).catch((err) => {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+  });
 }
 
 /** 读取 session JSONL 中的完整消息历史（type:"message" 行的 .message 字段）。
@@ -160,7 +188,7 @@ export async function readSessionMessages(filePath: string): Promise<ReplayMessa
           type?: string;
           customType?: string;
           data?: { toolCallId?: string; toolName?: string; args?: unknown };
-          message?: AgentMessage & { toolCallId?: string };
+          message?: AgentMessage & { toolCallId?: string; toolName?: string };
         };
         if (entry.type === 'custom' && entry.customType === 'tool_execution_start' && entry.data?.toolCallId) {
           toolMeta.set(entry.data.toolCallId, { toolName: entry.data.toolName, args: entry.data.args });
@@ -170,6 +198,8 @@ export async function readSessionMessages(filePath: string): Promise<ReplayMessa
           const m = entry.message;
           if (m.role === 'toolResult' && m.toolCallId) {
             const meta = toolMeta.get(m.toolCallId);
+            // issue 88: 匹配到 toolResult 后立即清理对应 toolMeta，避免 map 无限增长
+            toolMeta.delete(m.toolCallId);
             out.push({ ...m, toolName: meta?.toolName ?? m.toolName, replayArgs: meta?.args });
           } else {
             out.push(m);

@@ -16,7 +16,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
-import { cwdKey } from '../utils/path-key';
+import { cwdKey, modelKey } from '../utils/path-key';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpProviderConfig } from '../../shared/ipc-channels';
 
@@ -192,7 +192,8 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   }, []);
 
   const pidValid = /^[a-zA-Z0-9_-]+$/.test(pid);
-  const canSave = pidValid && baseUrl.trim().length > 0 && (apiKey.trim().length > 0 || NO_KEY_NEEDED.has(api));
+  // Bedrock/Azure/Vertex 等 provider 不需要 baseUrl，跳过非空校验（依据 NO_KEY_NEEDED 同组）
+  const canSave = pidValid && (baseUrl.trim().length > 0 || NO_KEY_NEEDED.has(api)) && (apiKey.trim().length > 0 || NO_KEY_NEEDED.has(api));
   /** 用户是否填了手动模型 ID */
   const hasManualIds = manualIds.split(/[,\s]+/).some((s) => s.trim().length > 0);
 
@@ -243,11 +244,19 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     try {
       await rpc.release(sp);                 // 杀旧进程（onExit 会短暂置 offline，onReady 恢复）
       await rpc.acquire(sp, cwd, approvalMode); // -r 续接同一会话文件，重读 models.yml
-    } catch { /* 重载失败不阻塞保存流程；用户可在第 2 步点「重试获取」 */ }
+    } catch (e) {
+      // 重载失败不应静默吞掉：抛出让调用方显示错误并阻止进入第 2 步
+      throw e;
+    }
   }, [pid]);
 
   /** 轮询 getAvailableModels 获取新 provider 的模型 */
   const pollModels = useCallback((providerId: string, attempt = 0) => {
+    // 重新 poll 前清掉旧定时器，避免重复点击产生并发轮询链
+    if (pollTimer.current) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
     setPolling(true);
     const sp = useApp.getState().currentSessionPath ?? '';
     void rpc.getAvailableModels(sp).then((r) => {
@@ -256,7 +265,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
       );
       if (list.length > 0) {
         setDiscovered(list);
-        setChecked(new Set(list.map((m) => `${m.provider}/${m.id}`)));
+        setChecked(new Set(list.map((m) => modelKey(m))));
         setPolling(false);
         return;
       }
@@ -296,7 +305,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
           name: id,
         }));
         setDiscovered(manualModels);
-        setChecked(new Set(manualModels.map((m) => `${m.provider}/${m.id}`)));
+        setChecked(new Set(manualModels.map((m) => modelKey(m))));
       }
       pollModels(pid.trim());
     } catch (e) {
@@ -315,7 +324,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
       // 手动 ID 直接写入 enabledModels 白名单
       if (parsedManualIds.length > 0) {
         const pidVal = pid.trim();
-        const keys = parsedManualIds.map((id) => `${pidVal}/${id}`);
+        const keys = parsedManualIds.map((id) => modelKey({ provider: pidVal, id }));
         const st = useApp.getState();
         const cur = st.enabledModels;
         if (cur !== undefined) {
@@ -336,7 +345,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   /** 第 2 步完成：把勾选结果并入 enabledModels 白名单 */
   const onFinish = useCallback(() => {
     const st = useApp.getState();
-    const providerPrefix = `${pid.trim()}/`;
+    const providerPrefix = `${pid.trim()}\u0000`;
     const checkedKeys = Array.from(checked);
     const cur = st.enabledModels;
 
@@ -344,7 +353,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     const allKeys = checkedKeys.length > 0
       ? checkedKeys
       : savedManualIdsRef.current.length > 0
-        ? savedManualIdsRef.current.map((id) => `${pid.trim()}/${id}`)
+        ? savedManualIdsRef.current.map((id) => modelKey({ provider: pid.trim(), id }))
         : [];
 
     if (cur !== undefined) {
@@ -369,7 +378,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   }, []);
 
   const allChecked = useMemo(
-    () => discovered.length > 0 && discovered.every((m) => checked.has(`${m.provider}/${m.id}`)),
+    () => discovered.length > 0 && discovered.every((m) => checked.has(modelKey(m))),
     [discovered, checked],
   );
 
@@ -623,14 +632,14 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                     checked={allChecked}
                     onChange={() => {
                       if (allChecked) setChecked(new Set());
-                      else setChecked(new Set(discovered.map((m) => `${m.provider}/${m.id}`)));
+                      else setChecked(new Set(discovered.map((m) => modelKey(m))));
                     }}
                   />
                   <span className="provider-model-name">全选（{checked.size}/{discovered.length}）</span>
                 </label>
                 <div className="add-model-list">
                   {discovered.map((m) => {
-                    const key = `${m.provider}/${m.id}`;
+                    const key = modelKey(m);
                     return (
                       <label key={key} className="provider-model-row" title={key}>
                         <input

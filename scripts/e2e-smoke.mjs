@@ -78,15 +78,17 @@ rl.on('line', (line) => {
     const out = (assistant?.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('');
     console.log('[result] assistant text =', JSON.stringify(out));
     clearTimeout(deadline);
+    phase = 'done';
     child.kill('SIGKILL');
-    console.log('E2E PASS');
-    process.exit(0);
   }
 });
 
 child.stderr.on('data', (d) => process.stderr.write('[stderr] ' + d.toString()));
 child.on('exit', (code) => {
-  if (phase !== 'done') {
-    console.error('\nomp exited early code=', code, 'phase=', phase);
+  if (phase === 'done') {
+    console.log('E2E PASS');
+    process.exit(0);
   }
+  console.error('\nomp exited early code=', code, 'phase=', phase);
+  process.exit(1);
 });

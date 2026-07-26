@@ -33,3 +33,10 @@ export function basename(p: string): string {
   const m = p.replace(/[\\/]+$/, '').split(/[\\/]/);
   return m[m.length - 1] || p;
 }
+
+/** 模型白名单 key（provider/id）。用不可见分隔符 \u0000，避免 provider 或 id 含 '/'
+ *  时与另一组 provider/id 碰撞（如 "a/b" + "c" 与 "a" + "b/c"）。
+ *  SettingsModelConfig 与 AddModelModal 共用此函数，保证写入/读取 enabledModels 一致。 */
+export function modelKey(m: { provider: string; id: string }): string {
+  return `${m.provider}\u0000${m.id}`;
+}

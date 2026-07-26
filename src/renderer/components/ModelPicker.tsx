@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
+import { modelKey } from '../utils/path-key';
 import type { ModelInfo } from '../../shared/rpc-types';
 
 export const ModelPicker: React.FC = () => {
@@ -45,6 +46,9 @@ export const ModelPicker: React.FC = () => {
     }
   }, [open, fetchModels]);
 
+  // 白名单转 Set，避免 includes O(n)（enabledModels 可能很长）
+  const enabledSet = useMemo(() => new Set(enabledModels ?? []), [enabledModels]);
+
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase();
     const whitelistActive = enabledModels !== undefined;
@@ -53,9 +57,9 @@ export const ModelPicker: React.FC = () => {
       // 白名单过滤：未勾选的模型不在切换列表里显示
       // （但当前正在使用的模型始终可见，避免"选中的被藏、切不回来"）
       if (whitelistActive) {
-        const key = `${m.provider}/${m.id}`;
+        const key = modelKey(m);
         const isCurrent = model?.provider === m.provider && model?.id === m.id;
-        if (!enabledModels!.includes(key) && !isCurrent) continue;
+        if (!enabledSet.has(key) && !isCurrent) continue;
       }
       if (q) {
         const hay = `${m.name ?? m.id} ${m.id} ${m.provider}`.toLowerCase();
@@ -64,7 +68,7 @@ export const ModelPicker: React.FC = () => {
       (acc[m.provider] ??= []).push(m);
     }
     return acc;
-  }, [models, query, enabledModels, model]);
+  }, [models, query, enabledModels, enabledSet, model]);
 
   const pick = (m: ModelInfo) => {
     setOpen(false);

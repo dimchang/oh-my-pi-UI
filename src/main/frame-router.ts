@@ -28,14 +28,27 @@ export class FrameRouter {
 
   /** 发送命令并等待响应。自动赋 id。 */
   send<T = unknown>(cmd: RpcCommand): Promise<RpcResponse<T>> {
-    const id = cmd.id ?? randomUUID();
+    // issue 38: 空字符串 id 会被 ?? 放行，导致空 key；改用 || 同时兜底 undefined 与 ''
+    const id = cmd.id || randomUUID();
     const withId = { ...cmd, id } as RpcCommand;
     return new Promise<RpcResponse<T>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`rpc timeout: ${withId.type}`));
       }, DEFAULT_TIMEOUT_MS);
-      this.pending.set(id, { resolve: resolve as never, reject, timer, command: withId.type });
+      // issue 4: 重复 id 静默覆盖 pending 会丢失旧 promise，先 reject 旧的
+      const existing = this.pending.get(id);
+      if (existing) {
+        clearTimeout(existing.timer);
+        existing.reject(new Error(`rpc id collision, superseded: ${id}`));
+      }
+      // issue 92: 用 as unknown as 透传泛型，而非 as never（更安全的断言）
+      this.pending.set(id, {
+        resolve: resolve as unknown as (resp: RpcResponse) => void,
+        reject,
+        timer,
+        command: withId.type,
+      });
       try {
         this.deps.write(withId);
       } catch (err) {
@@ -59,7 +72,7 @@ export class FrameRouter {
         if (resp.success) {
           p.resolve(resp);
         } else {
-          p.reject(new Error(`${resp.command}: ${resp.error ?? 'unknown error'}`));
+          p.reject(new Error(`${resp.command ?? '(unknown)'}: ${resp.error ?? 'unknown error'}`));
         }
       } else {
         this.deps.onLog(`[unmatched-response] command=${resp.command} success=${resp.success} ${resp.error ?? ''}`);

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useApp, type UiRequest, toolNameOf } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
@@ -95,6 +95,9 @@ export default function App(): React.ReactElement {
     }).catch(() => undefined);
   }, []);
 
+  /** 迁移中的 temp key 集合（并发保护）：同一 __new_ 会话的多次 agent_end 只处理一次。 */
+  const migratingTempKeys = useRef<Set<string>>(new Set());
+
   /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
    *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
    *  关键：omp 进程运行期间不写文件，只有首条消息完成后才落盘（probe 实测）。 */
@@ -102,12 +105,16 @@ export default function App(): React.ReactElement {
     const st = useApp.getState();
     const cur = st.currentSessionPath;
     if (!cur || !cur.startsWith('__new_')) return;
+    // 并发保护：已在迁移中则跳过，避免重复 setState / renameKey
+    if (migratingTempKeys.current.has(cur)) return;
+    migratingTempKeys.current.add(cur);
+    const done = () => migratingTempKeys.current.delete(cur);
     const cwd = st.currentWorkspace()?.cwd;
-    if (!cwd) return;
+    if (!cwd) { done(); return; }
     const newest = st.sessions
       .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
       .sort((a, b) => b.mtime - a.mtime)[0];
-    if (!newest || newest.path === cur) return;
+    if (!newest || newest.path === cur) { done(); return; }
     const buf = st.sessionsMap[cur];
     const ps = st.procStateMap[cur];
     const sessionsMap = { ...st.sessionsMap };
@@ -123,7 +130,7 @@ export default function App(): React.ReactElement {
       q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
     );
     st.setState({ sessionsMap, procStateMap, currentSessionPath: newest.path, uiQueue });
-    void rpc.renameKey(cur, newest.path);
+    void rpc.renameKey(cur, newest.path).then(done, done);
   }, []);
 
   /** 新建会话后：设为 current + 清缓冲 + 刷新列表/状态。newSessionForCwd 已返回新 path。 */
@@ -249,8 +256,8 @@ export default function App(): React.ReactElement {
   }, [loadAndReconcileWorkspaces]);
   useEffect(() => {
     if (workspacesLoaded) {
-      const initialCwd = useApp.getState().currentWorkspace()?.cwd;
-      void window.omp.notifyReady(initialCwd);
+      // issue 85: notifyReady 不再传 initialCwd（主进程 handler 为 no-op，pool 按需 lazy acquire）
+      void window.omp.notifyReady();
     }
   }, [workspacesLoaded]);
 
@@ -291,18 +298,27 @@ export default function App(): React.ReactElement {
   }, [pushToast, refreshSessions]);
 
   const onAbort = useCallback(() => {
-    const sp = useApp.getState().currentSessionPath;
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
     if (!sp) return;
-    useApp.getState().setAborting(true);
-    useApp.getState().setStreaming(false);
+    // 改用 per-session 状态机制：设置当前会话 procState，并按需同步全局状态供 UI 显示
+    st.setProcState(sp, { isAborting: true, isStreaming: false });
+    if (sp === st.currentSessionPath) st.setState({ isAborting: true, isStreaming: false });
     void rpc.abort(sp)
       .then(() => {
         setTimeout(() => {
-          if (useApp.getState().isAborting) useApp.getState().setAborting(false);
+          const stNow = useApp.getState();
+          const ps = stNow.procStateMap[sp];
+          if (ps?.isAborting) {
+            stNow.setProcState(sp, { isAborting: false });
+            if (sp === stNow.currentSessionPath) stNow.setState({ isAborting: false });
+          }
         }, 3000);
       })
       .catch(() => {
-        useApp.getState().setAborting(false);
+        const stNow = useApp.getState();
+        stNow.setProcState(sp, { isAborting: false });
+        if (sp === stNow.currentSessionPath) stNow.setState({ isAborting: false });
       });
   }, []);
 
@@ -314,8 +330,8 @@ export default function App(): React.ReactElement {
       pushToast('请先选择或新建一个工作空间', 'error');
       return;
     }
-    const targetMode = st.workspaces.find((w) => w.cwd === targetCwd)?.approvalMode ?? 'write';
-    const target = st.workspaces.find((w) => w.cwd === targetCwd);
+    const targetMode = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(targetCwd))?.approvalMode ?? 'write';
+    const target = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(targetCwd));
     if (target && st.currentWorkspaceId !== target.id) {
       st.setCurrentWorkspaceId(target.id);
       st.persistWorkspaces();
@@ -410,8 +426,8 @@ export default function App(): React.ReactElement {
   const onRenameSession = useCallback((s: SessionSummary) => {
     const name = window.prompt('新名称', s.title);
     if (name && name.trim()) {
-      const sp = useApp.getState().currentSessionPath ?? s.path;
-      void rpc.setSessionName(sp, name.trim()).then(() => {
+      // 始终用被右键的会话 s.path，而非 currentSessionPath，避免改错对象
+      void rpc.setSessionName(s.path, name.trim()).then(() => {
         refreshSessions();
       }).catch(() => undefined);
     }
@@ -424,7 +440,11 @@ export default function App(): React.ReactElement {
         pushToast('该会话没有可用的分叉点（无 user 消息）', 'error');
         return;
       }
-      const entryId = entries[entries.length - 1].id;
+      const entryId = entries[entries.length - 1]?.id;
+      if (!entryId) {
+        pushToast('该会话没有可用的分叉点（无 user 消息）', 'error');
+        return;
+      }
       const approvalMode = useApp.getState().workspaces.find((w) => cwdKey(w.cwd) === cwdKey(s.cwd))?.approvalMode ?? 'write';
       // 拉起该会话的进程（branch 作用于该进程的 current = s.path），不调 switchSession
       void rpc.acquire(s.path, s.cwd, approvalMode).then(() => {
@@ -579,7 +599,7 @@ export default function App(): React.ReactElement {
   const currentSessionPath = useApp((s) => s.currentSessionPath);
   const sessions = useApp((s) => s.sessions);
 
-  const showTitleBar = window.omp.platform === 'win32';
+  const showTitleBar = IS_WIN32;
 
   return (
     <div className={`app ${showTitleBar ? 'custom-titlebar' : ''}`}>
@@ -648,7 +668,11 @@ export default function App(): React.ReactElement {
       {/* 右栏面板 */}
       {rightPanel !== 'off' && (
         <div className="right-panel">
-          {rightPanel === 'files' && <FileTree cwd={getWorkDir()} />}
+          {rightPanel === 'files' && (() => {
+            const wd = getWorkDir();
+            // 无 workspace / 取不到 cwd 时避免 listFiles('')，改为提示
+            return wd ? <FileTree cwd={wd} /> : <div className="panel-empty">请先选择工作空间</div>;
+          })()}
           {rightPanel === 'diff' && (
             <div className="diff-panel">
               <div className="panel-header"><span>Diff</span></div>
@@ -695,11 +719,14 @@ export default function App(): React.ReactElement {
   );
 }
 
-/** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 process.cwd 兜底。 */
+/** 是否 Windows（模块级常量，避免每次 render 都访问 window.omp.platform）。 */
+const IS_WIN32 = window.omp?.platform === 'win32';
+
+/** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */
 function getWorkDir(): string {
   const ws = useApp.getState().currentWorkspace();
   if (ws?.cwd) return ws.cwd;
-  return process.cwd?.() ?? '';
+  return cwdProcess.cwd?.() ?? '';
 }
 
 /** 处理 extension_ui_request：需应答的入队（带 __sessionPath），单向的直接执行，cancel 的关对应 */
@@ -718,9 +745,12 @@ function handleUiRequest(
     return;
   }
   if (method === 'open_url') {
+    // open_url 是单向通知，不应入队弹窗（无法自动清除）；直接打开并自动放行应答。
     const url = req.launchUrl ?? req.url;
     if (url) void window.omp.openExternal(url);
-    st.enqueueUi(toUiRequest(req));
+    const sp = req.__sessionPath;
+    if (sp) void Promise.resolve(rpc.respondUI(sp, { id: req.id, confirmed: true }))
+      .catch(() => pushToast(`打开链接放行失败`, 'error'));
     return;
   }
   if (method === 'cancel') {
@@ -736,8 +766,11 @@ function handleUiRequest(
     if (method === 'confirm') {
       const ui = toUiRequest(req);
       const tool = toolNameOf(ui);
-      if (tool && st.isPermAllowed(req.__sessionPath ?? '', tool)) {
-        void rpc.respondUI(req.__sessionPath ?? '', { id: req.id, confirmed: true });
+      const sp = req.__sessionPath;
+      // sessionPath 为空时不走 auto-approve，避免 isPermAllowed 创建全局共享(() 的 perm 缓存条目
+      if (tool && sp && st.isPermAllowed(sp, tool)) {
+        void Promise.resolve(rpc.respondUI(sp, { id: req.id, confirmed: true }))
+          .catch(() => pushToast(`自动放行「${tool}」失败`, 'error'));
         return;
       }
     }
@@ -766,5 +799,5 @@ function toUiRequest(req: RpcExtensionUIRequest & { __sessionPath?: string }): U
   };
 }
 
-// process polyfill for renderer
-const process = { cwd: () => { try { return (window as unknown as { __CWD__?: string }).__CWD__ ?? ''; } catch { return ''; } } };
+// cwd polyfill for renderer（重命名以避免遮蔽 Node 全局 process）
+const cwdProcess = { cwd: () => { try { return (window as unknown as { __CWD__?: string }).__CWD__ ?? ''; } catch { return ''; } } };

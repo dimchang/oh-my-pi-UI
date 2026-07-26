@@ -29,9 +29,15 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   const [selected, setSelected] = useState<string>(normOptions[0]?.value ?? '');
   const [always, setAlways] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const busyRef = React.useRef(false);
   const lastPayload = React.useRef<{ value?: string; confirmed?: boolean; cancelled?: boolean }>({});
 
   const respond = async (payload: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
+    // 防重复点击：RPC 进行中直接丢弃后续调用
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
     lastPayload.current = payload;
     setErr(null);
     try {
@@ -46,6 +52,9 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
       setErr(
         `操作未送达：${e instanceof Error ? e.message : String(e)}。可点"重试"再试，或点"关闭"关闭此弹窗（关闭后需重新进入该会话才能再次操作）。`,
       );
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
     }
   };
 
@@ -63,8 +72,8 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
               始终允许此工具（本会话）
             </label>
             <div className="modal-actions">
-              <button className="btn" onClick={() => respond({ confirmed: false })}>拒绝</button>
-              <button className="btn btn-primary" onClick={() => respond({ confirmed: true })}>
+              <button className="btn" onClick={() => respond({ confirmed: false })} disabled={busy}>拒绝</button>
+              <button className="btn btn-primary" onClick={() => respond({ confirmed: true })} disabled={busy}>
                 批准
               </button>
             </div>
@@ -95,8 +104,8 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
               </div>
             )}
             <div className="modal-actions">
-              <button className="btn" onClick={() => respond({ cancelled: true })}>取消</button>
-              <button className="btn btn-primary" onClick={() => respond({ value: selected })}>确定</button>
+              <button className="btn" onClick={() => respond({ cancelled: true })} disabled={busy}>取消</button>
+              <button className="btn btn-primary" onClick={() => respond({ value: selected })} disabled={busy}>确定</button>
             </div>
           </>
         );
@@ -119,12 +128,12 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
                 placeholder={req.placeholder}
                 onChange={(e) => setInputVal(e.target.value)}
                 autoFocus
-                onKeyDown={(e) => e.key === 'Enter' && respond({ value: inputVal })}
+                onKeyDown={(e) => e.key === 'Enter' && !busy && respond({ value: inputVal })}
               />
             )}
             <div className="modal-actions">
-              <button className="btn" onClick={() => respond({ cancelled: true })}>取消</button>
-              <button className="btn btn-primary" onClick={() => respond({ value: inputVal })}>确定</button>
+              <button className="btn" onClick={() => respond({ cancelled: true })} disabled={busy}>取消</button>
+              <button className="btn btn-primary" onClick={() => respond({ value: inputVal })} disabled={busy}>确定</button>
             </div>
           </>
         );
@@ -133,7 +142,7 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
           <>
             <div className="modal-message">{req.message ?? `未处理的请求类型：${req.method}`}</div>
             <div className="modal-actions">
-              <button className="btn btn-primary" onClick={() => respond({ confirmed: true })}>知道了</button>
+              <button className="btn btn-primary" onClick={() => respond({ confirmed: true })} disabled={busy}>知道了</button>
             </div>
           </>
         );

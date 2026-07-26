@@ -30,7 +30,7 @@ const deadline = setTimeout(() => {
   console.error('TIMEOUT; frames captured=', frames.length, '->', OUT);
   dump();
   child.kill('SIGKILL');
-  process.exit(0);
+  process.exit(1);
 }, 30000);
 function send(cmd) { child.stdin.write(JSON.stringify(cmd) + '\n'); }
 rl.on('line', (line) => {

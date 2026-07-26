@@ -55,17 +55,21 @@ export const SkillsPanel: React.FC = () => {
       const hay = `${c.name} ${(c.aliases ?? []).join(' ')} ${c.description ?? ''}`.toLowerCase();
       return hay.includes(query);
     };
-    const sk = cmds.filter((c) => c.source === 'skill' && match(c));
-    // 插件/扩展：非 builtin、非 skill 的来源（extension / custom / file / mcp__* 等）
-    const pl = cmds.filter(
-      (c) => c.source && c.source !== 'builtin' && c.source !== 'skill' && match(c),
-    );
-    return {
-      skills: sk,
-      plugins: pl,
-      totalSkills: cmds.filter((c) => c.source === 'skill').length,
-      totalPlugins: cmds.filter((c) => c.source && c.source !== 'builtin' && c.source !== 'skill').length,
-    };
+    // 单次遍历分组，避免多次 filter（含 4 次全量扫描）
+    const sk: SlashCommand[] = [];
+    const pl: SlashCommand[] = [];
+    let ts = 0;
+    let tp = 0;
+    for (const c of cmds) {
+      const isSkill = c.source === 'skill';
+      const isPlugin = !!c.source && c.source !== 'builtin' && c.source !== 'skill';
+      if (isSkill) ts++;
+      if (isPlugin) tp++;
+      if (!match(c)) continue;
+      if (isSkill) sk.push(c);
+      else if (isPlugin) pl.push(c);
+    }
+    return { skills: sk, plugins: pl, totalSkills: ts, totalPlugins: tp };
   }, [cmds, query]);
 
   const back = () => useApp.getState().setMainView('chat');

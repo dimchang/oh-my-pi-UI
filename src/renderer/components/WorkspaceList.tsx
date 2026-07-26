@@ -1,7 +1,18 @@
 import React, { useMemo, useState } from 'react';
 import { useApp } from '../store';
 import { SessionList } from './SessionList';
+import { cwdKey } from '../utils/path-key';
 import type { SessionSummary, Workspace } from '../../shared/ipc-channels';
+
+/** 把右键菜单定位 clamp 到视口内，避免溢出屏幕（估算菜单尺寸做兜底） */
+function clampMenuPos(x: number, y: number): { left: number; top: number } {
+  const estW = 180;
+  const estH = 180;
+  return {
+    left: Math.max(0, Math.min(x, window.innerWidth - estW)),
+    top: Math.max(0, Math.min(y, window.innerHeight - estH)),
+  };
+}
 
 interface WorkspaceMenuState {
   ws: Workspace;
@@ -88,7 +99,6 @@ export const WorkspaceList: React.FC<{
   // 每组会话内部按 mtime 倒序（最近访问在前）。
   const sessionsByWs = useMemo(() => {
     const map = new Map<string, SessionSummary[]>();
-    const cwdKey = (p: string) => p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
     for (const s of allSessions) {
       const key = cwdKey(s.cwd);
       const arr = map.get(key) ?? [];
@@ -103,18 +113,25 @@ export const WorkspaceList: React.FC<{
 
   // 工作空间（任务）按「其下会话的最近访问时间」倒序排列：
   // 最近有活动的任务排在最前；无会话的任务用 createdAt 兜底并沉底。
+  // 注意：sessionsByWs 的 key 是 cwdKey(cwd)，而 ws.id 也等于 cwdKey(ws.cwd)
+  // （见 store.setWorkspacesFile 迁移）。这里显式用 cwdKey(ws.cwd) 查找，
+  // 不依赖「ws.id === cwdKey(ws.cwd)」这个隐式契约，避免后续 id 规则变化时漏命中。
   const sortedWorkspaces = useMemo(() => {
     const lastActive = (ws: Workspace): number => {
-      const arr = sessionsByWs.get(ws.id);
-      if (arr && arr.length > 0) return arr[0].mtime; // 组内已按 mtime 倒序，取首个即最近
+      const arr = sessionsByWs.get(cwdKey(ws.cwd));
+      if (arr && arr.length > 0 && arr[0]) return arr[0].mtime; // 组内已按 mtime 倒序，取首个即最近
       return ws.createdAt ?? 0;
     };
     return [...filtered].sort((a, b) => lastActive(b) - lastActive(a));
   }, [filtered, sessionsByWs]);
 
   const handleAddByDialog = async () => {
-    const cwd = await window.omp.openDirDialog();
-    if (cwd) onAddWorkspace(cwd);
+    try {
+      const cwd = await window.omp.openDirDialog();
+      if (cwd) onAddWorkspace(cwd);
+    } catch {
+      // 取消选择或对话框失败时静默忽略
+    }
   };
 
   const handleRename = (ws: Workspace) => {
@@ -188,7 +205,7 @@ export const WorkspaceList: React.FC<{
           sortedWorkspaces.map((ws) => {
             const isCurrent = ws.id === currentWorkspaceId;
             const isCollapsed = ws.collapsed;
-            const wsSessions = sessionsByWs.get(ws.id) ?? [];
+            const wsSessions = sessionsByWs.get(cwdKey(ws.cwd)) ?? [];
             return (
               <div key={ws.id} className={`workspace ${isCurrent ? 'current' : ''}`}>
                 <div
@@ -300,7 +317,7 @@ export const WorkspaceList: React.FC<{
       {menu && (
         <div
           className="ctx-menu"
-          style={{ left: menu.x, top: menu.y, position: 'fixed' }}
+          style={{ ...clampMenuPos(menu.x, menu.y), position: 'fixed' }}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="ctx-item" onClick={() => handleNewSession(menu.ws)}>新建会话</div>
@@ -313,9 +330,9 @@ export const WorkspaceList: React.FC<{
 
       {renameTarget && (
         <div className="modal-overlay" onMouseDown={() => { setRenameTarget(null); setRenameValue(''); }}>
+          {/* Enter/Escape 在主输入框里处理（见 input.onKeyDown）；此处只在焦点落在按钮等非输入框时响应 Escape */}
           <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => {
-            if (e.key === 'Enter') { e.preventDefault(); submitRename(); }
-            else if (e.key === 'Escape') { setRenameTarget(null); setRenameValue(''); }
+            if (e.key === 'Escape') { setRenameTarget(null); setRenameValue(''); }
           }}>
             <div className="modal-title">重命名工作空间</div>
             <input
@@ -323,7 +340,11 @@ export const WorkspaceList: React.FC<{
               autoFocus
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
-              onKeyDown={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                // 把 Enter/Escape 处理移入输入框，避免被 input 的 stopPropagation 吞掉
+                if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submitRename(); }
+                else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setRenameTarget(null); setRenameValue(''); }
+              }}
             />
             <div className="modal-actions">
               <button className="btn" onClick={() => { setRenameTarget(null); setRenameValue(''); }}>取消</button>
@@ -335,9 +356,9 @@ export const WorkspaceList: React.FC<{
 
       {deleteArchivedTarget && (
         <div className="modal-overlay" onMouseDown={() => setDeleteArchivedTarget(null)}>
+          {/* 删除确认：Enter 不触发删除（只允许点击按钮），避免误删；Escape 关闭 */}
           <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => {
-            if (e.key === 'Enter') { e.preventDefault(); onDeleteArchivedWorkspace(deleteArchivedTarget); setDeleteArchivedTarget(null); }
-            else if (e.key === 'Escape') setDeleteArchivedTarget(null);
+            if (e.key === 'Escape') setDeleteArchivedTarget(null);
           }}>
             <div className="modal-title">彻底删除</div>
             <div className="modal-message">

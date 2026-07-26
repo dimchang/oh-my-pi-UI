@@ -37,13 +37,17 @@ export const ThinkingPicker: React.FC = () => {
     setOpen(false);
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
-    void rpc.setThinkingLevel(sp, l).catch(() => undefined);
+    void rpc.setThinkingLevel(sp, l).catch((e) => {
+      useApp.getState().pushToast(`切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    });
   };
 
   const cycle = () => {
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
-    void rpc.cycleThinkingLevel(sp).catch(() => undefined);
+    void rpc.cycleThinkingLevel(sp).catch((e) => {
+      useApp.getState().pushToast(`循环切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    });
   };
 
   const current = LEVELS.find((l) => l.value === level);

@@ -74,7 +74,7 @@ export interface Usage {
 }
 
 export interface AgentMessage {
-  role: 'user' | 'assistant' | 'tool' | string;
+  role: 'user' | 'assistant' | 'tool' | (string & {});
   content: MessageContent[];
   attribution?: string;
   timestamp?: number;
@@ -91,7 +91,8 @@ export interface AgentMessage {
   errorStatus?: number;
   errorId?: number | string;
   errorMessage?: string;
-  [k: string]: unknown;
+  // issue 91: 未知字段收进显式 extra，替代宽松索引签名（避免所有属性访问退化为 unknown）
+  extra?: Record<string, unknown>;
 }
 
 /** 历史回放消息：AgentMessage 基础上，由 readSessionMessages 附加工具调用参数，
@@ -99,6 +100,9 @@ export interface AgentMessage {
 export interface ReplayMessage extends AgentMessage {
   /** 来自匹配到的 tool_execution_start 帧的 args（如 read 的 path） */
   replayArgs?: unknown;
+  // issue 91: 收紧索引签名后，回放 toolResult 需显式声明这两个字段（原先靠 [k:string]:unknown 隐式携带）
+  toolCallId?: string;
+  toolName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +111,8 @@ export interface ReplayMessage extends AgentMessage {
 
 export interface RpcCommandBase {
   id?: string;
-  type: string;
+  // issue 40: branded 写法，避免 `string` 吸收字面量联合导致 RpcCommand 判别联合失效
+  type: string & {};
 }
 
 export interface PromptCommand extends RpcCommandBase {
@@ -310,7 +315,8 @@ export type OmpFrame =
   | AgentSessionEvent
   | RpcExtensionUIRequest
   | AvailableCommandsUpdateFrame
-  | { type: string; [k: string]: unknown };
+  // issue 40: 兜底成员的 type 用 branded 写法，避免 `string` 吸收字面量联合导致判别失效
+  | { type: string & {}; [k: string]: unknown };
 
 // ---------------------------------------------------------------------------
 // get_state 的 data（实测字段）

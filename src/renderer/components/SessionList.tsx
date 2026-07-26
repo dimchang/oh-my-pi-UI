@@ -3,6 +3,7 @@ import type { SessionSummary } from '../../shared/ipc-channels';
 
 function relTime(mtime: number): string {
   const diff = Date.now() - mtime;
+  if (diff < 0) return '刚刚'; // mtime 来自未来（时钟回拨/时区）→ 显示刚刚，避免负数
   const min = Math.floor(diff / 60000);
   if (min < 1) return '刚刚';
   if (min < 60) return `${min} 分钟前`;
@@ -11,6 +12,16 @@ function relTime(mtime: number): string {
   const d = Math.floor(h / 24);
   if (d < 30) return `${d} 天前`;
   return new Date(mtime).toLocaleDateString();
+}
+
+/** 把右键菜单定位 clamp 到视口内，避免溢出屏幕 */
+function clampMenuPos(x: number, y: number): { left: number; top: number } {
+  const estW = 180;
+  const estH = 200;
+  return {
+    left: Math.max(0, Math.min(x, window.innerWidth - estW)),
+    top: Math.max(0, Math.min(y, window.innerHeight - estH)),
+  };
 }
 
 /** 纯展示型会话列表（接收 sessions 和 currentPath，由父组件 WorkspaceList 提供数据）
@@ -64,7 +75,7 @@ export const SessionList: React.FC<{
       {ctxMenu && (
         <div
           className="ctx-menu"
-          style={{ left: ctxMenu.x, top: ctxMenu.y, position: 'fixed' }}
+          style={{ ...clampMenuPos(ctxMenu.x, ctxMenu.y), position: 'fixed' }}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="ctx-item" onClick={() => { closeMenu(); onRename(ctxMenu.session); }}>重命名</div>

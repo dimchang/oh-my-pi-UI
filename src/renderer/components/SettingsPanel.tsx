@@ -7,6 +7,7 @@ import React, { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { SettingsModelConfig } from './SettingsModelConfig';
 import { SettingsHooks } from './SettingsHooks';
+import { basename } from '../utils/path-key';
 import type { AppearanceConfig, CustomCssConfig } from '../../shared/ipc-channels';
 
 const TABS: Array<{ key: 'system' | 'agent' | 'model'; icon: string; label: string }> = [
@@ -114,14 +115,16 @@ const SystemConfigTab: React.FC = () => {
     setCustomCss(appearance?.customCss ?? []);
   }, [appearance]);
 
+  // 从 store get() 读最新值作为 base，避免闭包捕获到过时的本地草稿 state
   const commit = (patch: Partial<AppearanceConfig>) => {
+    const prev = useApp.getState().appearance;
     const next: AppearanceConfig = {
-      mode,
-      fontFamily: fontFamily || undefined,
-      fontSize: fontSize > 0 ? fontSize : undefined,
-      bgColor: bgEnabled ? bgColor : undefined,
-      accentColor: accentEnabled ? accentColor : undefined,
-      customCss: customCss.length ? customCss : undefined,
+      mode: prev?.mode ?? mode,
+      fontFamily: prev?.fontFamily ?? (fontFamily || undefined),
+      fontSize: prev?.fontSize ?? (fontSize > 0 ? fontSize : undefined),
+      bgColor: prev?.bgColor ?? (bgEnabled ? bgColor : undefined),
+      accentColor: prev?.accentColor ?? (accentEnabled ? accentColor : undefined),
+      customCss: prev?.customCss ?? (customCss.length ? customCss : undefined),
       ...patch,
     };
     useApp.getState().setAppearance(next);
@@ -140,33 +143,47 @@ const SystemConfigTab: React.FC = () => {
     setCustomCss(next);
     commit({ customCss: next.length ? next : undefined });
   };
-  const basename = (p: string) => p.split(/[\\/]/).pop() || p;
 
   const importCss = async (importMode: 'embed' | 'link') => {
-    setCssError('');
-    const path = await window.omp.pickCssFile();
-    if (!path) return;
-    if (customCss.some((c) => c.path === path && c.mode === importMode)) {
-      setCssError(`已导入过该文件（${importMode === 'embed' ? '嵌入' : '链接'}模式）：${basename(path)}`);
-      return;
+    try {
+      setCssError('');
+      const path = await window.omp.pickCssFile();
+      if (!path) return;
+      // 读最新列表，避免闭包里的 customCss 过时
+      const cur = useApp.getState().appearance?.customCss ?? customCss;
+      if (cur.some((c) => c.path === path && c.mode === importMode)) {
+        setCssError(`已导入过该文件（${importMode === 'embed' ? '嵌入' : '链接'}模式）：${basename(path)}`);
+        return;
+      }
+      const id = `css-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const next: CustomCssConfig[] = [...cur, { id, path, mode: importMode, enabled: true, name: basename(path) }];
+      commitCss(next);
+    } catch (e) {
+      useApp.getState().pushToast(`导入 CSS 失败：${e instanceof Error ? e.message : String(e)}`, 'error');
     }
-    const id = `css-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next: CustomCssConfig[] = [...customCss, { id, path, mode: importMode, enabled: true, name: basename(path) }];
-    commitCss(next);
   };
 
   const toggleCss = (idx: number) =>
     commitCss(customCss.map((c, i) => (i === idx ? { ...c, enabled: !c.enabled } : c)));
   const removeCss = (idx: number) => commitCss(customCss.filter((_, i) => i !== idx));
   const reloadCss = async (idx: number) => {
-    setCssError('');
-    const c = customCss[idx];
-    if (c.mode === 'embed') {
-      const r = await window.omp.readCssFile(c.path);
-      if (r.error) { setCssError(`重新读取失败：${r.error}`); return; }
+    try {
+      setCssError('');
+      // 读最新列表，避免闭包里的 customCss 过时（issue 59）
+      const cur = useApp.getState().appearance?.customCss ?? customCss;
+      const c = cur[idx];
+      if (!c) return;
+      if (c.mode === 'embed') {
+        const r = await window.omp.readCssFile(c.path);
+        if (r.error) { setCssError(`重新读取失败：${r.error}`); return; }
+        // embed 模式：把读取到的（最新）源文件内容真正重新同步进 styles.css
+        // （syncCustomCss 会按 c.path 重读磁盘内容写入区块）
+      }
+      // link 模式：重新生成 @import；embed 模式：重新读源文件写入区块
+      commitCss(cur);
+    } catch (e) {
+      useApp.getState().pushToast(`重新读取 CSS 失败：${e instanceof Error ? e.message : String(e)}`, 'error');
     }
-    // 触发 syncCustomCss 重新写入 styles.css（embed 重新读源文件，link 重新生成 @import）
-    commitCss(customCss);
   };
 
   return (

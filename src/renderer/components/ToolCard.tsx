@@ -15,7 +15,9 @@ function stringify(v: unknown): string {
 /** 针对不同工具做友好摘要 */
 function summaryOf(tool: ToolPart): string {
   const name = tool.toolName.toLowerCase();
-  const args = (tool.args ?? {}) as Record<string, unknown>;
+  // args 可能非对象（如字符串/数字），强制断言会出错——先检查类型
+  const args: Record<string, unknown> =
+    typeof tool.args === 'object' && tool.args !== null ? (tool.args as Record<string, unknown>) : {};
   if (name === 'read' || name === 'write' || name === 'edit') {
     return String(args.path ?? args.file ?? '');
   }
