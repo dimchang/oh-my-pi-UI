@@ -5,9 +5,7 @@ import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
 import { InputBox } from './components/InputBox';
 import { WorkspaceList } from './components/WorkspaceList';
-import { ModelPicker } from './components/ModelPicker';
-import { PermissionPicker } from './components/PermissionPicker';
-import { ThinkingPicker } from './components/ThinkingPicker';
+import { Icon } from './components/Icon';
 import { StatusBar } from './components/StatusBar';
 import { PermissionModal } from './components/PermissionModal';
 import { FileTree } from './components/FileTree';
@@ -596,6 +594,10 @@ export default function App(): React.ReactElement {
   const currentUi = uiQueue[0];
   const currentSessionPath = useApp((s) => s.currentSessionPath);
   const sessions = useApp((s) => s.sessions);
+  // 顶栏标题 = 当前会话名（而非硬编码「OMP · Codex」）
+  const currentSessionTitle = useApp(
+    (s) => s.sessions.find((x) => x.path === s.currentSessionPath)?.title ?? null,
+  );
 
   const showTitleBar = IS_WIN32;
 
@@ -624,25 +626,22 @@ export default function App(): React.ReactElement {
         />
         <div className="main">
         <div className="topbar">
-          <span className="topbar-title">OMP · Codex</span>
+          <span className="topbar-title">{currentSessionTitle ?? '新会话'}</span>
           <div className="topbar-actions">
             <button
               className={`icon-btn ${rightPanel === 'files' ? 'active' : ''}`}
               onClick={() => togglePanel('files')}
               title="文件树"
             >
-              📁
+              <Icon name="folder" size={16} />
             </button>
             <button
               className={`icon-btn ${rightPanel === 'todo' ? 'active' : ''}`}
               onClick={() => togglePanel('todo')}
               title="Todo 列表"
             >
-              ☑
+              <Icon name="todo" size={16} />
             </button>
-            <ThinkingPicker />
-            <PermissionPicker onChange={onChangeApprovalMode} />
-            <ModelPicker />
           </div>
         </div>
         {mainView === 'skills' ? (
@@ -650,7 +649,7 @@ export default function App(): React.ReactElement {
         ) : (
           <>
             <ChatView />
-            <InputBox onSend={onSend} onAbort={onAbort} />
+            <InputBox onSend={onSend} onAbort={onAbort} onChangeApprovalMode={onChangeApprovalMode} />
             <StatusBar />
           </>
         )}

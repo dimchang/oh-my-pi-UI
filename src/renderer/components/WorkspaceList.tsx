@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { useApp } from '../store';
 import { SessionList } from './SessionList';
+import { Icon } from './Icon';
 import { cwdKey } from '../utils/path-key';
 import type { SessionSummary, Workspace } from '../../shared/ipc-channels';
 
@@ -177,7 +178,7 @@ export const WorkspaceList: React.FC<{
         onClick={() => useApp.getState().setMainView('skills')}
         title="查看 omp 已安装的技能与插件"
       >
-        <span className="skill-card-icon">🧩</span>
+        <span className="skill-card-icon"><Icon name="skill" size={15} /></span>
         <span className="skill-card-label">技能</span>
         <span className="skill-card-count">
           {slashCommands.filter((c) => c.source === 'skill').length}
@@ -237,7 +238,7 @@ export const WorkspaceList: React.FC<{
                   >
                     ▸
                   </span>
-                  <span className="workspace-icon">📁</span>
+                  <span className="workspace-icon"><Icon name="folder" size={16} /></span>
                   <span className="workspace-name">{ws.displayName}</span>
                   <span
                     className="workspace-menu-trigger"

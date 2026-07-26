@@ -42,7 +42,7 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
   return (
     <div className={`message ${msg.role}`} style={msg.error ? { borderLeft: '2px solid var(--red)', paddingLeft: 10 } : undefined}>
       <div className={`msg-role ${msg.role}`} style={msg.error ? { color: 'var(--red)' } : undefined}>
-        {msg.role === 'user' ? '你' : 'Codex'}{msg.error ? ' · 出错' : ''}
+        {msg.role === 'user' ? '你' : 'MyPi'}{msg.error ? ' · 出错' : ''}
       </div>
       <div className="msg-body">
         {msg.parts.map((p, i) => {
@@ -111,7 +111,7 @@ export const ChatView: React.FC = () => {
         {messages.length === 0 && !isCompacting && !isRetrying ? (
           <div className="chat-empty">
             <h2>有什么可以帮你的？</h2>
-            <p>输入任务，Codex 会读写文件、跑命令来完成。</p>
+            <p>输入任务，MyPi 会读写文件、跑命令来完成。</p>
           </div>
         ) : (
           messages.map((m) => <MessageItem key={m.id} msg={m} />)

@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { useApp } from '../store';
+import { Icon } from './Icon';
 import type { SlashCommand } from '../../shared/rpc-types';
 
 /** 把一条命令渲染成卡片（技能 / 插件通用）。 */
@@ -98,7 +99,7 @@ export const SkillsPanel: React.FC = () => {
 
         <section className="skills-section">
           <div className="skills-section-title">
-            🧩 技能 Skills <span className="skills-section-count">{skills.length}</span>
+            <Icon name="skill" size={14} /> 技能 Skills <span className="skills-section-count">{skills.length}</span>
           </div>
           {skills.length === 0 ? (
             <div className="skills-empty">
@@ -113,7 +114,7 @@ export const SkillsPanel: React.FC = () => {
 
         <section className="skills-section">
           <div className="skills-section-title">
-            🔌 插件 / 扩展 Plugins <span className="skills-section-count">{plugins.length}</span>
+            <Icon name="plug" size={14} /> 插件 / 扩展 Plugins <span className="skills-section-count">{plugins.length}</span>
           </div>
           {plugins.length === 0 ? (
             <div className="skills-empty">

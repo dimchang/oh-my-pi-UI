@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import type { FileEntry } from '../../shared/ipc-channels';
+import { Icon } from './Icon';
 
 function formatSize(bytes?: number): string {
   if (bytes === undefined) return '';
@@ -23,7 +24,7 @@ const EntryNode: React.FC<{
   onToggle: (entry: FileEntry) => void;
 }> = ({ entry, depth, expanded, version, onToggle }) => {
   const isOpen = expanded.has(entry.path);
-  const icon = entry.isDir ? (isOpen ? '📂' : '📁') : '📄';
+  const iconName = entry.isDir ? (isOpen ? 'folderOpen' : 'folder') : 'file';
   return (
     <div key={entry.path}>
       <div
@@ -32,7 +33,7 @@ const EntryNode: React.FC<{
         onClick={() => onToggle(entry)}
         title={entry.path}
       >
-        <span className="ft-icon">{icon}</span>
+        <span className="ft-icon"><Icon name={iconName} size={15} /></span>
         <span className="ft-name">{entry.name}</span>
         {!entry.isDir && <span className="ft-size">{formatSize(entry.size)}</span>}
       </div>

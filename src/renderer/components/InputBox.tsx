@@ -1,10 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
+import { ModelPicker } from './ModelPicker';
+import { ThinkingPicker } from './ThinkingPicker';
+import { PermissionPicker } from './PermissionPicker';
+import { Icon } from './Icon';
+import type { ApprovalMode } from '../../shared/ipc-channels';
 
-export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () => void }> = ({
-  onSend,
-  onAbort,
-}) => {
+export const InputBox: React.FC<{
+  onSend: (text: string) => void;
+  onAbort: () => void;
+  onChangeApprovalMode: (mode: ApprovalMode) => void;
+}> = ({ onSend, onAbort, onChangeApprovalMode }) => {
   const [draft, setDraft] = useState('');
   const [selIdx, setSelIdx] = useState(0);
   const isStreaming = useApp((s) => s.isStreaming);
@@ -102,19 +108,31 @@ export const InputBox: React.FC<{ onSend: (text: string) => void; onAbort: () =>
             ref={taRef}
             rows={1}
             value={draft}
-            placeholder={ready ? '给 Codex 派个任务…（/ 打开命令，Esc 中止）' : '正在连接 omp…'}
+            placeholder={ready ? '给 MyPi 派个任务…（/ 打开命令，Esc 中止）' : '正在连接 omp…'}
             onChange={(e) => { setDraft(e.target.value); setSelIdx(0); autoGrow(); }}
             onKeyDown={onKeyDown}
           />
-          {isStreaming ? (
-            <button className="btn" onClick={onAbort} disabled={isAborting}>
-              {isAborting ? '停止中…' : '停止'}
-            </button>
-          ) : (
-            <button className="btn btn-primary" onClick={submit} disabled={!ready || !draft.trim()}>
-              发送
-            </button>
-          )}
+          <div className="input-toolbar">
+            <div className="input-toolbar-left">
+              <button className="input-tool-btn" type="button" title="添加附件">
+                <Icon name="attach" size={16} />
+              </button>
+              <PermissionPicker onChange={onChangeApprovalMode} />
+            </div>
+            <div className="input-toolbar-right">
+              <ThinkingPicker />
+              <ModelPicker />
+              {isStreaming ? (
+                <button className="stop-btn-round" onClick={onAbort} disabled={isAborting} title="停止">
+                  <Icon name="stop" size={14} />
+                </button>
+              ) : (
+                <button className="send-btn-round" onClick={submit} disabled={!ready || !draft.trim()} title="发送">
+                  <Icon name="send" size={16} />
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

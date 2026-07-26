@@ -312,6 +312,31 @@ body {
   color: hsl(var(--oncolor-100));
 }
 
+/* 扁平化单色图标基样式（颜色随 currentColor 继承主题/悬停） */
+.icon {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* 标题栏左侧不可点击的品牌字 */
+.titlebar-brand {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px 0 4px;
+  margin-right: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: hsl(var(--text-100));
+  cursor: default;
+  user-select: none;
+  -webkit-app-region: drag;
+  app-region: drag;
+  border-right: 1px solid hsl(var(--border-200));
+}
+
 /* 下拉菜单 */
 .titlebar-dropdown {
   position: absolute;
@@ -705,7 +730,7 @@ body {
 .msg-role {
   font-size: 11px;
   font-weight: 600;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.6px;
   margin-bottom: 8px;
   color: hsl(var(--text-400));
@@ -926,6 +951,64 @@ body {
 .send-btn:hover { background: hsl(var(--accent-main-100)); }
 .send-btn:active { transform: scale(0.94); }
 .send-btn:disabled { background: hsl(var(--bg-400)); color: hsl(var(--text-400)); cursor: not-allowed; }
+
+/* 输入框下方工具栏：模型/思考/权限都收进对话框里 */
+.input-box { flex-direction: column; align-items: stretch; gap: 10px; }
+.input-box textarea { min-height: 24px; }
+.input-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.input-toolbar-left, .input-toolbar-right { display: flex; align-items: center; gap: 8px; }
+.input-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: 1px solid hsl(var(--border-200));
+  background: transparent;
+  color: hsl(var(--text-300));
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.input-tool-btn:hover { background: hsl(var(--bg-300) / 0.6); color: var(--text); }
+
+/* toolbar 内的 picker 按钮扁平化为胶囊 */
+.input-toolbar .model-picker .btn,
+.input-toolbar .thinking-picker .btn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid hsl(var(--border-200));
+  background: transparent;
+  color: hsl(var(--text-300));
+  font-size: 12.5px;
+}
+.input-toolbar .model-picker .btn:hover,
+.input-toolbar .thinking-picker .btn:hover { background: hsl(var(--bg-300) / 0.6); color: var(--text); }
+
+/* 圆形发送 / 停止按钮 */
+.send-btn-round, .stop-btn-round {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(var(--accent-main-000));
+  color: hsl(var(--oncolor-100));
+  transition: transform 0.05s, opacity 0.12s;
+}
+.send-btn-round:hover { opacity: 0.85; }
+.send-btn-round:active, .stop-btn-round:active { transform: scale(0.94); }
+.stop-btn-round { background: hsl(var(--bg-400)); color: var(--text); }
+.stop-btn-round:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* toolbar 贴底，下拉菜单向上展开 */
+.input-toolbar .model-menu,
+.input-toolbar .thinking-menu { top: auto; bottom: calc(100% + 6px); }
 
 .slash-popup {
   position: absolute;

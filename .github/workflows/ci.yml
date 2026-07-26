@@ -50,10 +50,9 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Upload to Release
-      # pinned by full commit SHA (security: avoid mutable tag).
-      # SHA 3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 = v2.6.2 (PGP 验证发布).
-      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        # pinned by full commit SHA (security: avoid mutable tag).
+        # SHA 3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 = v2.6.2 (PGP 验证发布).
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release/*-portable.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}

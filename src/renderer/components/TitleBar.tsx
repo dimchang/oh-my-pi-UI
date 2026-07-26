@@ -80,6 +80,7 @@ export function TitleBar(): React.ReactElement | null {
   return (
     <div ref={barRef} className="titlebar">
       <div className="titlebar-menus">
+        <span className="titlebar-brand">OMP-UI</span>
         {MENUS.map((menu) => (
           <div
             key={menu.label}

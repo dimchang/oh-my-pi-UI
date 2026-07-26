@@ -1,12 +1,11 @@
 import React from 'react';
 import { useApp } from '../store';
+import { Icon } from './Icon';
 
 export const StatusBar: React.FC = () => {
   const ready = useApp((s) => s.ready);
   const exited = useApp((s) => s.ompExited);
   const isStreaming = useApp((s) => s.isStreaming);
-  const model = useApp((s) => s.model);
-  const thinking = useApp((s) => s.thinkingLevel);
   const usage = useApp((s) => s.contextUsage);
   const stats = useApp((s) => s.sessionStats);
   const isCompacting = useApp((s) => s.isCompacting);
@@ -34,15 +33,10 @@ export const StatusBar: React.FC = () => {
       </span>
       {currentWorkspace && (
         <span className="status-item status-workspace" title={currentWorkspace.cwd}>
-          📂 {currentWorkspace.displayName}
+          <Icon name="folder" size={14} />
+          {currentWorkspace.displayName}
         </span>
       )}
-      {model && (
-        <span className="status-item" title={model.id}>
-          {model.name ?? model.id} · {model.provider}
-        </span>
-      )}
-      {thinking && <span className="status-item">思考: {thinking}</span>}
       <span className="status-spacer" />
       {stats?.totalTokens !== undefined && Number.isFinite(stats.totalTokens) && (
         <span className="status-item" title={`${stats.messageCount ?? 0} 条消息`}>
