@@ -46,3 +46,6 @@ scripts/sync-core.ps1
 
 # ===== One-off debug control dump (root, throwaway) =====
 control.json
+
+# ===== Runtime temp dir (omp stderr logs, etc.) =====
+.temp/

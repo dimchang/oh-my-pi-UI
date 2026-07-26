@@ -2,8 +2,10 @@
  * SettingsModelConfig — 配置页「模型配置」内容区。
  * - 展示 omp 当前所有可用模型（get_available_models 按 provider 分组）
  * - 每个模型 checkbox：勾选 = 进入 ModelPicker 白名单（enabledModels，存 workspaces.json）
- * - 自定义 provider（来自 ~/.omp/agent/models.yml）可删除；内置/OAuth provider 只读
+ * - 所有 provider（自定义 / omp 内置但未在 models.yml 里的）都支持编辑：修改 baseUrl / API Key 等 → 写到 models.yml
  * - [+ 添加模型] 弹出 AddModelModal（写 models.yml + 重启 omp + 二步勾选模型）
+ *
+ * 顶部搜索框：按 provider 名 / 模型名 / id 过滤（issue 156：模型多到难找）。
  *
  * 白名单语义：
  *   enabledModels === undefined → 未配置白名单 → 显示全部模型
@@ -26,9 +28,13 @@ export const SettingsModelConfig: React.FC = () => {
   const [ymlConfig, setYmlConfig] = useState<OmpModelsConfig>({ providers: {} });
   const [loading, setLoading] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  /** 编辑模式：editingId 设置后 AddModelModal 进入编辑模式 */
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  /** 模型列表搜索（issue 156）：按 provider 名 / 模型名 / id 过滤 */
+  const [search, setSearch] = useState('');
 
   // 递增请求序号：并发 refresh 时，只有最新一次请求能落下 loading=false / 数据，
   // 避免旧请求晚到时把新数据覆盖掉（并发 loading 错乱）。
@@ -76,6 +82,29 @@ export const SettingsModelConfig: React.FC = () => {
     () => new Set(Object.keys(ymlConfig.providers ?? {})),
     [ymlConfig],
   );
+
+  // 搜索过滤（issue 156）：provider 名 / 模型名 / 模型 id 任一匹配即可；空查询显示全部
+  const filteredGroups = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return groups;
+    const out: Record<string, ModelInfo[]> = {};
+    for (const [pid, list] of Object.entries(groups)) {
+      const providerName = ymlConfig.providers?.[pid]?.name ?? pid;
+      const providerHit = `${pid} ${providerName}`.toLowerCase().includes(q);
+      const matchedModels = list.filter((m) => {
+        const modelText = `${m.id} ${m.name ?? ''}`.toLowerCase();
+        return providerHit || modelText.includes(q);
+      });
+      // provider 名命中：整组保留（即便模型列表不全匹配，方便找同 provider 下其他模型）
+      // 只模型命中：只显示命中的模型
+      if (providerHit) {
+        out[pid] = list;
+      } else if (matchedModels.length > 0) {
+        out[pid] = matchedModels;
+      }
+    }
+    return out;
+  }, [groups, ymlConfig, search]);
 
   // 新语义：undefined = 未配置白名单（显示全部）；任何数组（含空数组 []）= 白名单已激活
   const whitelistActive = enabledModels !== undefined;
@@ -157,26 +186,47 @@ export const SettingsModelConfig: React.FC = () => {
         <button className="btn btn-primary" onClick={() => setAddOpen(true)}>+ 添加模型</button>
       </div>
 
+      {/* 搜索框（issue 156）：provider 名 / 模型名 / id 任一匹配即可；空查询显示全部 */}
+      <div className="model-config-search">
+        <input
+          className="form-input"
+          placeholder="🔍 搜索提供商 / 模型名 / ID…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        {search && (
+          <button className="btn btn-sm model-config-search-clear" onClick={() => setSearch('')} title="清空">
+            ✕
+          </button>
+        )}
+      </div>
+
       {error && <div className="model-config-error">{error}</div>}
       {busy && <div className="model-config-busy">{busy}</div>}
       {loading && <div className="settings-placeholder">加载中…</div>}
 
-      {!loading && Object.keys(groups).length === 0 && (
+      {!loading && Object.keys(filteredGroups).length === 0 && search && (
+        <div className="settings-placeholder">没有匹配「{search}」的提供商或模型</div>
+      )}
+
+      {!loading && Object.keys(filteredGroups).length === 0 && !search && Object.keys(groups).length === 0 && (
         <div className="settings-placeholder">暂无可用模型（omp 未就绪或没有已配置的提供商）</div>
       )}
 
       <div className="provider-list">
-        {Object.entries(groups).map(([pid, list]) => {
+        {Object.entries(filteredGroups).map(([pid, list]) => {
           const isCustom = customProviders.has(pid);
           const cfg = ymlConfig.providers?.[pid];
           const enabledCount = list.filter((m) => isEnabled(modelKey(m))).length;
+          // 用 discovered models 里的第一个 sample 提供 baseUrl/api 兜底（issue 156：omp 内置但 yml 里没有的 provider 编辑时）
+          const discoveredSample = list[0];
           return (
             <div key={pid} className="provider-card">
               <div className="provider-card-head">
                 <div className="provider-card-info">
                   <span className="provider-card-name">{cfg?.name ?? pid}</span>
-                  {isCustom && <span className="provider-badge custom">自定义</span>}
-                  {!isCustom && <span className="provider-badge">内置</span>}
+                  {isCustom && <span className="provider-badge custom">已配置</span>}
+                  {!isCustom && <span className="provider-badge">omp 内置</span>}
                   <span className="provider-count">{enabledCount}/{list.length} 启用</span>
                 </div>
                 <div className="provider-card-actions">
@@ -185,6 +235,14 @@ export const SettingsModelConfig: React.FC = () => {
                       {list.every((m) => isEnabled(modelKey(m))) ? '全不选' : '全选'}
                     </button>
                   )}
+                  {/* 编辑：所有 provider 都允许（issue 156：omp 内置也能编辑）→ 写到 models.yml 覆盖 */}
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => setEditingId(pid)}
+                    title={isCustom ? '编辑该 provider（baseUrl / API Key / 模型）' : '把配置写入 models.yml 覆盖 omp 内置默认'}
+                  >
+                    编辑
+                  </button>
                   {isCustom && (
                     <button className="btn btn-sm btn-danger" onClick={() => setConfirmDelete(pid)}>
                       删除
@@ -244,6 +302,20 @@ export const SettingsModelConfig: React.FC = () => {
           onClose={() => setAddOpen(false)}
           onSaved={() => {
             setAddOpen(false);
+            refresh();
+          }}
+        />
+      )}
+
+      {editingId && (
+        <AddModelModal
+          key={`edit-${editingId}`}
+          editingProviderId={editingId}
+          existingConfig={ymlConfig.providers?.[editingId] ?? null}
+          discoveredSample={models.find((m) => m.provider === editingId)}
+          onClose={() => setEditingId(null)}
+          onSaved={() => {
+            setEditingId(null);
             refresh();
           }}
         />

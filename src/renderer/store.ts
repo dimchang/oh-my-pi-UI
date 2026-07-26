@@ -14,6 +14,7 @@ import type {
   SlashCommand,
   ThinkingLevel,
   TodoPhase,
+  TodoItem,
 } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
@@ -125,7 +126,7 @@ interface AppState {
   compactionInfo: string;
   sessionStats?: { totalTokens?: number; totalCost?: number; messageCount?: number };
   /** 右栏标签：off|files|diff|todo */
-  rightPanel: 'off' | 'files' | 'diff' | 'todo';
+  rightPanel: 'off' | 'files' | 'todo';
   /** 主工作区视图：chat=对话，skills=技能/插件面板 */
   mainView: 'chat' | 'skills';
   setMainView(v: 'chat' | 'skills'): void;
@@ -362,7 +363,7 @@ export const useApp = create<AppState>((set, get) => ({
     set((s) => ({ stderrTail: [...s.stderrTail.slice(-199), line] })),
 
   setSessions: (list) => set({ sessions: list }),
-  setCurrentSessionPath: (p) => set({ currentSessionPath: p }),
+  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [] }),
 
   // M5: 工作空间
   workspaces: [],
@@ -714,6 +715,8 @@ export const useApp = create<AppState>((set, get) => ({
     switch (type) {
       case 'agent_start': {
         procStreaming = true;
+        // 新一轮任务开始：清空上一轮残留的待办列表（仅当前显示会话）
+        if (isDisplay) set({ todoPhases: [] });
         break;
       }
       case 'agent_end': {
@@ -812,6 +815,11 @@ export const useApp = create<AppState>((set, get) => ({
           result,
         }));
         bufferTouched = true;
+        // omp 把待办建模成 "todo" 工具：当前显示会话时，把结构化结果同步到全局 Todo 面板
+        if (isDisplay && (frame.toolName === 'todo' || frame.name === 'todo')) {
+          const phases = normalizeTodoPhases(result);
+          if (phases) set({ todoPhases: phases });
+        }
         break;
       }
       // ---- M4: 压缩 / 重试 / Todo：仅当前显示会话才更新全局 UI 状态（后台会话不污染）----
@@ -887,6 +895,35 @@ function updateToolInBuffer(
       p.kind === 'tool' && p.toolCallId === toolCallId ? fn(p) : p,
     ),
   }));
+}
+
+/**
+ * 从 omp `todo` 工具的 tool_execution_end.result 里提取结构化待办。
+ * omp 不吐 todo_reminder 帧（2026-07-26 probe 确认），待办藏在名为 "todo" 的工具里：
+ *   result.details = { op, phases: [{ name, tasks: [{ content, status }] }], storage }
+ * 归一化成 UI 的 TodoPhase[]（phase<-name, items<-tasks）。无有效数据时返回 null。
+ */
+function normalizeTodoPhases(result: unknown): TodoPhase[] | null {
+  if (!result || typeof result !== 'object') return null;
+  const details = (result as Record<string, unknown>).details;
+  if (!details || typeof details !== 'object') return null;
+  const phases = (details as Record<string, unknown>).phases;
+  if (!Array.isArray(phases) || phases.length === 0) return null;
+  const out: TodoPhase[] = [];
+  for (const ph of phases) {
+    if (!ph || typeof ph !== 'object') continue;
+    const p = ph as Record<string, unknown>;
+    const phaseName = typeof p.name === 'string' ? p.name : '';
+    const tasks = Array.isArray(p.tasks) ? (p.tasks as unknown[]) : [];
+    const items: TodoItem[] = tasks
+      .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+      .map((t) => ({
+        content: typeof t.content === 'string' ? t.content : String(t.content ?? ''),
+        status: typeof t.status === 'string' ? t.status : undefined,
+      }));
+    out.push({ phase: phaseName, items });
+  }
+  return out.length ? out : null;
 }
 
 /**

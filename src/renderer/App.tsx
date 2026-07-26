@@ -32,7 +32,7 @@ export default function App(): React.ReactElement {
     useApp.getState().pushToast(text, level);
   }, []);
 
-  const togglePanel = useCallback((panel: 'files' | 'diff' | 'todo') => {
+  const togglePanel = useCallback((panel: 'files' | 'todo') => {
     const st = useApp.getState();
     st.setState({ rightPanel: st.rightPanel === panel ? 'off' : panel });
   }, []);
@@ -634,13 +634,6 @@ export default function App(): React.ReactElement {
               📁
             </button>
             <button
-              className={`icon-btn ${rightPanel === 'diff' ? 'active' : ''}`}
-              onClick={() => togglePanel('diff')}
-              title="Diff 面板"
-            >
-              ⇔
-            </button>
-            <button
               className={`icon-btn ${rightPanel === 'todo' ? 'active' : ''}`}
               onClick={() => togglePanel('todo')}
               title="Todo 列表"
@@ -671,12 +664,6 @@ export default function App(): React.ReactElement {
             // 无 workspace / 取不到 cwd 时避免 listFiles('')，改为提示
             return wd ? <FileTree cwd={wd} /> : <div className="panel-empty">请先选择工作空间</div>;
           })()}
-          {rightPanel === 'diff' && (
-            <div className="diff-panel">
-              <div className="panel-header"><span>Diff</span></div>
-              <div className="panel-empty">点击工具卡中的文件变更以查看 diff</div>
-            </div>
-          )}
           {rightPanel === 'todo' && <TodoPanel />}
         </div>
       )}

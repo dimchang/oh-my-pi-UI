@@ -1,16 +1,22 @@
 /**
- * AddModelModal — 「添加模型」弹窗：
+ * AddModelModal — 「添加模型」/「编辑提供商」弹窗：
  *
- *  第 1 步：
- *    A) 从内置 provider 预设列表选择（自动填充 baseUrl / api 类型，只需填 API Key）
- *    B) 或选「自定义」手动填写全部字段
- *    → 写入 ~/.omp/agent/models.yml → 重启 omp
+ *  添加模式（默认）：
+ *    第 1 步：
+ *      A) 从内置 provider 预设列表选择（自动填充 baseUrl / api 类型，只需填 API Key）
+ *      B) 或选「自定义」手动填写全部字段
+ *      → 写入 ~/.omp/agent/models.yml → 重启 omp
  *
- *  两种保存方式：
- *    · 「保存并获取模型列表」→ 写配置 + 重启 + 第 2 步轮询自动发现
- *    · 「仅保存」（有手动模型 ID 时出现）→ 写配置 + 重启 + 手动 ID 直接入白名单 + 关闭
+ *    两种保存方式：
+ *      · 「保存并获取模型列表」→ 写配置 + 重启 + 第 2 步轮询自动发现
+ *      · 「仅保存」（有手动模型 ID 时出现）→ 写配置 + 重启 + 手动 ID 直接入白名单 + 关闭
  *
- *  第 2 步：展示该 provider 拉回的模型列表 → 用户勾选要启用的（写 enabledModels 白名单）
+ *    第 2 步：展示该 provider 拉回的模型列表 → 用户勾选要启用的（写 enabledModels 白名单）
+ *
+ *  编辑模式（editingProviderId 已传）：直接进表单 prepopulate 现有配置，
+ *    pid 锁定，按钮「保存修改」→ 写 models.yml + reload 当前会话 + 关闭。
+ *    即使是 omp 内置但未在 models.yml 里的 provider（如 openrouter）也可编辑：
+ *    把配置写到 models.yml 后 omp 优先使用该配置（issue 156）。
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -123,14 +129,28 @@ const NO_KEY_NEEDED = new Set(['ollama-chat', 'bedrock-converse-stream', 'azure-
 interface Props {
   onClose(): void;
   onSaved(): void;
+  /** 编辑模式：传入 provider id + 已有 yml 配置 + 来自 omp 的发现信息（baseUrl/api 兜底） */
+  editingProviderId?: string;
+  existingConfig?: OmpProviderConfig | null;
+  /** omp getAvailableModels 里该 provider 的模型（用于兜底 baseUrl/api，不修改它） */
+  discoveredSample?: ModelInfo;
 }
 
-export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
+export const AddModelModal: React.FC<Props> = ({
+  onClose,
+  onSaved,
+  editingProviderId,
+  existingConfig = null,
+  discoveredSample,
+}) => {
+  const isEditMode = !!editingProviderId;
   const [step, setStep] = useState<1 | 2>(1);
 
   // ---- 选择模式 ----
-  /** null = 未选（显示预设列表）；ProviderPreset = 选了预设；'custom' = 自定义 */
-  const [selectedPreset, setSelectedPreset] = useState<ProviderPreset | 'custom' | null>(null);
+  /** null = 未选（显示预设列表）；ProviderPreset = 选了预设；'custom' = 自定义/编辑模式 */
+  const [selectedPreset, setSelectedPreset] = useState<ProviderPreset | 'custom' | null>(
+    isEditMode ? 'custom' : null,
+  );
   const [searchQuery, setSearchQuery] = useState('');
 
   // ---- 表单字段 ----
@@ -157,6 +177,25 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   useEffect(() => () => {
     if (pollTimer.current) window.clearTimeout(pollTimer.current);
   }, []);
+
+  // 编辑模式：挂载时 prepopulate 表单字段（issue 156：允许修改自定义/omp 内置 provider 的 baseUrl、API Key 等）
+  useEffect(() => {
+    if (!isEditMode || !editingProviderId) return;
+    const cfg = existingConfig ?? {};
+    // 兜底：existingConfig 缺失字段时从 discoveredSample（omp getAvailableModels 里的 model）取
+    const sample = discoveredSample;
+    const fallbackBaseUrl = sample?.baseUrl ?? '';
+    const fallbackApi = sample?.api ?? 'openai-completions';
+    const fallbackName = sample?.provider ?? editingProviderId;
+    setPid(editingProviderId);
+    setName(cfg.name ?? fallbackName);
+    setBaseUrl(cfg.baseUrl ?? fallbackBaseUrl);
+    setApi(cfg.api ?? fallbackApi);
+    setApiKey(''); // 安全：永远不预填明文 key（让用户主动输入新值覆盖或留空保留）
+    setManualIds((cfg.models ?? []).map((m) => m.id).join(', '));
+    setShowKey(false);
+    setError('');
+  }, [isEditMode, editingProviderId, existingConfig, discoveredSample]);
 
   // ---- 预设搜索过滤 ----
   const filteredGroups = useMemo(() => {
@@ -195,8 +234,9 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   }, []);
 
   const pidValid = /^[a-zA-Z0-9_-]+$/.test(pid);
-  // Bedrock/Azure/Vertex 等 provider 不需要 baseUrl，跳过非空校验（依据 NO_KEY_NEEDED 同组）
-  const canSave = pidValid && (baseUrl.trim().length > 0 || NO_KEY_NEEDED.has(api)) && (apiKey.trim().length > 0 || NO_KEY_NEEDED.has(api));
+  // Bedrock/Azure/Vertex 等 provider 不需要 baseUrl；编辑模式 apiKey 留空保留原值，也算合法（issue 156）。
+  const apiKeyOk = apiKey.trim().length > 0 || NO_KEY_NEEDED.has(api) || isEditMode;
+  const canSave = pidValid && (baseUrl.trim().length > 0 || NO_KEY_NEEDED.has(api)) && apiKeyOk;
   /** 用户是否填了手动模型 ID */
   const hasManualIds = manualIds.split(/[,\s]+/).some((s) => s.trim().length > 0);
 
@@ -213,9 +253,13 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
       api,
     };
     if (name.trim()) cfg.name = name.trim();
-    if (apiKey.trim()) cfg.apiKey = apiKey.trim();
-    else if (!NO_KEY_NEEDED.has(api)) cfg.auth = 'none';
-
+    if (apiKey.trim()) {
+      cfg.apiKey = apiKey.trim();
+    } else if (!NO_KEY_NEEDED.has(api)) {
+      // 添加模式：用户没填 apiKey 且不是 no-key 类型 → 显式标 auth=none
+      // 编辑模式：保留原 apiKey（prepopulate 故意清空，避免明文显示；用户重新填入才覆盖）
+      if (!isEditMode) cfg.auth = 'none';
+    }
     // 手动指定的模型 ID → 写为静态 models 条目
     if (parsedManualIds.length > 0) {
       cfg.models = parsedManualIds.map((id) => ({ id }));
@@ -226,7 +270,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
       cfg.discovery = { type: discovery };
     }
     return cfg;
-  }, [baseUrl, api, name, apiKey, parsedManualIds]);
+  }, [baseUrl, api, name, apiKey, parsedManualIds, isEditMode]);
 
   /** 写 models.yml + 重载当前会话进程。
    *  omp 的 ModelRegistry 只在进程启动时加载 models.yml，已在线进程看不到新 provider，
@@ -331,6 +375,21 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     }
   }, [buildConfig, writeAndRestart, parsedManualIds, pid, onSaved]);
 
+  /** 编辑模式：保存修改 → 写 models.yml + reload 当前会话 + 关闭（不进入第 2 步） */
+  const onEditSave = useCallback(async () => {
+    setError('');
+    setBusy('正在保存修改并重启 omp…');
+    try {
+      const cfg = buildConfig();
+      await writeAndRestart(cfg);
+      setBusy('');
+      onSaved();
+    } catch (e) {
+      setBusy('');
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [buildConfig, writeAndRestart, onSaved]);
+
   /** 第 2 步完成：把勾选结果并入 enabledModels 白名单 */
   const onFinish = useCallback(() => {
     const st = useApp.getState();
@@ -391,10 +450,12 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     }}>
       <div className="modal add-model-modal">
         <div className="add-model-head">
-          <span className="modal-title">添加模型</span>
+          <span className="modal-title">{isEditMode ? `编辑提供商「${editingProviderId}」` : '添加模型'}</span>
           <span className="add-model-subtitle">
             {step === 1
-              ? selectedPreset === null ? '选择已知提供商或自定义' : `配置「${selectedPreset === 'custom' ? '自定义' : (selectedPreset as ProviderPreset).name}」`
+              ? isEditMode
+                ? '修改 baseUrl / API Key / 模型 ID 后保存'
+                : selectedPreset === null ? '选择已知提供商或自定义' : `配置「${selectedPreset === 'custom' ? '自定义' : (selectedPreset as ProviderPreset).name}」`
               : `选择要启用的模型（${pid}）`
             }
           </span>
@@ -404,8 +465,8 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
         {/* ==================== 第 1 步 ==================== */}
         {step === 1 && (
           <div className="add-model-form">
-            {/* ---- 阶段 A：预设选择 ---- */}
-            {selectedPreset === null && (
+            {/* ---- 阶段 A：预设选择 ----（编辑模式跳过，直接进表单） */}
+            {selectedPreset === null && !isEditMode && (
               <>
                 <div className="preset-search">
                   <input
@@ -472,12 +533,20 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                     </button>
                   </div>
                 )}
-                {selectedPreset === 'custom' && (
+                {selectedPreset === 'custom' && !isEditMode && (
                   <div className="preset-selected-bar">
                     <span className="preset-selected-name">自定义提供商</span>
                     <button className="btn btn-sm btn-link preset-change-btn" onClick={goBackToPresets}>
                       ← 从预设选择
                     </button>
+                  </div>
+                )}
+                {selectedPreset === 'custom' && isEditMode && (
+                  <div className="preset-selected-bar">
+                    <span className="preset-selected-name">编辑模式</span>
+                    <span className="form-hint" style={{ marginLeft: 8 }}>
+                      修改后将覆盖 ~/.omp/agent/models.yml 中同名条目
+                    </span>
                   </div>
                 )}
 
@@ -488,7 +557,7 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                     placeholder="如 deepseek（字母/数字/-/_）"
                     value={pid}
                     onChange={(e) => setPid(e.target.value)}
-                    disabled={selectedPreset !== 'custom'}
+                    disabled={selectedPreset !== 'custom' || isEditMode}
                   />
                   {pid && !pidValid && <span className="form-error">只允许字母、数字、- 和 _</span>}
                 </label>
@@ -537,9 +606,11 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                       className="form-input"
                       type={showKey ? 'text' : 'password'}
                       placeholder={
-                        selectedPreset !== 'custom'
-                          ? `输入 ${(selectedPreset as ProviderPreset).name} API Key（明文存于 models.yml）`
-                          : '输入 API Key（明文存于 ~/.omp/agent/models.yml）'
+                        isEditMode
+                          ? '留空保留原 Key；填入新值将覆盖（明文存于 models.yml）'
+                          : selectedPreset !== 'custom'
+                            ? `输入 ${(selectedPreset as ProviderPreset).name} API Key（明文存于 models.yml）`
+                            : '输入 API Key（明文存于 ~/.omp/agent/models.yml）'
                       }
                       value={apiKey}
                       onChange={(e) => setApiKey(e.target.value)}
@@ -553,7 +624,10 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                       {showKey ? '🙈' : '👁'}
                     </button>
                   </div>
-                  {selectedPreset !== 'custom' && (selectedPreset as ProviderPreset).hint && (
+                  {isEditMode && existingConfig?.apiKey && (
+                    <span className="form-hint">当前已配置（明文未显示）</span>
+                  )}
+                  {!isEditMode && selectedPreset !== 'custom' && (selectedPreset as ProviderPreset).hint && (
                     <span className="form-hint">格式提示：{(selectedPreset as ProviderPreset).hint}</span>
                   )}
                 </label>
@@ -577,9 +651,9 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                 {busy && <div className="model-config-busy">{busy}</div>}
 
                 <div className="modal-actions">
-                  <button className="btn" onClick={goBackToPresets}>返回</button>
+                  {!isEditMode && <button className="btn" onClick={goBackToPresets}>返回</button>}
                   <button className="btn" onClick={onClose} disabled={!!busy}>取消</button>
-                  {hasManualIds && (
+                  {!isEditMode && hasManualIds && (
                     <button
                       className="btn btn-primary"
                       onClick={() => void onSaveOnly()}
@@ -588,13 +662,23 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
                       仅保存
                     </button>
                   )}
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => void onSaveAndFetch()}
-                    disabled={!canSave || !!busy}
-                  >
-                    保存并获取模型列表
-                  </button>
+                  {isEditMode ? (
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => void onEditSave()}
+                      disabled={!canSave || !!busy}
+                    >
+                      保存修改
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => void onSaveAndFetch()}
+                      disabled={!canSave || !!busy}
+                    >
+                      保存并获取模型列表
+                    </button>
+                  )}
                 </div>
               </>
             )}
