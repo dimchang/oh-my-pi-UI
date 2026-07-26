@@ -16,7 +16,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
-import { cwdKey, modelKey } from '../utils/path-key';
+import { modelKey } from '../utils/path-key';
+import { reloadCurrentSession } from '../utils/reload-session';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpProviderConfig } from '../../shared/ipc-channels';
 
@@ -150,6 +151,8 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   const pollTimer = useRef<number | null>(null);
   /** 记住第 1 步填的手动模型 ID（跨步传递） */
   const savedManualIdsRef = useRef<string[]>([]);
+  /** 写盘时跳过了进程重载（temp 会话 / 正在生成中）→ 第 2 步自动发现不可用，需针对性提示 */
+  const [skippedRestart, setSkippedRestart] = useState(false);
 
   useEffect(() => () => {
     if (pollTimer.current) window.clearTimeout(pollTimer.current);
@@ -228,26 +231,11 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
   /** 写 models.yml + 重载当前会话进程。
    *  omp 的 ModelRegistry 只在进程启动时加载 models.yml，已在线进程看不到新 provider，
    *  不重载的话 pollModels 查旧进程 registry 会永远轮到空列表（表现为"获取失败"）。
-   *  → 写盘后对当前会话进程 evict + 重新 acquire（-r 续接同一 JSONL），新进程即含新 provider。 */
-  const writeAndRestart = useCallback(async (cfg: OmpProviderConfig) => {
+   *  → 写盘后对当前会话进程 evict + 重新 acquire（-r 续接同一 JSONL），新进程即含新 provider。
+   *  返回 true = 已重载；false = 跳过重载（temp 会话 / 正在生成中 / 无 cwd → 轮询将靠手动 ID fallback）。 */
+  const writeAndRestart = useCallback(async (cfg: OmpProviderConfig): Promise<boolean> => {
     await window.omp.writeOmpProvider(pid.trim(), cfg);
-    const st = useApp.getState();
-    const sp = st.currentSessionPath;
-    // temp 新会话（__new_）尚未落盘，无法用 -r 续接，跳过重载（轮询将靠手动 ID fallback）
-    if (!sp || sp.startsWith('__new_')) return;
-    // 正在生成中不打断（evict 会杀掉进行中的 agent run）
-    if (st.procStateMap[sp]?.isStreaming) return;
-    const sess = st.sessions.find((x) => x.path === sp);
-    const cwd = sess?.cwd ?? st.currentWorkspace()?.cwd ?? '';
-    if (!cwd) return;
-    const approvalMode = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(cwd))?.approvalMode ?? 'write';
-    try {
-      await rpc.release(sp);                 // 杀旧进程（onExit 会短暂置 offline，onReady 恢复）
-      await rpc.acquire(sp, cwd, approvalMode); // -r 续接同一会话文件，重读 models.yml
-    } catch (e) {
-      // 重载失败不应静默吞掉：抛出让调用方显示错误并阻止进入第 2 步
-      throw e;
-    }
+    return reloadCurrentSession();
   }, [pid]);
 
   /** 轮询 getAvailableModels 获取新 provider 的模型 */
@@ -293,7 +281,8 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
     setBusy('正在写入 models.yml 并重启 omp…');
     try {
       savedManualIdsRef.current = parsedManualIds; // 记住手动 ID
-      await writeAndRestart(buildConfig());
+      const restarted = await writeAndRestart(buildConfig());
+      setSkippedRestart(!restarted);
       setBusy('');
       setStep(2);
       // 如果有手动 ID，先作为 fallback 放进 discovered
@@ -618,7 +607,12 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
             {polling && (
               <div className="model-config-busy">正在获取模型列表…</div>
             )}
-            {!polling && discovered.length === 0 && savedManualIdsRef.current.length === 0 && (
+            {!polling && discovered.length === 0 && skippedRestart && (
+              <div className="model-config-busy">
+                临时会话 / 正在生成中，自动发现暂不可用。可返回上一步手动填写模型 ID 后点击「仅保存」。
+              </div>
+            )}
+            {!polling && discovered.length === 0 && !skippedRestart && savedManualIdsRef.current.length === 0 && (
               <div className="model-config-error">
                 未能获取到「{pid}」的模型列表。可能原因：API Key / baseUrl 有误，或该端点不支持自动发现。
                 可返回上一步手动填写模型 ID 后点击「仅保存」。
@@ -655,8 +649,8 @@ export const AddModelModal: React.FC<Props> = ({ onClose, onSaved }) => {
               </>
             )}
             <div className="modal-actions">
-              <button className="btn" onClick={() => setStep(1)}>上一步</button>
-              {!polling && discovered.length === 0 && savedManualIdsRef.current.length === 0 && (
+              <button className="btn" onClick={() => { setSkippedRestart(false); setStep(1); }}>上一步</button>
+              {!polling && discovered.length === 0 && !skippedRestart && savedManualIdsRef.current.length === 0 && (
                 <button className="btn" onClick={() => pollModels(pid.trim())}>重试获取</button>
               )}
               {!polling && discovered.length === 0 && savedManualIdsRef.current.length > 0 && (

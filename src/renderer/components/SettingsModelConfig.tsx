@@ -15,6 +15,7 @@ import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 import { AddModelModal } from './AddModelModal';
 import { modelKey } from '../utils/path-key';
+import { reloadCurrentSession } from '../utils/reload-session';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpModelsConfig } from '../../shared/ipc-channels';
 
@@ -108,24 +109,38 @@ export const SettingsModelConfig: React.FC = () => {
     useApp.getState().setEnabledModels(next);
   }, []);
 
-  /** 删除自定义 provider：删 models.yml 条目 → 重启 omp → 刷新；白名单里该 provider 的 key 一并清理 */
+  /** 删除自定义 provider：删 models.yml 条目 → 重载会话进程 → 刷新；白名单里该 provider 的 key 一并清理 */
   const doDeleteProvider = useCallback(async (pid: string) => {
     setConfirmDelete(null);
     setBusy(`正在删除 ${pid} 并重启 omp…`);
     setError('');
+    let reloadFailed = false;
+    let reloadError = '';
+    let deleted = false;
     try {
       await window.omp.deleteOmpProvider(pid);
+      deleted = true;
       const st = useApp.getState();
       if (st.enabledModels?.some((k) => k.startsWith(`${pid}\u0000`))) {
         st.setEnabledModels(st.enabledModels.filter((k) => !k.startsWith(`${pid}\u0000`)));
       }
-      // 多进程：models.yml 已保存，新 acquire 的进程会读新配置。
-      // 已在线的进程不重读（omp 启动时读 models.yml）；如需立即生效切回该会话触发重新 acquire。
-      refresh();
+      // 已在线的进程不重读 models.yml（omp 启动时加载），需 reload 当前会话进程，
+      // 让 getAvailableModels 反映删除后的 provider 列表（issue 110）。
+      try {
+        await reloadCurrentSession();
+      } catch (re) {
+        reloadFailed = true;
+        reloadError = re instanceof Error ? re.message : String(re);
+      }
     } catch (e) {
       setError(`删除失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy('');
+    }
+    if (!deleted) return; // 删除失败：错误已显示，不再 refresh（避免清掉错误信息）
+    refresh(); // 放在 reload 之后，确保 getAvailableModels 命中新进程
+    if (reloadFailed) {
+      setError(`已删除 ${pid}，但重载会话进程失败：${reloadError}（可切换会话后重试）`);
     }
   }, [refresh]);
 

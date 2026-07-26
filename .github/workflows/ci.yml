@@ -12,14 +12,19 @@ jobs:
     name: Typecheck & Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # pinned by full commit SHA (security: avoid mutable tag)
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      # NOTE (issue #69, wontfix): 仓库确有 e2e 脚本（scripts/e2e-smoke.mjs / scripts/e2e-session.mjs），
+      # 但依赖真实 omp 二进制（OMP_PATH 或 PATH 中的 omp），ubuntu-latest CI runner 无该二进制，无法运行；
+      # 亦无 eslint 配置与 devDep，typecheck 步骤已覆盖类型层。故 CI 暂不加 test/lint 步骤，
+      # 待补齐 omp 二进制或 eslint 配置后再引入。
 
   release:
     name: Build Windows portable
@@ -29,8 +34,8 @@ jobs:
     permissions:
       contents: write   # 创建 GitHub Release 需要写权限（GITHUB_TOKEN 默认只有 read）
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: 22
           cache: npm
@@ -38,9 +43,16 @@ jobs:
       - name: Pack portable exe
         run: npm run pack:portable
         env:
+          # issue #70: 通过 secrets 注入代码签名证书。若仓库配置了 CSC_LINK / CSC_KEY_PASSWORD，
+          # electron-builder 会对 portable exe 自动签名以消除 Windows SmartScreen 警告；
+          # 未配置时为空字符串，electron-builder 跳过签名且不报错（CI 不会因此失败）。
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+      # pinned by full commit SHA (security: avoid mutable tag).
+      # SHA 3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 = v2.6.2 (PGP 验证发布).
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release/*-portable.exe
         env:

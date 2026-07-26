@@ -7,8 +7,8 @@ import React, { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { SettingsModelConfig } from './SettingsModelConfig';
 import { SettingsHooks } from './SettingsHooks';
-import { basename } from '../utils/path-key';
-import type { AppearanceConfig, CustomCssConfig } from '../../shared/ipc-channels';
+import type { AppearanceConfig } from '../../shared/ipc-channels';
+import { builtinThemes } from '../themes';
 
 const TABS: Array<{ key: 'system' | 'agent' | 'model'; icon: string; label: string }> = [
   { key: 'system', icon: '⚙️', label: '系统配置' },
@@ -92,6 +92,7 @@ const SystemConfigTab: React.FC = () => {
 
   const [promptDraft, setPromptDraft] = useState(systemPrompt ?? '');
   // appearance 用本地草稿，避免每次拖动滑块都触发 persist（失焦/松手时提交）
+  const [theme, setTheme] = useState(appearance?.theme ?? '');
   const [mode, setMode] = useState<AppearanceConfig['mode']>(appearance?.mode ?? 'system');
   const [fontFamily, setFontFamily] = useState(appearance?.fontFamily ?? '');
   const [fontSize, setFontSize] = useState(appearance?.fontSize ?? 14);
@@ -99,12 +100,11 @@ const SystemConfigTab: React.FC = () => {
   const [bgColor, setBgColor] = useState(appearance?.bgColor ?? '#0d1117');
   const [accentEnabled, setAccentEnabled] = useState(Boolean(appearance?.accentColor));
   const [accentColor, setAccentColor] = useState(appearance?.accentColor ?? '#0a84ff');
-  const [customCss, setCustomCss] = useState<CustomCssConfig[]>(appearance?.customCss ?? []);
-  const [cssError, setCssError] = useState('');
 
   // 外部（如恢复默认）同步时刷新本地草稿
   useEffect(() => { setPromptDraft(systemPrompt ?? ''); }, [systemPrompt]);
   useEffect(() => {
+    setTheme(appearance?.theme ?? '');
     setMode(appearance?.mode ?? 'system');
     setFontFamily(appearance?.fontFamily ?? '');
     setFontSize(appearance?.fontSize ?? 14);
@@ -112,78 +112,28 @@ const SystemConfigTab: React.FC = () => {
     setBgColor(appearance?.bgColor ?? '#0d1117');
     setAccentEnabled(Boolean(appearance?.accentColor));
     setAccentColor(appearance?.accentColor ?? '#0a84ff');
-    setCustomCss(appearance?.customCss ?? []);
   }, [appearance]);
 
   // 从 store get() 读最新值作为 base，避免闭包捕获到过时的本地草稿 state
   const commit = (patch: Partial<AppearanceConfig>) => {
     const prev = useApp.getState().appearance;
     const next: AppearanceConfig = {
+      theme: prev?.theme ?? (theme || undefined),
       mode: prev?.mode ?? mode,
       fontFamily: prev?.fontFamily ?? (fontFamily || undefined),
       fontSize: prev?.fontSize ?? (fontSize > 0 ? fontSize : undefined),
       bgColor: prev?.bgColor ?? (bgEnabled ? bgColor : undefined),
       accentColor: prev?.accentColor ?? (accentEnabled ? accentColor : undefined),
-      customCss: prev?.customCss ?? (customCss.length ? customCss : undefined),
       ...patch,
     };
     useApp.getState().setAppearance(next);
   };
 
   const resetAppearance = () => {
-    setMode('system'); setFontFamily(''); setFontSize(14);
+    setTheme(''); setMode('system'); setFontFamily(''); setFontSize(14);
     setBgEnabled(false); setBgColor('#0d1117');
     setAccentEnabled(false); setAccentColor('#0a84ff');
-    // 恢复默认外观时保留已导入的自定义 CSS（它是独立于配色的资源）
-    useApp.getState().setAppearance(customCss.length ? { customCss } : {});
-  };
-
-  // ---- 自定义 CSS 导入 ----
-  const commitCss = (next: CustomCssConfig[]) => {
-    setCustomCss(next);
-    commit({ customCss: next.length ? next : undefined });
-  };
-
-  const importCss = async (importMode: 'embed' | 'link') => {
-    try {
-      setCssError('');
-      const path = await window.omp.pickCssFile();
-      if (!path) return;
-      // 读最新列表，避免闭包里的 customCss 过时
-      const cur = useApp.getState().appearance?.customCss ?? customCss;
-      if (cur.some((c) => c.path === path && c.mode === importMode)) {
-        setCssError(`已导入过该文件（${importMode === 'embed' ? '嵌入' : '链接'}模式）：${basename(path)}`);
-        return;
-      }
-      const id = `css-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const next: CustomCssConfig[] = [...cur, { id, path, mode: importMode, enabled: true, name: basename(path) }];
-      commitCss(next);
-    } catch (e) {
-      useApp.getState().pushToast(`导入 CSS 失败：${e instanceof Error ? e.message : String(e)}`, 'error');
-    }
-  };
-
-  const toggleCss = (idx: number) =>
-    commitCss(customCss.map((c, i) => (i === idx ? { ...c, enabled: !c.enabled } : c)));
-  const removeCss = (idx: number) => commitCss(customCss.filter((_, i) => i !== idx));
-  const reloadCss = async (idx: number) => {
-    try {
-      setCssError('');
-      // 读最新列表，避免闭包里的 customCss 过时（issue 59）
-      const cur = useApp.getState().appearance?.customCss ?? customCss;
-      const c = cur[idx];
-      if (!c) return;
-      if (c.mode === 'embed') {
-        const r = await window.omp.readCssFile(c.path);
-        if (r.error) { setCssError(`重新读取失败：${r.error}`); return; }
-        // embed 模式：把读取到的（最新）源文件内容真正重新同步进 styles.css
-        // （syncCustomCss 会按 c.path 重读磁盘内容写入区块）
-      }
-      // link 模式：重新生成 @import；embed 模式：重新读源文件写入区块
-      commitCss(cur);
-    } catch (e) {
-      useApp.getState().pushToast(`重新读取 CSS 失败：${e instanceof Error ? e.message : String(e)}`, 'error');
-    }
+    useApp.getState().setAppearance({});
   };
 
   return (
@@ -215,7 +165,51 @@ const SystemConfigTab: React.FC = () => {
       {/* ===== 系统风格 ===== */}
       <section className="settings-section">
         <h3 className="settings-section-title">系统风格</h3>
-        <p className="settings-section-desc">调整配色模式、字体、字号、背景色与强调色。修改即时生效，并自动保存。</p>
+        <p className="settings-section-desc">选择主题风格与配色模式，调整字体、字号、背景色与强调色。修改即时生效，并自动保存。</p>
+
+        {/* 主题风格 */}
+        <div className="settings-field">
+          <label className="settings-field-label">主题风格</label>
+          <div className="theme-grid">
+            <button
+              className={`theme-card ${theme === '' ? 'active' : ''}`}
+              onClick={() => { setTheme(''); commit({ theme: undefined }); }}
+            >
+              <span className="theme-card-icon">
+                <span className="theme-card-icon-lines">
+                  <i />
+                  <i />
+                  <i />
+                </span>
+                <i className="theme-card-icon-bar" style={{ background: 'hsl(211 100% 50%)' }} />
+              </span>
+              <span className="theme-card-info">
+                <span className="theme-card-name">默认</span>
+                <span className="theme-card-desc">Apple 蓝，简洁明快</span>
+              </span>
+            </button>
+            {builtinThemes.map((t) => (
+              <button
+                key={t.id}
+                className={`theme-card ${theme === t.id ? 'active' : ''}`}
+                onClick={() => { setTheme(t.id); commit({ theme: t.id }); }}
+              >
+                <span className="theme-card-icon">
+                  <span className="theme-card-icon-lines">
+                    <i />
+                    <i />
+                    <i />
+                  </span>
+                  <i className="theme-card-icon-bar" style={{ background: `hsl(${t.light.accent.brand})` }} />
+                </span>
+                <span className="theme-card-info">
+                  <span className="theme-card-name">{t.name}</span>
+                  <span className="theme-card-desc">{t.description}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
 
         {/* 配色模式 */}
         <div className="settings-field">
@@ -307,48 +301,6 @@ const SystemConfigTab: React.FC = () => {
               onChange={(e) => { setAccentColor(e.target.value); commit({ accentColor: e.target.value }); }}
             />
           </div>
-        </div>
-
-        {/* 自定义 CSS 导入 */}
-        <div className="settings-field">
-          <label className="settings-field-label">自定义 CSS</label>
-          <div className="css-import-header">
-            <p className="settings-section-desc" style={{ margin: 0 }}>
-              从 <code>.css</code> 文件导入样式。
-              <strong>嵌入</strong>：内容写入 styles.css；
-              <strong>链接</strong>：styles.css 顶部 <code>@import</code> 该文件。
-            </p>
-            <div className="css-import-actions">
-              <button className="settings-btn ghost" onClick={() => void importCss('embed')}>嵌入导入…</button>
-              <button className="settings-btn ghost" onClick={() => void importCss('link')}>链接导入…</button>
-            </div>
-          </div>
-          {cssError && <div className="hook-error">{cssError}</div>}
-          {customCss.length === 0 ? (
-            <div className="css-empty">尚未导入 CSS 文件。</div>
-          ) : (
-            <div className="css-list">
-              {customCss.map((c, idx) => (
-                <div key={c.id ?? `${c.mode}:${c.path}`} className={`css-item ${c.enabled ? '' : 'disabled'}`}>
-                  <label className="settings-checkbox css-item-toggle">
-                    <input type="checkbox" checked={c.enabled} onChange={() => toggleCss(idx)} />
-                  </label>
-                  <div className="css-item-main">
-                    <span className="css-item-name" title={c.name || basename(c.path)}>{c.name || basename(c.path)}</span>
-                    <span className="css-item-path" title={c.path}>{c.path}</span>
-                  </div>
-                  <div className="css-item-badges">
-                    <span className={`css-item-mode ${c.mode}`}>{c.mode === 'embed' ? '嵌入' : '链接'}</span>
-                    <div className="css-item-actions">
-                      <button title="重新读取并写入 styles.css" onClick={() => void reloadCss(idx)}>↻</button>
-                      <button title="在文件管理器中定位" onClick={() => void window.omp.showItemInFolder(c.path)}>📂</button>
-                      <button title="移除" onClick={() => removeCss(idx)}>✕</button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
 
         <div className="settings-row-end">

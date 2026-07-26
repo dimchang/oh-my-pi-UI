@@ -2029,3 +2029,83 @@ body {
 .chat-scroll {
   background-color: var(--app-bg, hsl(var(--bg-100)));
 }
+
+/* ====== 主题风格选择卡片（设置页） ====== */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+.theme-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1.5px solid hsl(var(--border-200));
+  border-radius: var(--radius-md);
+  background: hsl(var(--bg-000));
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+}
+.theme-card:hover {
+  border-color: hsl(var(--accent-main-000) / 0.5);
+}
+.theme-card.active {
+  border-color: hsl(var(--accent-main-000));
+  box-shadow: 0 0 0 2px hsl(var(--accent-main-000) / 0.18);
+}
+.theme-card-icon {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  border: 1px solid hsl(var(--border-200));
+  background: hsl(var(--bg-100));
+  overflow: hidden;
+  gap: 5px;
+}
+.theme-card-icon-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 18px;
+}
+.theme-card-icon-lines i {
+  display: block;
+  height: 2px;
+  border-radius: 1px;
+  background: hsl(var(--text-200));
+  width: 100%;
+}
+.theme-card-icon-bar {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin-top: 1px;
+}
+.theme-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.theme-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--text-100));
+}
+.theme-card-desc {
+  font-size: 11px;
+  color: hsl(var(--text-400));
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

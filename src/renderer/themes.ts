@@ -1,0 +1,320 @@
+/**
+ * 主题预设系统（内置自 OMP-CSS/index.ts）
+ *
+ * 架构说明：
+ * - 每个"主题风格"（ThemePreset）包含 light 和 dark 两套配色
+ * - 用户在设置页选择 主题风格 + 日夜模式（system/light/dark）
+ * - applyAppearance 会把选中主题按 data-theme + data-mode 生成 CSS 变量注入 <head>，
+ *   覆盖 styles.css 里的默认 token。
+ *
+ * 颜色格式：HSL 不带 hsl() 包装，如 '210 90% 50%'（与 styles.css 的 token 一致）
+ */
+
+// ============================================
+// Types
+// ============================================
+
+export interface ThemeColors {
+  background: { bg000: string; bg100: string; bg200: string; bg300: string; bg400: string };
+  text: {
+    text000: string; text100: string; text200: string; text300: string;
+    text400: string; text500: string; text600: string;
+  };
+  accent: { brand: string; main000: string; main100: string; main200: string; secondary100: string };
+  semantic: {
+    success100: string; success200: string; successBg: string;
+    warning100: string; warning200: string; warningBg: string;
+    danger000: string; danger100: string; danger200: string; dangerBg: string; danger900: string;
+    info100: string; info200: string; infoBg: string;
+  };
+  border: { border100: string; border200: string; border300: string };
+  special?: { alwaysBlack?: string; alwaysWhite?: string; oncolor100?: string };
+}
+
+export interface ThemePreset {
+  id: string;
+  name: string;
+  description: string;
+  light: ThemeColors;
+  dark: ThemeColors;
+}
+
+// ============================================
+// Eucalyptus 主题 - 莫兰迪色系
+// ============================================
+
+const eucalyptusLight: ThemeColors = {
+  background: { bg000: '150 10% 99%', bg100: '150 12% 96%', bg200: '150 12% 93%', bg300: '150 10% 89%', bg400: '150 10% 85%' },
+  text: { text000: '0 0% 100%', text100: '170 15% 15%', text200: '170 10% 40%', text300: '170 8% 55%', text400: '170 8% 70%', text500: '170 6% 78%', text600: '170 10% 85%' },
+  accent: { brand: '165 45% 42%', main000: '165 40% 35%', main100: '165 45% 42%', main200: '165 50% 48%', secondary100: '200 45% 50%' },
+  semantic: { success100: '140 40% 40%', success200: '140 35% 32%', successBg: '140 30% 94%', warning100: '35 80% 45%', warning200: '35 70% 38%', warningBg: '35 60% 94%', danger000: '5 55% 40%', danger100: '5 60% 55%', danger200: '5 65% 62%', dangerBg: '5 60% 96%', danger900: '5 50% 93%', info100: '200 50% 50%', info200: '200 45% 60%', infoBg: '200 40% 95%' },
+  border: { border100: '160 10% 86%', border200: '160 10% 82%', border300: '160 10% 75%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const eucalyptusDark: ThemeColors = {
+  background: { bg000: '210 20% 18%', bg100: '210 20% 14%', bg200: '210 20% 11%', bg300: '210 20% 9%', bg400: '210 25% 6%' },
+  text: { text000: '0 0% 100%', text100: '210 15% 92%', text200: '210 10% 70%', text300: '210 8% 55%', text400: '210 8% 40%', text500: '210 6% 32%', text600: '210 10% 25%' },
+  accent: { brand: '165 50% 55%', main000: '165 45% 45%', main100: '165 50% 55%', main200: '165 55% 65%', secondary100: '200 50% 60%' },
+  semantic: { success100: '140 50% 55%', success200: '140 45% 62%', successBg: '140 30% 15%', warning100: '35 80% 60%', warning200: '35 75% 68%', warningBg: '35 30% 15%', danger000: '5 65% 60%', danger100: '5 70% 65%', danger200: '5 72% 72%', dangerBg: '5 30% 15%', danger900: '5 28% 22%', info100: '200 60% 65%', info200: '200 55% 72%', infoBg: '200 30% 15%' },
+  border: { border100: '210 15% 22%', border200: '210 15% 26%', border300: '210 15% 32%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const eucalyptusTheme: ThemePreset = {
+  id: 'eucalyptus', name: 'Eucalyptus', description: '莫兰迪桉树绿，清爽护眼',
+  light: eucalyptusLight, dark: eucalyptusDark,
+};
+
+// ============================================
+// Claude 主题 - 暖调橙色
+// ============================================
+
+const claudeLight: ThemeColors = {
+  background: { bg000: '45 40% 99%', bg100: '45 35% 96%', bg200: '45 30% 93%', bg300: '45 25% 90%', bg400: '45 20% 86%' },
+  text: { text000: '0 0% 100%', text100: '30 10% 15%', text200: '30 8% 35%', text300: '30 6% 50%', text400: '30 5% 60%', text500: '30 4% 70%', text600: '30 3% 82%' },
+  accent: { brand: '24 90% 50%', main000: '24 85% 45%', main100: '24 90% 50%', main200: '24 95% 55%', secondary100: '210 85% 50%' },
+  semantic: { success100: '142 70% 40%', success200: '142 65% 32%', successBg: '142 60% 94%', warning100: '38 92% 48%', warning200: '32 88% 42%', warningBg: '48 90% 92%', danger000: '0 65% 38%', danger100: '0 72% 48%', danger200: '0 78% 58%', dangerBg: '0 75% 95%', danger900: '0 55% 92%', info100: '210 85% 48%', info200: '210 80% 58%', infoBg: '210 90% 95%' },
+  border: { border100: '35 15% 82%', border200: '35 12% 85%', border300: '35 18% 78%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const claudeDark: ThemeColors = {
+  background: { bg000: '30 3% 20%', bg100: '30 3% 15%', bg200: '30 3% 12%', bg300: '30 3% 9%', bg400: '0 0% 5%' },
+  text: { text000: '0 0% 100%', text100: '40 20% 95%', text200: '40 10% 75%', text300: '40 5% 60%', text400: '40 3% 50%', text500: '40 2% 40%', text600: '40 2% 30%' },
+  accent: { brand: '24 70% 55%', main000: '24 75% 50%', main100: '24 80% 58%', main200: '24 85% 62%', secondary100: '210 80% 60%' },
+  semantic: { success100: '142 70% 50%', success200: '142 65% 60%', successBg: '142 50% 15%', warning100: '38 90% 55%', warning200: '38 85% 65%', warningBg: '38 50% 15%', danger000: '0 85% 65%', danger100: '0 70% 55%', danger200: '0 75% 65%', dangerBg: '0 50% 15%', danger900: '0 50% 25%', info100: '210 85% 60%', info200: '210 80% 70%', infoBg: '210 50% 15%' },
+  border: { border100: '40 5% 25%', border200: '40 5% 30%', border300: '40 5% 35%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const claudeTheme: ThemePreset = {
+  id: 'claude', name: 'Claude', description: '暖橙经典配色',
+  light: claudeLight, dark: claudeDark,
+};
+
+// ============================================
+// Breeze 主题 - 现代清新青绿
+// ============================================
+
+const breezeLight: ThemeColors = {
+  background: { bg000: '210 20% 99%', bg100: '210 15% 96.5%', bg200: '210 12% 93.5%', bg300: '210 10% 90%', bg400: '210 8% 86%' },
+  text: { text000: '0 0% 100%', text100: '215 15% 14%', text200: '215 10% 34%', text300: '215 7% 48%', text400: '215 5% 58%', text500: '215 4% 68%', text600: '215 3% 80%' },
+  accent: { brand: '187 72% 42%', main000: '187 68% 36%', main100: '187 72% 42%', main200: '187 75% 48%', secondary100: '230 65% 55%' },
+  semantic: { success100: '152 60% 38%', success200: '152 55% 30%', successBg: '152 50% 94%', warning100: '42 85% 46%', warning200: '36 80% 40%', warningBg: '48 80% 93%', danger000: '4 60% 36%', danger100: '4 65% 46%', danger200: '4 70% 56%', dangerBg: '4 65% 95%', danger900: '4 50% 92%', info100: '215 75% 48%', info200: '215 70% 58%', infoBg: '215 80% 95%' },
+  border: { border100: '210 10% 83%', border200: '210 8% 86%', border300: '210 12% 78%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const breezeDark: ThemeColors = {
+  background: { bg000: '215 8% 20%', bg100: '215 8% 14%', bg200: '215 8% 11%', bg300: '215 8% 8%', bg400: '215 10% 5%' },
+  text: { text000: '0 0% 100%', text100: '210 15% 93%', text200: '210 8% 72%', text300: '210 5% 58%', text400: '210 3% 48%', text500: '210 2% 38%', text600: '210 2% 28%' },
+  accent: { brand: '187 65% 52%', main000: '187 60% 46%', main100: '187 65% 52%', main200: '187 68% 58%', secondary100: '230 60% 62%' },
+  semantic: { success100: '152 55% 48%', success200: '152 50% 58%', successBg: '152 40% 14%', warning100: '42 82% 52%', warning200: '42 78% 62%', warningBg: '42 45% 14%', danger000: '4 75% 62%', danger100: '4 65% 52%', danger200: '4 68% 62%', dangerBg: '4 45% 14%', danger900: '4 42% 24%', info100: '215 75% 58%', info200: '215 70% 68%', infoBg: '215 45% 14%' },
+  border: { border100: '215 6% 24%', border200: '215 5% 28%', border300: '215 7% 32%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const breezeTheme: ThemePreset = {
+  id: 'breeze', name: 'Breeze', description: '冷调青绿，清爽护眼',
+  light: breezeLight, dark: breezeDark,
+};
+
+// ============================================
+// Sakura 主题 - 粉白色系
+// ============================================
+
+const sakuraLight: ThemeColors = {
+  background: { bg000: '350 30% 99%', bg100: '350 25% 97%', bg200: '350 20% 94%', bg300: '350 18% 90%', bg400: '350 15% 86%' },
+  text: { text000: '0 0% 100%', text100: '340 20% 15%', text200: '340 15% 35%', text300: '340 10% 50%', text400: '340 8% 62%', text500: '340 6% 72%', text600: '340 5% 82%' },
+  accent: { brand: '340 70% 55%', main000: '340 65% 48%', main100: '340 70% 55%', main200: '340 75% 62%', secondary100: '320 60% 50%' },
+  semantic: { success100: '140 50% 42%', success200: '140 45% 35%', successBg: '140 40% 94%', warning100: '35 85% 48%', warning200: '35 80% 40%', warningBg: '35 70% 93%', danger000: '350 65% 45%', danger100: '350 70% 55%', danger200: '350 75% 62%', dangerBg: '350 60% 95%', danger900: '350 50% 92%', info100: '200 70% 50%', info200: '200 65% 58%', infoBg: '200 60% 95%' },
+  border: { border100: '350 15% 88%', border200: '350 12% 84%', border300: '350 10% 78%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const sakuraDark: ThemeColors = {
+  background: { bg000: '340 15% 18%', bg100: '340 15% 14%', bg200: '340 12% 11%', bg300: '340 10% 9%', bg400: '340 8% 6%' },
+  text: { text000: '0 0% 100%', text100: '350 15% 92%', text200: '350 10% 72%', text300: '350 8% 58%', text400: '350 6% 48%', text500: '350 5% 38%', text600: '350 4% 28%' },
+  accent: { brand: '340 65% 60%', main000: '340 60% 52%', main100: '340 65% 60%', main200: '340 70% 68%', secondary100: '320 55% 62%' },
+  semantic: { success100: '140 55% 52%', success200: '140 50% 60%', successBg: '140 35% 14%', warning100: '35 85% 58%', warning200: '35 80% 65%', warningBg: '35 30% 14%', danger000: '350 75% 62%', danger100: '350 70% 58%', danger200: '350 72% 68%', dangerBg: '350 30% 14%', danger900: '350 25% 22%', info100: '200 75% 62%', info200: '200 70% 70%', infoBg: '200 30% 14%' },
+  border: { border100: '340 10% 24%', border200: '340 8% 28%', border300: '340 6% 34%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const sakuraTheme: ThemePreset = {
+  id: 'sakura', name: 'Sakura', description: '柔粉色系，温柔和暖',
+  light: sakuraLight, dark: sakuraDark,
+};
+
+// ============================================
+// Ocean 主题 - 蓝白色系
+// ============================================
+
+const oceanLight: ThemeColors = {
+  background: { bg000: '215 40% 99%', bg100: '215 35% 97%', bg200: '215 30% 94%', bg300: '215 25% 90%', bg400: '215 20% 86%' },
+  text: { text000: '0 0% 100%', text100: '220 25% 15%', text200: '220 20% 35%', text300: '220 15% 50%', text400: '220 12% 62%', text500: '220 10% 72%', text600: '220 8% 82%' },
+  accent: { brand: '215 80% 52%', main000: '215 75% 45%', main100: '215 80% 52%', main200: '215 85% 58%', secondary100: '200 70% 50%' },
+  semantic: { success100: '155 60% 40%', success200: '155 55% 32%', successBg: '155 50% 94%', warning100: '40 90% 48%', warning200: '35 85% 40%', warningBg: '40 80% 93%', danger000: '0 70% 45%', danger100: '0 75% 55%', danger200: '0 80% 62%', dangerBg: '0 70% 95%', danger900: '0 55% 92%', info100: '215 80% 50%', info200: '215 75% 58%', infoBg: '215 70% 95%' },
+  border: { border100: '215 20% 86%', border200: '215 18% 82%', border300: '215 15% 76%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const oceanDark: ThemeColors = {
+  background: { bg000: '220 30% 16%', bg100: '220 30% 12%', bg200: '220 28% 10%', bg300: '220 25% 8%', bg400: '220 20% 5%' },
+  text: { text000: '0 0% 100%', text100: '215 20% 92%', text200: '215 15% 72%', text300: '215 12% 58%', text400: '215 10% 48%', text500: '215 8% 38%', text600: '215 6% 28%' },
+  accent: { brand: '215 75% 58%', main000: '215 70% 50%', main100: '215 75% 58%', main200: '215 80% 65%', secondary100: '200 65% 60%' },
+  semantic: { success100: '155 65% 55%', success200: '155 60% 62%', successBg: '155 35% 14%', warning100: '40 90% 60%', warning200: '40 85% 68%', warningBg: '40 30% 14%', danger000: '0 80% 62%', danger100: '0 75% 58%', danger200: '0 78% 68%', dangerBg: '0 30% 14%', danger900: '0 25% 22%', info100: '215 80% 62%', info200: '215 75% 70%', infoBg: '215 30% 14%' },
+  border: { border100: '220 15% 22%', border200: '220 12% 26%', border300: '220 10% 32%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const oceanTheme: ThemePreset = {
+  id: 'ocean', name: 'Ocean', description: '深蓝色系，沉静专注',
+  light: oceanLight, dark: oceanDark,
+};
+
+// ============================================
+// Dracula 主题
+// ============================================
+
+const draculaLight: ThemeColors = {
+  background: { bg000: '48 100% 96%', bg100: '48 88% 94%', bg200: '45 52% 90%', bg300: '240 19% 88%', bg400: '240 19% 84%' },
+  text: { text000: '0 0% 100%', text100: '0 0% 12%', text200: '49 18% 36%', text300: '46 14% 46%', text400: '45 12% 58%', text500: '240 19% 84%', text600: '240 19% 88%' },
+  accent: { brand: '252 54% 54%', main000: '336 78% 36%', main100: '252 54% 54%', main200: '265 89% 78%', secondary100: '198 96% 30%' },
+  semantic: { success100: '114 84% 24%', success200: '120 90% 30%', successBg: '48 100% 96%', warning100: '24 78% 36%', warning200: '54 78% 36%', warningBg: '48 100% 96%', danger000: '6 66% 48%', danger100: '12 72% 54%', danger200: '0 100% 67%', dangerBg: '48 100% 96%', danger900: '240 19% 84%', info100: '198 96% 30%', info200: '204 100% 42%', infoBg: '48 100% 96%' },
+  border: { border100: '240 19% 88%', border200: '240 19% 84%', border300: '49 18% 36%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const draculaDark: ThemeColors = {
+  background: { bg000: '231 15% 18%', bg100: '233 16% 16%', bg200: '233 17% 14%', bg300: '233 18% 12%', bg400: '233 20% 10%' },
+  text: { text000: '0 0% 100%', text100: '60 30% 96%', text200: '60 23% 90%', text300: '225 27% 51%', text400: '228 16% 62%', text500: '232 14% 31%', text600: '233 17% 14%' },
+  accent: { brand: '265 89% 78%', main000: '258 60% 60%', main100: '265 89% 78%', main200: '265 89% 78%', secondary100: '225 27% 51%' },
+  semantic: { success100: '135 94% 65%', success200: '120 90% 30%', successBg: '235 14% 15%', warning100: '31 100% 71%', warning200: '54 78% 36%', warningBg: '235 14% 15%', danger000: '0 100% 67%', danger100: '12 72% 54%', danger200: '0 100% 67%', dangerBg: '235 14% 15%', danger900: '230 15% 24%', info100: '191 97% 77%', info200: '204 100% 42%', infoBg: '235 14% 15%' },
+  border: { border100: '232 14% 31%', border200: '232 14% 31%', border300: '225 27% 51%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const draculaTheme: ThemePreset = {
+  id: 'dracula', name: 'Dracula', description: '经典 Dracula，日间 Alucard',
+  light: draculaLight, dark: draculaDark,
+};
+
+// ============================================
+// Obsidian 主题 - 纯黑高对比
+// ============================================
+
+const obsidianLight: ThemeColors = {
+  background: { bg000: '0 0% 100%', bg100: '0 0% 98%', bg200: '0 0% 95%', bg300: '0 0% 91%', bg400: '0 0% 86%' },
+  text: { text000: '0 0% 100%', text100: '0 0% 13%', text200: '0 0% 35%', text300: '0 0% 44%', text400: '0 0% 67%', text500: '0 0% 74%', text600: '0 0% 83%' },
+  accent: { brand: '254 80% 68%', main000: '255 82% 63%', main100: '254 80% 68%', main200: '258 100% 75%', secondary100: '212 93% 45%' },
+  semantic: { success100: '144 92% 38%', success200: '144 92% 32%', successBg: '144 70% 94%', warning100: '30 100% 46%', warning200: '31 79% 58%', warningBg: '46 100% 94%', danger000: '353 81% 48%', danger100: '353 81% 55%', danger200: '358 96% 63%', dangerBg: '353 100% 96%', danger900: '353 70% 92%', info100: '212 93% 45%', info200: '212 100% 50%', infoBg: '212 100% 96%' },
+  border: { border100: '0 0% 89%', border200: '0 0% 88%', border300: '0 0% 83%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+const obsidianDark: ThemeColors = {
+  background: { bg000: '0 0% 16%', bg100: '0 0% 13%', bg200: '0 0% 10%', bg300: '0 0% 8%', bg400: '0 0% 5%' },
+  text: { text000: '0 0% 100%', text100: '0 0% 85%', text200: '0 0% 73%', text300: '0 0% 60%', text400: '0 0% 40%', text500: '0 0% 33%', text600: '0 0% 25%' },
+  accent: { brand: '254 80% 68%', main000: '255 82% 63%', main100: '254 80% 68%', main200: '258 100% 75%', secondary100: '212 100% 50%' },
+  semantic: { success100: '138 59% 54%', success200: '138 59% 60%', successBg: '138 24% 18%', warning100: '31 79% 58%', warning200: '59 64% 66%', warningBg: '46 24% 18%', danger000: '358 96% 58%', danger100: '358 96% 63%', danger200: '358 96% 69%', dangerBg: '353 22% 18%', danger900: '353 18% 24%', info100: '212 100% 50%', info200: '212 100% 58%', infoBg: '212 24% 18%' },
+  border: { border100: '0 0% 16%', border200: '0 0% 21%', border300: '0 0% 25%' },
+  special: { alwaysBlack: '0 0% 0%', alwaysWhite: '0 0% 100%', oncolor100: '0 0% 100%' },
+};
+
+export const obsidianTheme: ThemePreset = {
+  id: 'obsidian', name: 'Obsidian', description: '纯黑高对比，紫色点缀',
+  light: obsidianLight, dark: obsidianDark,
+};
+
+// ============================================
+// Theme Registry
+// ============================================
+
+/** 默认主题 ID（不设主题时 = 沿用 styles.css 内置的 Apple 蓝，用 '' 表示） */
+export const DEFAULT_THEME_ID = '';
+
+export const builtinThemes: ThemePreset[] = [
+  eucalyptusTheme,
+  claudeTheme,
+  breezeTheme,
+  sakuraTheme,
+  oceanTheme,
+  draculaTheme,
+  obsidianTheme,
+];
+
+export function getThemePreset(id: string): ThemePreset | undefined {
+  return builtinThemes.find((t) => t.id === id);
+}
+
+/** 把 ThemeColors 转换为 CSS 变量赋值字符串（token 名与 styles.css 完全一致）。 */
+export function themeColorsToCSSVars(theme: ThemeColors): string {
+  const l: string[] = [];
+  l.push(`--bg-000: ${theme.background.bg000};`);
+  l.push(`--bg-100: ${theme.background.bg100};`);
+  l.push(`--bg-200: ${theme.background.bg200};`);
+  l.push(`--bg-300: ${theme.background.bg300};`);
+  l.push(`--bg-400: ${theme.background.bg400};`);
+  l.push(`--text-000: ${theme.text.text000};`);
+  l.push(`--text-100: ${theme.text.text100};`);
+  l.push(`--text-200: ${theme.text.text200};`);
+  l.push(`--text-300: ${theme.text.text300};`);
+  l.push(`--text-400: ${theme.text.text400};`);
+  l.push(`--text-500: ${theme.text.text500};`);
+  l.push(`--text-600: ${theme.text.text600};`);
+  l.push(`--accent-brand: ${theme.accent.brand};`);
+  l.push(`--accent-main-000: ${theme.accent.main000};`);
+  l.push(`--accent-main-100: ${theme.accent.main100};`);
+  l.push(`--accent-main-200: ${theme.accent.main200};`);
+  l.push(`--accent-secondary-100: ${theme.accent.secondary100};`);
+  l.push(`--success-100: ${theme.semantic.success100};`);
+  l.push(`--success-200: ${theme.semantic.success200};`);
+  l.push(`--success-bg: ${theme.semantic.successBg};`);
+  l.push(`--warning-100: ${theme.semantic.warning100};`);
+  l.push(`--warning-200: ${theme.semantic.warning200};`);
+  l.push(`--warning-bg: ${theme.semantic.warningBg};`);
+  l.push(`--danger-000: ${theme.semantic.danger000};`);
+  l.push(`--danger-100: ${theme.semantic.danger100};`);
+  l.push(`--danger-200: ${theme.semantic.danger200};`);
+  l.push(`--danger-bg: ${theme.semantic.dangerBg};`);
+  l.push(`--danger-900: ${theme.semantic.danger900};`);
+  l.push(`--info-100: ${theme.semantic.info100};`);
+  l.push(`--info-200: ${theme.semantic.info200};`);
+  l.push(`--info-bg: ${theme.semantic.infoBg};`);
+  l.push(`--border-100: ${theme.border.border100};`);
+  l.push(`--border-200: ${theme.border.border200};`);
+  l.push(`--border-300: ${theme.border.border300};`);
+  if (theme.special) {
+    if (theme.special.alwaysBlack) l.push(`--always-black: ${theme.special.alwaysBlack};`);
+    if (theme.special.alwaysWhite) l.push(`--always-white: ${theme.special.alwaysWhite};`);
+    if (theme.special.oncolor100) l.push(`--oncolor-100: ${theme.special.oncolor100};`);
+  }
+  return l.join('\n  ');
+}
+
+/**
+ * 生成某个主题的完整 CSS（含 light / 系统深色 / 手动深色三态），
+ * 通过 data-theme 选择器覆盖 styles.css 默认 token。
+ * 选择器用 :root:root[data-theme] 保证特异性高于 styles.css 的 :root:root。
+ */
+export function buildThemeCSS(preset: ThemePreset): string {
+  const id = preset.id;
+  const light = themeColorsToCSSVars(preset.light);
+  const dark = themeColorsToCSSVars(preset.dark);
+  return [
+    `:root:root[data-theme='${id}'],`,
+    `:root:root[data-theme='${id}'][data-mode='light'] {`,
+    `  ${light}`,
+    `}`,
+    `@media (prefers-color-scheme: dark) {`,
+    `  :root:root[data-theme='${id}']:not([data-mode]) {`,
+    `    ${dark}`,
+    `  }`,
+    `}`,
+    `:root:root[data-theme='${id}'][data-mode='dark'] {`,
+    `  ${dark}`,
+    `}`,
+  ].join('\n');
+}

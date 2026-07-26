@@ -113,6 +113,8 @@ export interface Workspace {
 
 /** 外观（系统风格）配置：由设置页写入，applyAppearance 注入为 :root 上的 CSS 变量。 */
 export interface AppearanceConfig {
+  /** 主题预设 id（内置 themes.ts，如 eucalyptus/claude/breeze…；留空=默认 Apple 蓝主题） */
+  theme?: string;
   /** 配色模式：system=跟随系统；light=浅色；dark=深色 */
   mode?: 'system' | 'light' | 'dark';
   /** 主字体（CSS font-family 字符串；留空=用主题默认） */

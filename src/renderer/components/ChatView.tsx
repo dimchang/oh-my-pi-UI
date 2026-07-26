@@ -49,7 +49,7 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
           if (p.kind === 'text') {
             return (
               <ReactMarkdown
-                key={i}
+                key={`text-${i}`}
                 remarkPlugins={[remarkGfm]}
                 components={{
                   pre: ({ node: _node, children, ...props }) => (
@@ -63,14 +63,14 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
           }
           if (p.kind === 'thinking') {
             return (
-              <details key={i} className="thinking">
+              <details key={`thinking-${i}`} className="thinking">
                 <summary>思考过程</summary>
                 <div className="thinking-body">{p.text}</div>
               </details>
             );
           }
           if (p.kind === 'tool') {
-            return <ToolCard key={p.toolCallId ?? i} tool={p} />;
+            return <ToolCard key={`tool-${p.toolCallId}`} tool={p} />;
           }
           return null;
         })}

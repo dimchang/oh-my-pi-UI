@@ -17,6 +17,7 @@ import type {
 } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
+import { buildThemeCSS, getThemePreset } from './themes';
 
 export type PartKind = 'text' | 'thinking' | 'tool';
 
@@ -347,7 +348,6 @@ export const useApp = create<AppState>((set, get) => ({
   setAppearance: (v) => {
     set({ appearance: v });
     applyAppearance(v);
-    void syncCustomCss(v?.customCss);
     get().persistWorkspaces();
   },
   setHooks: (v) => {
@@ -895,9 +895,37 @@ function updateToolInBuffer(
  *  - mode：system=移除 data-mode（跟随系统媒体查询）；light/dark=设置 data-mode 属性。
  *  - fontFamily / fontSize / bgColor / accentColor：留空则清除对应变量，回退主题默认。
  */
+/**
+ * 把选中的主题预设注入到 <head> 的一个专用 <style> 里（覆盖 styles.css 默认 token）。
+ * 未选主题（空 id）时移除该 style，回退到 styles.css 内置的默认 Apple 蓝主题。
+ * 只注入当前选中的一份，切换主题即整体替换，避免多份堆积。
+ */
+function applyThemePreset(themeId?: string): void {
+  if (typeof document === 'undefined') return;
+  const STYLE_ID = 'omp-theme-preset';
+  let el = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
+  const preset = themeId ? getThemePreset(themeId) : undefined;
+  if (!preset) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('style');
+    el.id = STYLE_ID;
+    document.head.appendChild(el);
+  }
+  el.textContent = buildThemeCSS(preset);
+}
+
 export function applyAppearance(a?: AppearanceConfig | null): void {
   const root = document.documentElement;
   if (!root) return;
+
+  // 主题预设：注入选中主题的 CSS 变量（覆盖 styles.css 默认 token），并设 data-theme
+  applyThemePreset(a?.theme);
+  if (a?.theme) root.setAttribute('data-theme', a.theme);
+  else root.removeAttribute('data-theme');
+
   if (a?.mode && a.mode !== 'system') root.setAttribute('data-mode', a.mode);
   else root.removeAttribute('data-mode');
 

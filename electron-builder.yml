@@ -13,8 +13,4 @@ win:
   artifactName: ${productName}-${version}-portable.${ext}
 portable:
   artifactName: ${productName}-${version}-portable.${ext}
-nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
-  artifactName: ${productName}-Setup-${version}.${ext}
 asar: true

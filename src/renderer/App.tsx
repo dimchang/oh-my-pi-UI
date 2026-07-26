@@ -15,7 +15,7 @@ import { TitleBar } from './components/TitleBar';
 import { TodoPanel } from './components/TodoPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
-import { applyAppearance, syncCustomCss } from './store';
+import { applyAppearance } from './store';
 import type { OmpFrame, RpcExtensionUIRequest, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
 
@@ -148,10 +148,8 @@ export default function App(): React.ReactElement {
   const loadAndReconcileWorkspaces = useCallback((): void => {
     void window.omp.getWorkspaces().then((file) => {
       useApp.getState().setWorkspacesFile(file);
-      // 恢复上次的外观配置（背景色 / 字体 / 字号 / 配色模式）
+      // 恢复上次的外观配置（主题预设 / 背景色 / 字体 / 字号 / 配色模式）
       applyAppearance(useApp.getState().appearance);
-      // 把自定义 CSS 列表同步到 styles.css（embed 写入内容；link 插入 @import）
-      void syncCustomCss(useApp.getState().appearance?.customCss);
       const st = useApp.getState();
       const sessions = st.sessions;
       const existingCwds = new Set(st.workspaces.map((w) => cwdKey(w.cwd)));

@@ -42,3 +42,7 @@ probe-*.mjs
 
 # ===== Local sync helper (hardcodes /d/code/OMP-github path; not for public repo) =====
 /sync-to-github.ps1
+scripts/sync-core.ps1
+
+# ===== One-off debug control dump (root, throwaway) =====
+control.json
