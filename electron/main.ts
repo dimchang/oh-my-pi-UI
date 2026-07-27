@@ -403,11 +403,14 @@ function registerIpc(): void {
       defaultPath: defaultPath || undefined,
     });
     if (r.canceled || r.filePaths.length === 0) return null;
-    return r.filePaths.map((p) => {
-      let size = 0;
-      try { size = fs.statSync(p).size; } catch { /* 读不到大小就用 0 */ }
-      return { path: p, name: path.basename(p), size };
-    });
+    // #10：改用异步 fs.promises.stat，避免在主进程 IPC handler 中同步阻塞所有渲染进程的 IPC 响应
+    return await Promise.all(
+      r.filePaths.map(async (p) => {
+        let size = 0;
+        try { size = (await fs.promises.stat(p)).size; } catch { /* 读不到大小就用 0 */ }
+        return { path: p, name: path.basename(p), size };
+      }),
+    );
   });
 
   // ---- 钩子（Hooks）管理 ----

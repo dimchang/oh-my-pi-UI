@@ -51,5 +51,8 @@ control.json
 preview-*.html
 *-research.html
 
+# ===== One-off research / design doc (root, throwaway) =====
+minimap-density-scrollbar.md
+
 # ===== Runtime temp dir (omp stderr logs, etc.) =====
 .temp/
