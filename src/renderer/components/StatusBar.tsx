@@ -10,6 +10,9 @@ export const StatusBar: React.FC = () => {
   const stats = useApp((s) => s.sessionStats);
   const isCompacting = useApp((s) => s.isCompacting);
   const isRetrying = useApp((s) => s.isRetrying);
+  // 当前会话的模型 / 思考档位（refreshState 已填充，这里仅展示）
+  const model = useApp((s) => s.model);
+  const thinking = useApp((s) => s.thinkingLevel);
   // 直接从 selector 参数 s 中 find，避免在 selector 内调用 get() 破坏响应式订阅
   const currentWorkspace = useApp((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId) ?? null);
 
@@ -37,6 +40,12 @@ export const StatusBar: React.FC = () => {
           {currentWorkspace.displayName}
         </span>
       )}
+      {model && (
+        <span className="status-item" title={model.id}>
+          {model.name ?? model.id} · {model.provider}
+        </span>
+      )}
+      {thinking && <span className="status-item">思考: {thinking}</span>}
       <span className="status-spacer" />
       {stats?.totalTokens !== undefined && Number.isFinite(stats.totalTokens) && (
         <span className="status-item" title={`${stats.messageCount ?? 0} 条消息`}>

@@ -3,7 +3,7 @@
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { IPC, type OmpApi, type FileEntry, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig } from '../src/shared/ipc-channels';
+import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig } from '../src/shared/ipc-channels';
 import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -43,6 +43,7 @@ const api: OmpApi = {
   getWorkspaces: () => ipcRenderer.invoke(IPC.WorkspacesGet),
   saveWorkspaces: (file: WorkspacesFile) => ipcRenderer.invoke(IPC.WorkspacesSave, file),
   openDirDialog: (defaultPath?: string) => ipcRenderer.invoke(IPC.DialogOpenDir, defaultPath),
+  pickFiles: (defaultPath?: string) => ipcRenderer.invoke(IPC.DialogOpenFiles, defaultPath),
 
   // 模型配置：读写 omp 原生 ~/.omp/agent/models.yml
   readModelsConfig: () => ipcRenderer.invoke(IPC.OmpModelsRead),

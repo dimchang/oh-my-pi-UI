@@ -17,15 +17,15 @@ export type IconName =
   | 'stop'
   | 'model'
   | 'plug'
-  | 'steer'
-  | 'restart'
   // 设置页侧栏扁平化单色图标（替换原 emoji）
   | 'cog'
   | 'robot'
   | 'pkg'
   // 输入行为二态按钮
   | 'queue'
-  | 'guide';
+  | 'guide'
+  // 关闭 / 移除（附件芯片上的 ×）
+  | 'close';
 
 const PATHS: Record<IconName, React.ReactNode> = {
   folder: <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />,
@@ -92,21 +92,6 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
     </>
   ),
-  // 改写下一轮（steer）：带弯钩的右向箭头，隐喻"转下一条"
-  steer: (
-    <>
-      <path d="M9 14l5-5 0 0" />
-      <path d="M4 20a8 8 0 0 1 8-8h7" />
-      <path d="M15 7l5 0 0 5" />
-    </>
-  ),
-  // 立即重起：圆形重置箭头，隐喻"立即重起当前 agent 轮"
-  restart: (
-    <>
-      <path d="M3 12a9 9 0 1 0 3-6.7" />
-      <path d="M3 4v5h5" />
-    </>
-  ),
   // 设置（系统配置）侧栏图标：单线齿轮，24x24 苹果风
   cog: (
     <>
@@ -150,6 +135,13 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M5 14h14" />
       <path d="M7 17h10" />
       <path d="M9 20h6" />
+    </>
+  ),
+  // 关闭（移除）图标：单线 X
+  close: (
+    <>
+      <path d="M18 6 6 18" />
+      <path d="M6 6l12 12" />
     </>
   ),
 };

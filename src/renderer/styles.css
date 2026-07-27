@@ -983,6 +983,49 @@ body {
 }
 .input-tool-btn.icon-only:hover { background: hsl(var(--bg-300) / 0.6); }
 
+/* 输入框内待发送附件芯片 */
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 2px 0;
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid hsl(var(--border-200));
+  border-radius: var(--radius-pill);
+  background: hsl(var(--bg-200) / 0.6);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.attachment-chip .attachment-name {
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+.attachment-chip .attachment-name:hover { text-decoration: underline; }
+.attachment-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: hsl(var(--text-400));
+  cursor: pointer;
+}
+.attachment-remove:hover { background: hsl(var(--bg-300) / 0.8); color: var(--text); }
+
 /* toolbar 内的 picker 按钮扁平化为胶囊 */
 .input-toolbar .model-picker .btn,
 .input-toolbar .thinking-picker .btn {
@@ -1017,50 +1060,37 @@ body {
 .stop-btn-round { background: hsl(var(--bg-400)); color: var(--text); }
 .stop-btn-round:disabled { opacity: 0.6; cursor: not-allowed; }
 
-/* 改写下一轮（steer）按钮：琥珀色，区别于蓝色发送 / 灰色停止 */
-.steer-btn-round {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  border: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  background: hsl(32 95% 52%);
-  color: hsl(0 0% 100%);
-  transition: transform 0.05s, opacity 0.12s;
-}
-.steer-btn-round:hover { opacity: 0.88; }
-.steer-btn-round:active { transform: scale(0.94); }
-.steer-btn-round:disabled { opacity: 0.5; cursor: not-allowed; }
 /* 工具栏"改写下一轮"模式开关（高亮态） */
 .input-tool-btn.active { background: hsl(32 95% 52% / 0.18); color: hsl(32 95% 52%); }
 
-/* 立即重起（restart）按钮：深红警告色，比 steer 更显眼，传达"会丢 token"的代价 */
-.restart-btn-round {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  border: 1.5px solid hsl(0 78% 50%);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  background: hsl(0 78% 50% / 0.12);
-  color: hsl(0 78% 50%);
-  transition: transform 0.05s, opacity 0.12s, background 0.12s;
-}
-.restart-btn-round:hover { background: hsl(0 78% 50% / 0.22); opacity: 1; }
-.restart-btn-round:active { transform: scale(0.94); }
-.restart-btn-round:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* 改写下一轮消息：右侧消息加琥珀色强调，与常规「你」区分 */
 .message.steered { border-right: 2px solid hsl(32 95% 52%); padding-right: 10px; }
 .message.steered .msg-role { color: hsl(32 95% 52%); }
 .message.steered .msg-body { color: hsl(32 60% 72%); }
+
+/* 历史消息中的附件芯片（点击在系统应用/文件管理器打开） */
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.msg-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 240px;
+  padding: 2px 8px;
+  border: 1px solid hsl(var(--border-200));
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: hsl(var(--accent-main-000));
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-attachment-chip:hover { background: hsl(var(--accent-main-000) / 0.1); }
+.msg-attachment-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 排队消息：浅灰边框 + 灰色文字，提示这是等当前轮跑完再处理的消息 */
 .message.queued { border-right: 2px solid hsl(var(--text-300) / 0.4); padding-right: 10px; }

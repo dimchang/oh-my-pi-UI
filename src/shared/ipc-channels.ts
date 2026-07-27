@@ -27,6 +27,7 @@ export const IPC = {
   WorkspacesGet: 'workspaces:get', // () => Promise<WorkspacesFile>
   WorkspacesSave: 'workspaces:save', // (file: WorkspacesFile) => Promise<void>
   DialogOpenDir: 'dialog:open-dir', // (defaultPath?: string) => Promise<string | null>
+  DialogOpenFiles: 'dialog:open-files', // (defaultPath?: string) => Promise<PickedFile[] | null> — 多选文件，返回绝对路径 + 名称 + 大小
 
   // 模型配置：读写 omp 原生配置文件 ~/.omp/agent/models.yml
   OmpModelsRead: 'omp:models-read', // () => Promise<OmpModelsConfig>
@@ -68,6 +69,16 @@ export const IPC = {
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
+
+/** 文件选择结果（主进程 stat 后回传：绝对路径 + 名称 + 字节数） */
+export interface PickedFile {
+  /** 文件绝对路径 */
+  path: string;
+  /** 文件名（basename） */
+  name: string;
+  /** 字节大小 */
+  size: number;
+}
 
 /** 文件树条目 */
 export interface FileEntry {
@@ -214,12 +225,6 @@ export interface WorkspacesFile {
   /** 钩子（Hooks）配置：导入的 .ts 钩子文件列表，含每个文件的启用状态与单元开关。
    *  启动时按启用集合向 omp 进程追加 --hook=<path>（多单元文件会生成过滤后的包装文件）。 */
   hooks?: HookFileConfig[];
-  /** 输入框 Enter 默认行为（v0.3.4+）：
-   *   - 'restart'（默认）Enter = 立即重起（真中断当前 turn，立刻按新方向开 turn，丢已生成 token）
-   *   - 'steer'           Enter = 中途改写（mid-run：当前 tool 完成后立即按新方向继续，跳过剩余 tool）
-   *  Shift+Enter 自动取反。undefined 走 'restart' 兜底。v0.3.5 实测修正：
-   *  steer 并不是"等当前 turn 跑完再下一轮"，而是 tool 边界的 mid-run 中断（参考 omp 源码注释
-   *  `Delivered after current tool execution, skips remaining tools`）。 */
   /** 输入框 Enter 默认行为（v0.3.6 简化）：
    *   - 'guide'（默认）Enter = 引导（steer mid-run）：当前 tool 完成后立即按新方向继续，跳过剩余 tool 队列
    *   - 'queue'           Enter = 排队（follow_up）：等当前 agent turn 跑完再处理，不打断当前 tool/t
@@ -311,6 +316,8 @@ export interface OmpApi {
   getWorkspaces(): Promise<WorkspacesFile>;
   saveWorkspaces(file: WorkspacesFile): Promise<void>;
   openDirDialog(defaultPath?: string): Promise<string | null>;
+  /** 弹出文件选择框（多选），返回选中文件的绝对路径 + 名称 + 大小；取消返回 null */
+  pickFiles(defaultPath?: string): Promise<PickedFile[] | null>;
 
   // 模型配置：读写 omp 原生 ~/.omp/agent/models.yml
   readModelsConfig(): Promise<OmpModelsConfig>;

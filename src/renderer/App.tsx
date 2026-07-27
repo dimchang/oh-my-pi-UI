@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useApp, type UiRequest, toolNameOf } from './store';
+import { useApp, type UiRequest, type Attachment, toolNameOf } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -272,7 +272,7 @@ export default function App(): React.ReactElement {
   }, []);
 
   // ---- 用户操作 ----
-  const onSend = useCallback((text: string) => {
+  const onSend = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
     const sp = st.currentSessionPath;
     if (!sp) {
@@ -281,11 +281,12 @@ export default function App(): React.ReactElement {
     }
     const cwd = st.currentWorkspace()?.cwd ?? '';
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const promptText = buildPromptWithAttachments(text, attachments);
     const doSend = async () => {
       // 懒拉起该会话的进程（带 -c 续接）。已在线则 no-op。**不影响其他会话**。
       await rpc.acquire(sp, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text);
-      await rpc.prompt(sp, text);
+      useApp.getState().appendUserMessage(text, { attachments });
+      await rpc.prompt(sp, promptText);
       refreshSessions();
     };
     void doSend().catch((err) =>
@@ -295,7 +296,7 @@ export default function App(): React.ReactElement {
 
   /** 引导（steer mid-run）：生成中途按 Enter → omp 在当前 tool 完成后立即按新方向继续，
    *  跳过剩余 tool 队列，再走一次模型。空闲时同 onSend 的效果。 */
-  const onGuide = useCallback((text: string) => {
+  const onGuide = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
     const sp = st.currentSessionPath;
     if (!sp) {
@@ -304,10 +305,11 @@ export default function App(): React.ReactElement {
     }
     const cwd = st.currentWorkspace()?.cwd ?? '';
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const promptText = buildPromptWithAttachments(text, attachments);
     const doGuide = async () => {
       await rpc.acquire(sp, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text, { steered: true });
-      await rpc.steer(sp, text);
+      useApp.getState().appendUserMessage(text, { steered: true, attachments });
+      await rpc.steer(sp, promptText);
       refreshSessions();
     };
     void doGuide().catch((err) =>
@@ -316,7 +318,7 @@ export default function App(): React.ReactElement {
   }, [pushToast, refreshSessions]);
 
   /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
-  const onQueue = useCallback((text: string) => {
+  const onQueue = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
     const sp = st.currentSessionPath;
     if (!sp) {
@@ -325,10 +327,11 @@ export default function App(): React.ReactElement {
     }
     const cwd = st.currentWorkspace()?.cwd ?? '';
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const promptText = buildPromptWithAttachments(text, attachments);
     const doQueue = async () => {
       await rpc.acquire(sp, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text, { queued: true });
-      await rpc.followUp(sp, text);
+      useApp.getState().appendUserMessage(text, { queued: true, attachments });
+      await rpc.followUp(sp, promptText);
       refreshSessions();
     };
     void doQueue().catch((err) =>
@@ -749,6 +752,17 @@ export default function App(): React.ReactElement {
 
 /** 是否 Windows（模块级常量，避免每次 render 都访问 window.omp.platform）。 */
 const IS_WIN32 = window.omp?.platform === 'win32';
+
+/** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */
+/** 把附件绝对路径拼进发给 omp 的 prompt（agent 用其文件读取工具按需读取）。
+ *  UI 里消息正文保持用户原文本、附件以芯片展示，不污染正文可读性。
+ *  仅当文本为空（纯附件消息）时，prompt 退化为附件列表本身。 */
+function buildPromptWithAttachments(text: string, atts?: Attachment[]): string {
+  if (!atts || atts.length === 0) return text;
+  const lines = atts.map((a) => `- ${a.path}`).join('\n');
+  const block = `Attached files (absolute paths, read them as needed):\n${lines}`;
+  return text ? `${text}\n\n${block}` : block;
+}
 
 /** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */
 function getWorkDir(): string {

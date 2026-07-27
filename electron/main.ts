@@ -394,6 +394,21 @@ function registerIpc(): void {
     const r = await dialog.showOpenDialog(mainWindow, { title: '选择工作目录', properties: ['openDirectory'], defaultPath: defaultPath || undefined });
     return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
   });
+  // 添加文件到对话：多选文件，返回绝对路径 + 名称 + 大小（渲染进程据此拼进 prompt / 展示芯片）
+  ipcMain.handle(IPC.DialogOpenFiles, async (_e, defaultPath?: string) => {
+    if (!mainWindow) return null;
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择要添加到对话的文件',
+      properties: ['openFile', 'multiSelections'],
+      defaultPath: defaultPath || undefined,
+    });
+    if (r.canceled || r.filePaths.length === 0) return null;
+    return r.filePaths.map((p) => {
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch { /* 读不到大小就用 0 */ }
+      return { path: p, name: path.basename(p), size };
+    });
+  });
 
   // ---- 钩子（Hooks）管理 ----
   ipcMain.handle(IPC.OmpPickHookFiles, async () => {

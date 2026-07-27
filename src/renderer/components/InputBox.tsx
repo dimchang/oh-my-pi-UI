@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useApp } from '../store';
+import { useApp, type Attachment } from '../store';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
 import { PermissionPicker } from './PermissionPicker';
@@ -7,9 +7,9 @@ import { Icon } from './Icon';
 import type { ApprovalMode } from '../../shared/ipc-channels';
 
 export const InputBox: React.FC<{
-  onSend: (text: string) => void;
-  onGuide: (text: string) => void;
-  onQueue: (text: string) => void;
+  onSend: (text: string, attachments?: Attachment[]) => void;
+  onGuide: (text: string, attachments?: Attachment[]) => void;
+  onQueue: (text: string, attachments?: Attachment[]) => void;
   onAbort: () => void;
   onChangeApprovalMode: (mode: ApprovalMode) => void;
 }> = ({ onSend, onGuide, onQueue, onAbort, onChangeApprovalMode }) => {
@@ -24,6 +24,8 @@ export const InputBox: React.FC<{
   // Enter 默认行为：'guide'（默认，mid-run 介入）/ 'queue'（等当前轮跑完）
   // Shift+Enter 自动取反
   const inputBehavior = useApp((s) => s.inputBehavior ?? 'guide');
+  const cwd = useApp((s) => s.currentWorkspace()?.cwd ?? '');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // 提交防重复：onSend 把状态切到 streaming 有一帧延迟，期间按两次 Enter 会重复发送
   const submittingRef = useRef(false);
@@ -61,6 +63,30 @@ export const InputBox: React.FC<{
     }
   };
 
+  // 附件：从文件选择框添加（项目内或任意外部文件），按路径去重
+  const onPickFiles = async () => {
+    try {
+      const picked = await window.omp.pickFiles(cwd || undefined);
+      if (!picked || picked.length === 0) return;
+      setAttachments((prev) => {
+        const existing = new Set(prev.map((a) => a.path));
+        const added = picked.filter((p) => !existing.has(p.path));
+        return added.length ? [...prev, ...added] : prev;
+      });
+    } catch (err) {
+      console.error('pickFiles 失败', err);
+    }
+  };
+
+  const removeAttachment = (path: string) => {
+    setAttachments((prev) => prev.filter((a) => a.path !== path));
+  };
+
+  // 打开附件：本地文件走 shell.openPath（window.omp.openExternal 已对本地路径回退 openPath）
+  const openAttachment = (path: string) => {
+    void window.omp.openExternal(path).catch((err) => console.error('openAttachment 失败', err));
+  };
+
   /**
    * 提交并按用户设置选择模式：
    *   - draft 为空：按了也无效
@@ -79,13 +105,13 @@ export const InputBox: React.FC<{
     } else {
       mode = inputBehavior;
     }
-    if (!mode) return;
     submittingRef.current = true;
     setDraft('');
+    setAttachments([]); // 清空待发送附件（已随消息一并发出）
     requestAnimationFrame(autoGrow);
-    if (mode === 'guide') onGuide(text);
-    else if (mode === 'queue') onQueue(text);
-    else onSend(text);
+    if (mode === 'guide') onGuide(text, attachments);
+    else if (mode === 'queue') onQueue(text, attachments);
+    else onSend(text, attachments);
     // 释放：等状态切到 streaming 或超时后允许再次发送（避免异常时永久锁死）
     setTimeout(() => { submittingRef.current = false; }, 500);
   };
@@ -119,6 +145,8 @@ export const InputBox: React.FC<{
   // placeholder 根据当前模式 + 设置变化
   //   引导 (guide) = steer mid-run：当前 tool 完成后立即按新方向继续（跳过剩余 tool 队列）
   //   排队 (queue) = follow_up：等当前 agent turn 跑完再处理，不打断当前 tool/t
+  // 有附件也算有输入（即使正文为空也能发送）
+  const hasInput = draft.trim() !== '' || attachments.length > 0;
   const placeholder = !ready
     ? '正在连接 omp…'
     : isStreaming
@@ -145,6 +173,25 @@ export const InputBox: React.FC<{
           </div>
         )}
         <div className="input-box">
+          {attachments.length > 0 && (
+            <div className="attachment-chips">
+              {attachments.map((a) => (
+                <span className="attachment-chip" key={a.path} title={a.path}>
+                  <Icon name="file" size={13} />
+                  <span
+                    className="attachment-name"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => openAttachment(a.path)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openAttachment(a.path); }}
+                  >{a.name}</span>
+                  <button type="button" className="attachment-remove" title="移除附件" onClick={() => removeAttachment(a.path)}>
+                    <Icon name="close" size={12} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <textarea
             ref={taRef}
             rows={2}
@@ -155,7 +202,7 @@ export const InputBox: React.FC<{
           />
           <div className="input-toolbar">
             <div className="input-toolbar-left">
-              <button className="input-tool-btn icon-only" type="button" title="添加附件">
+              <button className="input-tool-btn icon-only" type="button" title="添加附件（项目内或任意外部文件）" onClick={onPickFiles}>
                 <Icon name="attach" size={16} />
               </button>
               <PermissionPicker onChange={onChangeApprovalMode} />
@@ -167,7 +214,7 @@ export const InputBox: React.FC<{
                   - draft 为空：灰色 STOP（onAbort，仅生成中可点）
                   - draft 有内容 + 生成中：按 inputBehavior 显示琥珀「引导」或灰色「排队」
                   - draft 有内容 + 空闲：蓝色 SEND */}
-              {draft.trim() === '' ? (
+              {!hasInput ? (
                 <button
                   className="stop-btn-round"
                   onClick={onAbort}

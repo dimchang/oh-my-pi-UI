@@ -80,6 +80,22 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
         })}
         {msg.streaming && <span style={{ color: 'var(--text-faint)' }}>▍</span>}
       </div>
+      {msg.role === 'user' && msg.attachments && msg.attachments.length > 0 && (
+        <div className="msg-attachments">
+          {msg.attachments.map((a) => (
+            <button
+              type="button"
+              className="msg-attachment-chip"
+              key={a.path}
+              title={a.path}
+              onClick={() => { void window.omp.openExternal(a.path).catch(() => undefined); }}
+            >
+              <Icon name="file" size={13} />
+              <span>{a.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {msg.usage?.totalTokens !== undefined && (
         <div className="msg-usage">
           {msg.usage.totalTokens} tokens{msg.usage.duration ? ` · ${(msg.usage.duration / 1000).toFixed(1)}s` : ''}

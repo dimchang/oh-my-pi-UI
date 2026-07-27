@@ -37,6 +37,17 @@ export interface ThinkingPart { kind: 'thinking'; text: string; }
 
 export type MessagePart = TextPart | ThinkingPart | ToolPart;
 
+/** 已附加到对话的文件（发送时把绝对路径拼进 prompt，让 agent 用文件读取工具按需读取）。
+ *  区分于普通文本：附件只持有路径引用，UI 以芯片展示，agent 真正读取由 omp 工具完成。 */
+export interface Attachment {
+  /** 文件绝对路径 */
+  path: string;
+  /** 文件名（basename） */
+  name: string;
+  /** 字节大小（可选，仅用于展示） */
+  size?: number;
+}
+
 /**
  * 从 UI 请求里提取工具名，作为"始终允许"缓存的 key。
  * omp 的 confirm 请求把工具名 + 命令塞在 title 里（用 \n 分隔），工具名是第一行。
@@ -68,6 +79,8 @@ export interface ChatMessage {
   steered?: boolean;
   /** true=该用户消息来自 follow_up（排队），UI 用 distinct 样式 + 标记渲染 */
   queued?: boolean;
+  /** 随消息附带的文件（历史消息中点击可在系统应用/文件管理器打开） */
+  attachments?: Attachment[];
 }
 
 export interface UiRequest {
@@ -156,13 +169,6 @@ interface AppState {
   setSystemPrompt(v: string): void;
 
   // ---- 输入行为 ----
-  /** steer 默认行为（设置→系统配置）：
-   *   - 'restart'（默认）Enter = 立即重起（真中断当前 turn，立刻按新方向开 turn，丢已生成 token）。
-   *   - 'steer'           Enter = 中途改写 / mid-run 中断（当前 tool 完成后立即按新方向继续，
-   *                                                omp 跳过剩余 tool 队列，仍要等当前 tool 跑完 + 走一次模型）。
-   *  Shift+Enter 取反（v0.3.5 实测 probe-steer-v5.mjs 确认 steer 具备 mid-run 中断能力
-   *   —— omp 源码注释：`Delivered after current tool execution, skips remaining tools`）。
-   *  之前 v0.3.3/v0.3.4 错误地认为 steer 不打断当前 turn，已在 v0.3.5 修正。 */
   /** 输入框 Enter 默认行为（系统配置 → 输入行为）：
    *  - 'guide'（默认）= 引导（steer）：生成中途按 Enter → mid-run 介入，当前 tool 完成后立即按新方向继续
    *    （OMP 源码注释：\`Delivered after current tool execution, skips remaining tools.\`）。
@@ -240,7 +246,7 @@ interface AppState {
   /** 从磁盘读某会话历史并缓冲 */
   loadSessionMessages(path: string): void;
   /** 往当前显示会话追加一条 user 消息（onSend 用）。opts.steered=true 标记为 steer（改写方向）。 */
-  appendUserMessage(text: string, opts?: { steered?: boolean; queued?: boolean }): void;
+  appendUserMessage(text: string, opts?: { steered?: boolean; queued?: boolean; attachments?: Attachment[] }): void;
   resetChat(): void;
   // 进程池状态
   /** 部分更新某会话的进程状态（合并写入） */
@@ -688,7 +694,11 @@ export const useApp = create<AppState>((set, get) => ({
             streaming: false,
             usage: m.usage ? { totalTokens: m.usage.totalTokens, duration: m.duration } : undefined,
             error: errorText,
-            // 历史回放：用户消息若带 steering 标记（omp 由 steer 产生），渲染为"改写方向"
+            // 历史回放标记重建（2026-07-27 probe-followup.mjs v3 实测确认）：
+            //   - steer（引导）：omp 在 JSONL 内层 message 持久化 "steering":true → 可重建 steered。
+            //   - follow_up（排队）：omp 在 JSONL 上**不打任何标记**（message 与普通 prompt 逐字节相同），
+            //     故 queued 无法仅从磁盘重建；重载后排队消息会渲染成普通"你"消息（仅丢小标签，内容无损）。
+            //     这是 omp 的落盘限制，非本映射遗漏——有意不映射 queued（详见 MEMORY.md 关键约束 #4）。
             steered: m.role === 'user' ? Boolean((m as { steering?: boolean }).steering) : undefined,
           });
         }
@@ -715,6 +725,7 @@ export const useApp = create<AppState>((set, get) => ({
       streaming: false,
       steered: opts?.steered ?? false,
       queued: opts?.queued ?? false,
+      attachments: opts?.attachments ?? [],
     };
     const buf = st.sessionsMap[path] ? [...st.sessionsMap[path], userMsg] : [userMsg];
     const sessionsMap = { ...st.sessionsMap, [path]: buf };
