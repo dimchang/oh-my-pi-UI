@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useApp } from '../store';
 import { SessionList } from './SessionList';
 import { Icon } from './Icon';
@@ -77,14 +78,25 @@ export const WorkspaceList: React.FC<{
   const [deleteArchivedTarget, setDeleteArchivedTarget] = useState<Workspace | null>(null);
   const closeMenu = () => setMenu(null);
 
+  // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
+  const openMenu = (m: NonNullable<typeof menu>) => {
+    document.dispatchEvent(new CustomEvent('omp:ctxmenu-open'));
+    setMenu(m);
+  };
+
   React.useEffect(() => {
     if (!menu) return;
     const onDoc = () => closeMenu();
+    const onOtherMenu = () => closeMenu();
     // 用 click 而不是 mousedown：mousedown 阶段就会 setMenu(null) 卸载菜单，
     // 后续 click 事件的目标已不在 React 树中，ctx-item 的 onClick 无法触发。
     // 改用 click 后，React 先派发 ctx-item.onClick，document 后关闭菜单。
     document.addEventListener('click', onDoc);
-    return () => document.removeEventListener('click', onDoc);
+    document.addEventListener('omp:ctxmenu-open', onOtherMenu);
+    return () => {
+      document.removeEventListener('click', onDoc);
+      document.removeEventListener('omp:ctxmenu-open', onOtherMenu);
+    };
   }, [menu]);
 
   // 过滤：按 displayName 大小写不敏感匹配
@@ -224,7 +236,7 @@ export const WorkspaceList: React.FC<{
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault();
-                    setMenu({ ws, x: e.clientX, y: e.clientY });
+                    openMenu({ ws, x: e.clientX, y: e.clientY });
                   }}
                   title={ws.cwd}
                 >
@@ -244,7 +256,7 @@ export const WorkspaceList: React.FC<{
                     className="workspace-menu-trigger"
                     onClick={(e) => {
                       e.stopPropagation();
-                      setMenu({ ws, x: e.clientX, y: e.clientY });
+                      openMenu({ ws, x: e.clientX, y: e.clientY });
                     }}
                     title="更多"
                   >
@@ -315,7 +327,7 @@ export const WorkspaceList: React.FC<{
         </div>
       )}
 
-      {menu && (
+      {menu && createPortal(
         <div
           className="ctx-menu"
           style={{ ...clampMenuPos(menu.x, menu.y), position: 'fixed' }}
@@ -326,7 +338,8 @@ export const WorkspaceList: React.FC<{
           <div className="ctx-item" onClick={() => handleOpenInExplorer(menu.ws)}>在文件管理器中打开</div>
           <div className="ctx-sep" />
           <div className="ctx-item" onClick={() => handleArchive(menu.ws)}>归档</div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {renameTarget && (

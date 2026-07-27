@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import { useApp, type ChatMessage } from '../store';
 import { ToolCard } from './ToolCard';
 import { Icon } from './Icon';
+import { Minimap } from './Minimap';
 
 /** 正文里 markdown 代码块默认折叠（超过 ~6 行时收起） */
 const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown }> = ({ children, node: _node }) => {
@@ -126,27 +127,30 @@ export const ChatView: React.FC = () => {
   };
 
   return (
-    <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
-      <div className="chat-inner">
-        {messages.length === 0 && !isCompacting && !isRetrying ? (
-          <div className="chat-empty">
-            <h2>有什么可以帮你的？</h2>
-            <p>输入任务，MyPi 会读写文件、跑命令来完成。</p>
-          </div>
-        ) : (
-          messages.map((m) => <MessageItem key={m.id} msg={m} />)
-        )}
-        {isCompacting && (
-          <div className="status-bubble compacting">
-            <span className="status-spinner" /> {compactionInfo || '压缩上下文中…'}
-          </div>
-        )}
-        {isRetrying && (
-          <div className="status-bubble retrying">
-            <span className="status-spinner" /> {retryInfo || '重试中…'}
-          </div>
-        )}
+    <div className="chat-area">
+      <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
+        <div className="chat-inner">
+          {messages.length === 0 && !isCompacting && !isRetrying ? (
+            <div className="chat-empty">
+              <h2>有什么可以帮你的？</h2>
+              <p>输入任务，MyPi 会读写文件、跑命令来完成。</p>
+            </div>
+          ) : (
+            messages.map((m) => <MessageItem key={m.id} msg={m} />)
+          )}
+          {isCompacting && (
+            <div className="status-bubble compacting">
+              <span className="status-spinner" /> {compactionInfo || '压缩上下文中…'}
+            </div>
+          )}
+          {isRetrying && (
+            <div className="status-bubble retrying">
+              <span className="status-spinner" /> {retryInfo || '重试中…'}
+            </div>
+          )}
+        </div>
       </div>
+      <Minimap scrollRef={scrollRef} />
     </div>
   );
 };

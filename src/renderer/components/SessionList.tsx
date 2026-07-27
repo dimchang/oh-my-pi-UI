@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { SessionSummary } from '../../shared/ipc-channels';
 
 function relTime(mtime: number): string {
@@ -42,12 +43,23 @@ export const SessionList: React.FC<{
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; session: SessionSummary } | null>(null);
   const closeMenu = () => setCtxMenu(null);
 
+  // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
+  const openMenu = (menu: NonNullable<typeof ctxMenu>) => {
+    document.dispatchEvent(new CustomEvent('omp:ctxmenu-open'));
+    setCtxMenu(menu);
+  };
+
   React.useEffect(() => {
     if (!ctxMenu) return;
     const onDoc = () => closeMenu();
+    const onOtherMenu = () => closeMenu();
     // 用 click 而不是 mousedown：避免 mousedown 提前关闭菜单导致 ctx-item 的 onClick 永不触发
     document.addEventListener('click', onDoc);
-    return () => document.removeEventListener('click', onDoc);
+    document.addEventListener('omp:ctxmenu-open', onOtherMenu);
+    return () => {
+      document.removeEventListener('click', onDoc);
+      document.removeEventListener('omp:ctxmenu-open', onOtherMenu);
+    };
   }, [ctxMenu]);
 
   if (sessions.length === 0) {
@@ -63,7 +75,7 @@ export const SessionList: React.FC<{
           onClick={() => onSelect(s)}
           onContextMenu={(e) => {
             e.preventDefault();
-            setCtxMenu({ x: e.clientX, y: e.clientY, session: s });
+            openMenu({ x: e.clientX, y: e.clientY, session: s });
           }}
           title={s.path}
         >
@@ -72,7 +84,7 @@ export const SessionList: React.FC<{
         </div>
       ))}
 
-      {ctxMenu && (
+      {ctxMenu && createPortal(
         <div
           className="ctx-menu"
           style={{ ...clampMenuPos(ctxMenu.x, ctxMenu.y), position: 'fixed' }}
@@ -86,7 +98,8 @@ export const SessionList: React.FC<{
           <div className="ctx-item" onClick={() => { closeMenu(); onOpenDir(ctxMenu.session); }}>打开所在目录</div>
           <div className="ctx-sep" />
           <div className="ctx-item ctx-danger" onClick={() => { closeMenu(); onDelete(ctxMenu.session); }}>删除</div>
-        </div>
+        </div>,
+        document.body
       )}
     </>
   );
