@@ -293,6 +293,50 @@ export default function App(): React.ReactElement {
     );
   }, [pushToast, refreshSessions]);
 
+  /** 引导（steer mid-run）：生成中途按 Enter → omp 在当前 tool 完成后立即按新方向继续，
+   *  跳过剩余 tool 队列，再走一次模型。空闲时同 onSend 的效果。 */
+  const onGuide = useCallback((text: string) => {
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
+    if (!sp) {
+      pushToast('请先选择一个会话', 'error');
+      return;
+    }
+    const cwd = st.currentWorkspace()?.cwd ?? '';
+    const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const doGuide = async () => {
+      await rpc.acquire(sp, cwd, approvalMode);
+      useApp.getState().appendUserMessage(text, { steered: true });
+      await rpc.steer(sp, text);
+      refreshSessions();
+    };
+    void doGuide().catch((err) =>
+      pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    );
+  }, [pushToast, refreshSessions]);
+
+  /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
+  const onQueue = useCallback((text: string) => {
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
+    if (!sp) {
+      pushToast('请先选择一个会话', 'error');
+      return;
+    }
+    const cwd = st.currentWorkspace()?.cwd ?? '';
+    const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    const doQueue = async () => {
+      await rpc.acquire(sp, cwd, approvalMode);
+      useApp.getState().appendUserMessage(text, { queued: true });
+      await rpc.followUp(sp, text);
+      refreshSessions();
+    };
+    void doQueue().catch((err) =>
+      pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    );
+  }, [pushToast, refreshSessions]);
+
+  // 中止当前 agent 轮
   const onAbort = useCallback(() => {
     const st = useApp.getState();
     const sp = st.currentSessionPath;
@@ -649,7 +693,7 @@ export default function App(): React.ReactElement {
         ) : (
           <>
             <ChatView />
-            <InputBox onSend={onSend} onAbort={onAbort} onChangeApprovalMode={onChangeApprovalMode} />
+            <InputBox onSend={onSend} onGuide={onGuide} onQueue={onQueue} onAbort={onAbort} onChangeApprovalMode={onChangeApprovalMode} />
             <StatusBar />
           </>
         )}

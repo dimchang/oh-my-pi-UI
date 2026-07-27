@@ -9,11 +9,12 @@ import { SettingsModelConfig } from './SettingsModelConfig';
 import { SettingsHooks } from './SettingsHooks';
 import type { AppearanceConfig } from '../../shared/ipc-channels';
 import { builtinThemes } from '../themes';
+import { Icon, type IconName } from './Icon';
 
-const TABS: Array<{ key: 'system' | 'agent' | 'model'; icon: string; label: string }> = [
-  { key: 'system', icon: '⚙️', label: '系统配置' },
-  { key: 'agent', icon: '🤖', label: '智能体设置' },
-  { key: 'model', icon: '📦', label: '模型配置' },
+const TABS: Array<{ key: 'system' | 'agent' | 'model'; icon: IconName; label: string }> = [
+  { key: 'system', icon: 'cog', label: '系统配置' },
+  { key: 'agent', icon: 'robot', label: '智能体设置' },
+  { key: 'model', icon: 'pkg', label: '模型配置' },
 ];
 
 const FONT_PRESETS: Array<{ label: string; value: string }> = [
@@ -69,7 +70,9 @@ export const SettingsPanel: React.FC = () => {
                 className={`settings-nav-item ${tab === t.key ? 'active' : ''}`}
                 onClick={() => useApp.getState().setSettingsTab(t.key)}
               >
-                <span className="settings-nav-icon">{t.icon}</span>
+                <span className="settings-nav-icon">
+                  <Icon name={t.icon} size={18} strokeWidth={1.8} />
+                </span>
                 <span>{t.label}</span>
               </button>
             ))}
@@ -85,10 +88,11 @@ export const SettingsPanel: React.FC = () => {
   );
 };
 
-/** 系统配置：系统提示词 + 系统风格（外观） */
+/** 系统配置：系统提示词 + 输入行为（默认：引导）+ 系统风格（外观） */
 const SystemConfigTab: React.FC = () => {
   const systemPrompt = useApp((s) => s.systemPrompt);
   const appearance = useApp((s) => s.appearance);
+  const inputBehavior = useApp((s) => s.inputBehavior ?? 'guide');
 
   const [promptDraft, setPromptDraft] = useState(systemPrompt ?? '');
   // appearance 用本地草稿，避免每次拖动滑块都触发 persist（失焦/松手时提交）
@@ -160,6 +164,39 @@ const SystemConfigTab: React.FC = () => {
             </button>
           )}
         </div>
+      </section>
+
+      {/* ===== 输入行为：Enter 默认行为（引导 / 排队） ===== */}
+      <section className="settings-section">
+        <h3 className="settings-section-title">输入行为</h3>
+        <p className="settings-section-desc">
+          控制输入框 <kbd>Enter</kbd> 默认行为；<kbd>Shift</kbd>+<kbd>Enter</kbd> 自动取反。
+        </p>
+        <div className="settings-toggle-row" role="tablist" aria-label="输入行为">
+          <button
+            role="tab"
+            aria-selected={inputBehavior === 'queue'}
+            className={`settings-toggle-btn ${inputBehavior === 'queue' ? 'active' : ''}`}
+            onClick={() => useApp.getState().setInputBehavior('queue')}
+            title="等当前 agent turn 跑完再处理（不打断当前 tool/t）"
+          >
+            排队
+          </button>
+          <button
+            role="tab"
+            aria-selected={inputBehavior === 'guide'}
+            className={`settings-toggle-btn ${inputBehavior === 'guide' ? 'active' : ''}`}
+            onClick={() => useApp.getState().setInputBehavior('guide')}
+            title="mid-run 引导：当前 tool 完成后立即按新方向继续（omp 跳过剩余 tool 队列）"
+          >
+            引导
+          </button>
+        </div>
+        <p className="settings-hint" style={{ marginTop: 10 }}>
+          {inputBehavior === 'guide'
+            ? '当前：Enter 引导（mid-run）。omp 在当前 tool 完成后立即按新方向继续，跳过剩余 tool 队列。'
+            : '当前：Enter 排队。把消息追加到当前会话末尾，等当前 agent turn 跑完再处理，不打断当前 tool/t。'}
+        </p>
       </section>
 
       {/* ===== 系统风格 ===== */}

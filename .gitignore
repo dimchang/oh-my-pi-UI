@@ -49,6 +49,7 @@ control.json
 
 # ===== One-off local preview html (root, throwaway) =====
 preview-*.html
+*-research.html
 
 # ===== Runtime temp dir (omp stderr logs, etc.) =====
 .temp/

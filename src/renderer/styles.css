@@ -928,7 +928,7 @@ body {
   font-family: inherit;
   font-size: 14px;
   resize: none;
-  max-height: 160px;
+  max-height: 320px;
   line-height: 1.5;
   padding: 2px 0;
 }
@@ -972,6 +972,17 @@ body {
 }
 .input-tool-btn:hover { background: hsl(var(--bg-300) / 0.6); color: var(--text); }
 
+/* 单图标按钮（无文字标签，如 attach）：跟 PermissionPicker / ModelPicker 等
+   带文字胶囊按钮同高 28px，扁平化无边框，跟 toolbar 视觉权重一致 */
+.input-tool-btn.icon-only {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-pill);
+}
+.input-tool-btn.icon-only:hover { background: hsl(var(--bg-300) / 0.6); }
+
 /* toolbar 内的 picker 按钮扁平化为胶囊 */
 .input-toolbar .model-picker .btn,
 .input-toolbar .thinking-picker .btn {
@@ -1005,6 +1016,94 @@ body {
 .send-btn-round:active, .stop-btn-round:active { transform: scale(0.94); }
 .stop-btn-round { background: hsl(var(--bg-400)); color: var(--text); }
 .stop-btn-round:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* 改写下一轮（steer）按钮：琥珀色，区别于蓝色发送 / 灰色停止 */
+.steer-btn-round {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(32 95% 52%);
+  color: hsl(0 0% 100%);
+  transition: transform 0.05s, opacity 0.12s;
+}
+.steer-btn-round:hover { opacity: 0.88; }
+.steer-btn-round:active { transform: scale(0.94); }
+.steer-btn-round:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 工具栏"改写下一轮"模式开关（高亮态） */
+.input-tool-btn.active { background: hsl(32 95% 52% / 0.18); color: hsl(32 95% 52%); }
+
+/* 立即重起（restart）按钮：深红警告色，比 steer 更显眼，传达"会丢 token"的代价 */
+.restart-btn-round {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1.5px solid hsl(0 78% 50%);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(0 78% 50% / 0.12);
+  color: hsl(0 78% 50%);
+  transition: transform 0.05s, opacity 0.12s, background 0.12s;
+}
+.restart-btn-round:hover { background: hsl(0 78% 50% / 0.22); opacity: 1; }
+.restart-btn-round:active { transform: scale(0.94); }
+.restart-btn-round:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* 改写下一轮消息：右侧消息加琥珀色强调，与常规「你」区分 */
+.message.steered { border-right: 2px solid hsl(32 95% 52%); padding-right: 10px; }
+.message.steered .msg-role { color: hsl(32 95% 52%); }
+.message.steered .msg-body { color: hsl(32 60% 72%); }
+
+/* 排队消息：浅灰边框 + 灰色文字，提示这是等当前轮跑完再处理的消息 */
+.message.queued { border-right: 2px solid hsl(var(--text-300) / 0.4); padding-right: 10px; }
+.message.queued .msg-role { color: hsl(var(--text-300)); }
+.message.queued .msg-body { color: hsl(var(--text-300)); }
+
+/* 引导按钮（mid-run steer，生成中途注入） */
+.guide-btn-round {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(32 95% 52%);
+  color: hsl(0 0% 100%);
+  transition: transform 0.05s, opacity 0.12s;
+}
+.guide-btn-round:hover { opacity: 0.88; }
+.guide-btn-round:active { transform: scale(0.94); }
+.guide-btn-round:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 排队按钮（follow_up，等当前轮跑完） */
+.queue-btn-round {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(var(--bg-300));
+  color: hsl(var(--text-300));
+  transition: transform 0.05s, opacity 0.12s;
+}
+.queue-btn-round:hover { background: hsl(var(--bg-400)); color: var(--text); }
+.queue-btn-round:active { transform: scale(0.94); }
+.queue-btn-round:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* toolbar 贴底，下拉菜单向上展开 */
 .input-toolbar .model-menu,
@@ -1536,13 +1635,52 @@ body {
   color: hsl(var(--accent-main-000));
   font-weight: 500;
 }
-.settings-nav-icon { font-size: 15px; flex-shrink: 0; }
+.settings-nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  color: inherit;
+}
 .settings-content { flex: 1; overflow-y: auto; padding: 24px 28px; }
 .settings-placeholder {
   color: hsl(var(--text-400));
   font-size: 13px;
   padding: 40px 0;
   text-align: center;
+}
+
+/* 苹果风二态按钮：参考截图「排队 / 引导」样式（圆角胶囊 + 选中态深色填充） */
+.settings-toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  padding: 4px;
+  background: hsl(var(--bg-300) / 0.6);
+  border-radius: 999px;
+  align-self: flex-start;
+}
+.settings-toggle-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: hsl(var(--text-300));
+  font-size: 13px;
+  font-family: inherit;
+  padding: 6px 18px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+  min-width: 64px;
+}
+.settings-toggle-btn:hover { color: var(--text); }
+.settings-toggle-btn.active {
+  background: hsl(var(--bg-100));
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 3px hsl(0 0% 0% / 0.18);
 }
 
 /* ====== 系统配置（SettingsPanel SystemConfigTab） ====== */

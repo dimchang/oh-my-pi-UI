@@ -64,6 +64,10 @@ export interface ChatMessage {
   usage?: { totalTokens?: number; duration?: number };
   /** stopReason==='error' 时的错误信息（模型 404/限流等） */
   error?: string;
+  /** true=该用户消息来自 steer（引导），UI 用 distinct 样式 + 标记渲染 */
+  steered?: boolean;
+  /** true=该用户消息来自 follow_up（排队），UI 用 distinct 样式 + 标记渲染 */
+  queued?: boolean;
 }
 
 export interface UiRequest {
@@ -150,6 +154,22 @@ interface AppState {
   /** 系统提示词：新建会话时注入。改了即持久化。 */
   systemPrompt?: string;
   setSystemPrompt(v: string): void;
+
+  // ---- 输入行为 ----
+  /** steer 默认行为（设置→系统配置）：
+   *   - 'restart'（默认）Enter = 立即重起（真中断当前 turn，立刻按新方向开 turn，丢已生成 token）。
+   *   - 'steer'           Enter = 中途改写 / mid-run 中断（当前 tool 完成后立即按新方向继续，
+   *                                                omp 跳过剩余 tool 队列，仍要等当前 tool 跑完 + 走一次模型）。
+   *  Shift+Enter 取反（v0.3.5 实测 probe-steer-v5.mjs 确认 steer 具备 mid-run 中断能力
+   *   —— omp 源码注释：`Delivered after current tool execution, skips remaining tools`）。
+   *  之前 v0.3.3/v0.3.4 错误地认为 steer 不打断当前 turn，已在 v0.3.5 修正。 */
+  /** 输入框 Enter 默认行为（系统配置 → 输入行为）：
+   *  - 'guide'（默认）= 引导（steer）：生成中途按 Enter → mid-run 介入，当前 tool 完成后立即按新方向继续
+   *    （OMP 源码注释：\`Delivered after current tool execution, skips remaining tools.\`）。
+   *  - 'queue'         = 排队（follow_up）：等当前 agent turn 跑完再处理，不打断当前 tool/t。
+   *  Shift+Enter 自动取反。 */
+  inputBehavior: 'queue' | 'guide';
+  setInputBehavior(v: 'queue' | 'guide'): void;
   /** 外观（系统风格）配置。改了即持久化并实时应用。 */
   appearance?: AppearanceConfig;
   setAppearance(v: AppearanceConfig): void;
@@ -219,8 +239,8 @@ interface AppState {
   // 会话消息：per-session 缓冲
   /** 从磁盘读某会话历史并缓冲 */
   loadSessionMessages(path: string): void;
-  /** 往当前显示会话追加一条 user 消息（onSend 用） */
-  appendUserMessage(text: string): void;
+  /** 往当前显示会话追加一条 user 消息（onSend 用）。opts.steered=true 标记为 steer（改写方向）。 */
+  appendUserMessage(text: string, opts?: { steered?: boolean; queued?: boolean }): void;
   resetChat(): void;
   // 进程池状态
   /** 部分更新某会话的进程状态（合并写入） */
@@ -305,6 +325,7 @@ export const useApp = create<AppState>((set, get) => ({
   enabledModels: undefined,
   systemPrompt: undefined,
   appearance: undefined,
+  inputBehavior: 'guide',
 
   setReady: (v) => set({ ready: v }),
   setMainView: (v) => set({ mainView: v }),
@@ -349,6 +370,10 @@ export const useApp = create<AppState>((set, get) => ({
   setAppearance: (v) => {
     set({ appearance: v });
     applyAppearance(v);
+    get().persistWorkspaces();
+  },
+  setInputBehavior: (v) => {
+    set({ inputBehavior: v });
     get().persistWorkspaces();
   },
   setHooks: (v) => {
@@ -454,6 +479,7 @@ export const useApp = create<AppState>((set, get) => ({
       systemPrompt: file.systemPrompt,
       appearance: migratedAppearance,
       hooks: file.hooks,
+      inputBehavior: file.inputBehavior ?? 'guide',
     });
     // 若发生过迁移（任何 id 改了格式）或 customCss 补上 id，立即写回磁盘
     const dirty =
@@ -562,6 +588,7 @@ export const useApp = create<AppState>((set, get) => ({
       systemPrompt: s.systemPrompt,
       appearance: s.appearance,
       hooks: s.hooks,
+      inputBehavior: s.inputBehavior,
     };
     // 动态 import 避免循环依赖（rpc-client 也 import store）
     void import('./rpc-client').then(({ rpc }) => {
@@ -661,6 +688,8 @@ export const useApp = create<AppState>((set, get) => ({
             streaming: false,
             usage: m.usage ? { totalTokens: m.usage.totalTokens, duration: m.duration } : undefined,
             error: errorText,
+            // 历史回放：用户消息若带 steering 标记（omp 由 steer 产生），渲染为"改写方向"
+            steered: m.role === 'user' ? Boolean((m as { steering?: boolean }).steering) : undefined,
           });
         }
         const st = get();
@@ -676,7 +705,7 @@ export const useApp = create<AppState>((set, get) => ({
     );
   },
 
-  appendUserMessage: (text) => {
+  appendUserMessage: (text, opts) => {
     const st = get();
     const path = st.currentSessionPath ?? '';
     const userMsg: ChatMessage = {
@@ -684,6 +713,8 @@ export const useApp = create<AppState>((set, get) => ({
       role: 'user',
       parts: [{ kind: 'text', text }],
       streaming: false,
+      steered: opts?.steered ?? false,
+      queued: opts?.queued ?? false,
     };
     const buf = st.sessionsMap[path] ? [...st.sessionsMap[path], userMsg] : [userMsg];
     const sessionsMap = { ...st.sessionsMap, [path]: buf };

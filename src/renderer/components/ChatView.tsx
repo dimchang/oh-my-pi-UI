@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApp, type ChatMessage } from '../store';
 import { ToolCard } from './ToolCard';
+import { Icon } from './Icon';
 
 /** 正文里 markdown 代码块默认折叠（超过 ~6 行时收起） */
 const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown }> = ({ children, node: _node }) => {
@@ -40,9 +41,12 @@ const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown
 
 const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
   return (
-    <div className={`message ${msg.role}`} style={msg.error ? { borderLeft: '2px solid var(--red)', paddingLeft: 10 } : undefined}>
+    <div
+      className={`message ${msg.role}${msg.steered ? ' steered' : ''}${msg.queued ? ' queued' : ''}`}
+      style={msg.error ? { borderLeft: '2px solid var(--red)', paddingLeft: 10 } : undefined}
+    >
       <div className={`msg-role ${msg.role}`} style={msg.error ? { color: 'var(--red)' } : undefined}>
-        {msg.role === 'user' ? '你' : 'MyPi'}{msg.error ? ' · 出错' : ''}
+        {msg.steered ? (<><Icon name="guide" size={12} /> 引导 (mid-run)</>) : msg.queued ? (<><Icon name="queue" size={12} /> 排队</>) : (msg.role === 'user' ? '你' : 'MyPi')}{msg.error ? ' · 出错' : ''}
       </div>
       <div className="msg-body">
         {msg.parts.map((p, i) => {

@@ -33,6 +33,10 @@ export const rpc = {
   getSessionStats: (sp: string) => send<{ totalTokens?: number; totalCost?: number; messageCount?: number }>(sp, { type: 'get_session_stats' }),
 
   prompt: (sp: string, message: string) => send(sp, { type: 'prompt', message }),
+  /** 引导：当前 tool 完成后立即按新方向继续（mid-run 中断，OMP 源码注释确认）。 */
+  steer: (sp: string, message: string) => send(sp, { type: 'steer', message }),
+  /** 排队：把消息追加到当前会话末尾，等当前 agent turn 跑完后处理（不打断当前 tool/t）。 */
+  followUp: (sp: string, message: string) => send(sp, { type: 'follow_up', message }),
   abort: (sp: string) => send(sp, { type: 'abort' }),
   newSession: (sp: string) => send(sp, { type: 'new_session' }),
   setModel: (sp: string, provider: string, modelId: string) =>

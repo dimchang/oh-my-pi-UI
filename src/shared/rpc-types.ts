@@ -93,6 +93,9 @@ export interface AgentMessage {
   errorMessage?: string;
   // issue 91: 未知字段收进显式 extra，替代宽松索引签名（避免所有属性访问退化为 unknown）
   extra?: Record<string, unknown>;
+  /** 由 steer 命令产生的用户消息会带此标记（message_start / agent_end.messages 均可见）。
+   *  UI 据此把"改写方向"与普通 prompt 区分渲染。 */
+  steering?: boolean;
 }
 
 /** 历史回放消息：AgentMessage 基础上，由 readSessionMessages 附加工具调用参数，
@@ -118,6 +121,27 @@ export interface RpcCommandBase {
 export interface PromptCommand extends RpcCommandBase {
   type: 'prompt';
   /** 用户输入文本（实测字段名为 message） */
+  message: string;
+}
+
+/** steer：引导当前 agent 轮次（mid-run 中断）。
+ *  实测（probe-steer.mjs / probe-steer-v5.mjs）：
+ *  - 字段名同 prompt 用 `message`（`text` 报 "i.startsWith" 错误）。
+ *  - omp 源码注释：\"Queue a steering message to interrupt the agent mid-run.
+ *    Delivered after current tool execution, skips remaining tools.\"
+ *  - 生成中途发送：当前 tool 完成后立即投递 + 跳过剩余 tool + 走一次模型处理，**不打断当前 tool**。
+ *  - 空闲时发送：起一个新 user 轮，消息带 `steering:true` 标记（区别于普通 prompt）。
+ *  帧流里 user 消息会带 `steering:true`（message_start / agent_end.messages），UI 据此区分渲染。 */
+export interface SteerCommand extends RpcCommandBase {
+  type: 'steer';
+  /** 引导文本（字段名同 prompt：message） */
+  message: string;
+}
+
+/** follow_up：把消息追加到当前会话末尾，等当前 agent turn 跑完后处理（不打断、不 mid-run 介入）。
+ *  字段名同 prompt：message。空闲时等价于普通 prompt。 */
+export interface FollowUpCommand extends RpcCommandBase {
+  type: 'follow_up';
   message: string;
 }
 
@@ -160,6 +184,8 @@ export interface ExtensionUIResponseCommand extends RpcCommandBase {
 
 export type RpcCommand =
   | PromptCommand
+  | SteerCommand
+  | FollowUpCommand
   | SetModelCommand
   | SwitchSessionCommand
   | SetSessionNameCommand
