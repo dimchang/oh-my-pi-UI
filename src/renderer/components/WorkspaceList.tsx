@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useApp } from '../store';
 import { SessionList } from './SessionList';
+import { ProjectSettingsModal } from './ProjectSettingsModal';
 import { Icon } from './Icon';
 import { cwdKey } from '../utils/path-key';
 import type { SessionSummary, Workspace } from '../../shared/ipc-channels';
@@ -76,6 +77,7 @@ export const WorkspaceList: React.FC<{
   const [renameValue, setRenameValue] = useState('');
   const [archiveExpanded, setArchiveExpanded] = useState(false);
   const [deleteArchivedTarget, setDeleteArchivedTarget] = useState<Workspace | null>(null);
+  const [projSettingsTarget, setProjSettingsTarget] = useState<Workspace | null>(null);
   const closeMenu = () => setMenu(null);
 
   // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
@@ -335,6 +337,7 @@ export const WorkspaceList: React.FC<{
         >
           <div className="ctx-item" onClick={() => handleNewSession(menu.ws)}>新建会话</div>
           <div className="ctx-item" onClick={() => handleRename(menu.ws)}>重命名</div>
+          <div className="ctx-item" onClick={() => { setProjSettingsTarget(menu.ws); closeMenu(); }}>项目设置</div>
           <div className="ctx-item" onClick={() => handleOpenInExplorer(menu.ws)}>在文件管理器中打开</div>
           <div className="ctx-sep" />
           <div className="ctx-item" onClick={() => handleArchive(menu.ws)}>归档</div>
@@ -387,6 +390,11 @@ export const WorkspaceList: React.FC<{
             </div>
           </div>
         </div>
+      )}
+
+      {projSettingsTarget && createPortal(
+        <ProjectSettingsModal ws={projSettingsTarget} onClose={() => setProjSettingsTarget(null)} />,
+        document.body
       )}
     </div>
   );

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApp, type ChatMessage } from '../store';
@@ -12,11 +12,13 @@ const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown
   const [needsCollapse, setNeedsCollapse] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = preRef.current;
     if (!el) return;
-    // 150px ≈ 120px max-height + padding；超出则显示折叠按钮
-    setNeedsCollapse(el.scrollHeight > 150);
+    // 150px ≈ 120px max-height + padding；超出则显示折叠按钮。
+    // 用函数式更新并与当前值比较，避免 children 每次渲染都是新引用导致的重渲染循环（issue 14）
+    const shouldCollapse = el.scrollHeight > 150;
+    setNeedsCollapse((prev) => (prev === shouldCollapse ? prev : shouldCollapse));
   }, [children]);
 
   return (
@@ -40,7 +42,7 @@ const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown
   );
 };
 
-const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
+const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage }) {
   return (
     <div
       className={`message ${msg.role}${msg.steered ? ' steered' : ''}${msg.queued ? ' queued' : ''}`}
@@ -89,7 +91,7 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
               className="msg-attachment-chip"
               key={a.path}
               title={a.path}
-              onClick={() => { void window.omp.openExternal(a.path).catch(() => undefined); }}
+              onClick={() => { void window.omp.showItemInFolder(a.path).catch(() => undefined); }}
             >
               <Icon name="file" size={13} />
               <span>{a.name}</span>
@@ -104,7 +106,12 @@ const MessageItem: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
       )}
     </div>
   );
-};
+});
+
+/** 虚拟化窗口：初始只渲染最后 N 条消息，滚动到顶部时加载更多。
+ *  避免数百条消息（每条含多个 ToolCard）一次性渲染导致 DOM 爆炸。 */
+const INITIAL_WINDOW = 80;
+const LOAD_MORE_COUNT = 60;
 
 export const ChatView: React.FC = () => {
   const messages = useApp((s) => s.messages);
@@ -114,6 +121,20 @@ export const ChatView: React.FC = () => {
   const retryInfo = useApp((s) => s.retryInfo);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
+  // 虚拟化：当前可见窗口大小（从末尾往前数）
+  const [windowSize, setWindowSize] = useState(INITIAL_WINDOW);
+  // 消息总数变化时重置窗口（切换会话）
+  const prevLenRef = useRef(messages.length);
+  if (messages.length < prevLenRef.current) {
+    // 会话切换（消息数减少）→ 重置窗口
+    setWindowSize(INITIAL_WINDOW);
+  }
+  prevLenRef.current = messages.length;
+
+  const total = messages.length;
+  const startIdx = Math.max(0, total - windowSize);
+  const visible = messages.slice(startIdx);
+  const hasMore = startIdx > 0;
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -124,19 +145,36 @@ export const ChatView: React.FC = () => {
     const el = scrollRef.current;
     if (!el) return;
     stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    // 滚动到顶部时加载更多历史消息
+    if (el.scrollTop < 100 && hasMore) {
+      const prevScrollHeight = el.scrollHeight;
+      setWindowSize((w) => w + LOAD_MORE_COUNT);
+      // 保持滚动位置（避免加载更多后跳到顶部）
+      requestAnimationFrame(() => {
+        const newEl = scrollRef.current;
+        if (newEl) newEl.scrollTop = newEl.scrollHeight - prevScrollHeight;
+      });
+    }
   };
 
   return (
     <div className="chat-area">
       <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
         <div className="chat-inner">
-          {messages.length === 0 && !isCompacting && !isRetrying ? (
+          {total === 0 && !isCompacting && !isRetrying ? (
             <div className="chat-empty">
               <h2>有什么可以帮你的？</h2>
               <p>输入任务，MyPi 会读写文件、跑命令来完成。</p>
             </div>
           ) : (
-            messages.map((m) => <MessageItem key={m.id} msg={m} />)
+            <>
+              {hasMore && (
+                <div className="chat-load-more" style={{ textAlign: 'center', padding: '8px 0', color: 'var(--text-faint)', fontSize: 12 }}>
+                  ↑ 滚动加载更多（剩余 {startIdx} 条）
+                </div>
+              )}
+              {visible.map((m) => <MessageItem key={m.id} msg={m} />)}
+            </>
           )}
           {isCompacting && (
             <div className="status-bubble compacting">

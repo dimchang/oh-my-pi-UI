@@ -19,6 +19,7 @@ import type {
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 import { buildThemeCSS, getThemePreset } from './themes';
+import { extractDiff } from './components/DiffView';
 
 export type PartKind = 'text' | 'thinking' | 'tool';
 
@@ -142,8 +143,10 @@ interface AppState {
   retryInfo: string;
   compactionInfo: string;
   sessionStats?: { totalTokens?: number; totalCost?: number; messageCount?: number };
+  /** 右栏 Diff 面板内容：从 tool_execution_end 结果中提取的 unified diff 列表。 */
+  diffs: Array<{ toolName: string; diff: string }>;
   /** 右栏标签：off|files|diff|todo */
-  rightPanel: 'off' | 'files' | 'todo';
+  rightPanel: 'off' | 'files' | 'todo' | 'diff';
   /** 主工作区视图：chat=对话，skills=技能/插件面板 */
   mainView: 'chat' | 'skills';
   setMainView(v: 'chat' | 'skills'): void;
@@ -152,9 +155,9 @@ interface AppState {
   /** 配置页是否打开（全屏 overlay） */
   settingsOpen: boolean;
   /** 配置页左侧当前选中标签 */
-  settingsTab: 'system' | 'agent' | 'model';
+  settingsTab: 'system' | 'agent' | 'context' | 'model';
   setSettingsOpen(v: boolean): void;
-  setSettingsTab(tab: 'system' | 'agent' | 'model'): void;
+  setSettingsTab(tab: 'system' | 'agent' | 'context' | 'model'): void;
   /** 模型启用白名单（key = `${provider}/${modelId}`）。
    *  undefined/空 = 未配置 → ModelPicker 显示全部；非空 = 只显示白名单内的。 */
   enabledModels?: string[];
@@ -305,6 +308,10 @@ function contentToParts(msg: AgentMessage): MessagePart[] {
   return parts;
 }
 
+// issue 10：persistWorkspaces 去抖。多次高频触发时只在静默窗口后写一次，
+// 且 flush 时读取最新 store 状态，避免用旧数据覆盖新数据。
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   ompExited: false,
@@ -325,6 +332,7 @@ export const useApp = create<AppState>((set, get) => ({
   retryInfo: '',
   compactionInfo: '',
   rightPanel: 'off',
+  diffs: [],
   mainView: 'chat',
   settingsOpen: false,
   settingsTab: 'model',
@@ -356,9 +364,11 @@ export const useApp = create<AppState>((set, get) => ({
     let next: string[] | undefined;
     if (cur === undefined) {
       // 首次操作：从"显示全部"切换到白名单模式。
-      // 先用 allKeys 初始化全集，再剔除本次取消的 key，避免"首次取消就丢失全部模型"。
-      const all = allKeys && allKeys.length ? allKeys : [];
-      next = all.filter((k) => k !== key);
+      // 必须用真实的全部模型 key 初始化、再剔除本次取消的 key（只禁用那一个），
+      // 否则若 allKeys 为空会把白名单初始化成 [] → 所有模型被禁用且 UI 上像"全消失"（issue #4）。
+      // 当 allKeys 为空（如模型尚在加载、调用方未传入）时跳过本次操作，保持"显示全部"，避免误伤。
+      if (!allKeys || allKeys.length === 0) return;
+      next = allKeys.filter((k) => k !== key);
     } else {
       // 已在白名单模式：toggle 该 key
       const has = cur.includes(key);
@@ -386,7 +396,20 @@ export const useApp = create<AppState>((set, get) => ({
     set({ hooks: v });
     get().persistWorkspaces();
   },
-  setOmpExited: (code) => set({ ompExited: code, isStreaming: false, isAborting: false }),
+  setOmpExited: (code) =>
+    set((s) => {
+      // code === null 表示 omp 已上线/恢复，仅清全局流式标志，不动 per-session 状态
+      if (code === null) {
+        return { ompExited: null, isStreaming: false, isAborting: false };
+      }
+      // issue 20: omp 进程已退出，所有会话绑定的进程一并失效。重置 per-session procState，
+      // 避免 acquireSession 误判某会话仍在线而复用已退出的进程。
+      const procStateMap: Record<string, ProcState> = {};
+      for (const [k, v] of Object.entries(s.procStateMap)) {
+        procStateMap[k] = { ...v, status: 'offline', isStreaming: false, isAborting: false };
+      }
+      return { ompExited: code, isStreaming: false, isAborting: false, procStateMap };
+    }),
   setStreaming: (v) => set({ isStreaming: v }),
   setAborting: (v) => set({ isAborting: v }),
   setState: (partial) => set(partial),
@@ -394,7 +417,7 @@ export const useApp = create<AppState>((set, get) => ({
     set((s) => ({ stderrTail: [...s.stderrTail.slice(-199), line] })),
 
   setSessions: (list) => set({ sessions: list }),
-  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [] }),
+  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [] }),
 
   // M5: 工作空间
   workspaces: [],
@@ -582,26 +605,32 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   persistWorkspaces: () => {
-    const s = get();
-    const file: WorkspacesFile = {
-      version: 1,
-      workspaces: s.workspaces,
-      currentId: s.currentWorkspaceId,
-      archived: s.archived,
-      removedCwds: s.removedCwds,
-      lastModel: s.lastModel,
-      enabledModels: s.enabledModels,
-      systemPrompt: s.systemPrompt,
-      appearance: s.appearance,
-      hooks: s.hooks,
-      inputBehavior: s.inputBehavior,
-    };
-    // 动态 import 避免循环依赖（rpc-client 也 import store）
-    void import('./rpc-client').then(({ rpc }) => {
-      void rpc.saveWorkspaces(file).catch((e) =>
-        get().pushToast(`保存工作空间配置失败：${e instanceof Error ? e.message : String(e)}`, 'error'),
-      );
-    });
+    // issue 10：并发/高频写入去抖。多次触发时仅在静默 120ms 后写一次，
+    // 且 flush 时读取最新 store 状态构建 file，避免用旧数据覆盖新数据。
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      const s = get();
+      const file: WorkspacesFile = {
+        version: 1,
+        workspaces: s.workspaces,
+        currentId: s.currentWorkspaceId,
+        archived: s.archived,
+        removedCwds: s.removedCwds,
+        lastModel: s.lastModel,
+        enabledModels: s.enabledModels,
+        systemPrompt: s.systemPrompt,
+        appearance: s.appearance,
+        hooks: s.hooks,
+        inputBehavior: s.inputBehavior,
+      };
+      // 动态 import 避免循环依赖（rpc-client 也 import store）
+      void import('./rpc-client').then(({ rpc }) => {
+        void rpc.saveWorkspaces(file).catch((e) =>
+          get().pushToast(`保存工作空间配置失败：${e instanceof Error ? e.message : String(e)}`, 'error'),
+        );
+      });
+    }, 120);
   },
 
   enqueueUi: (req) =>
@@ -620,6 +649,8 @@ export const useApp = create<AppState>((set, get) => ({
   resetChat: () => {
     const st = get();
     const path = st.currentSessionPath ?? '';
+    // 没有当前会话时不创建 key='' 的幽灵条目（issue 12）
+    if (!path) return;
     const sessionsMap = { ...st.sessionsMap, [path]: [] };
     const procStateMap = {
       ...st.procStateMap,
@@ -857,6 +888,15 @@ export const useApp = create<AppState>((set, get) => ({
           result,
         }));
         bufferTouched = true;
+        // 提取 diff 到右栏面板（仅当前显示会话）
+        if (isDisplay && !isError) {
+          const diffText = extractDiff(result);
+          if (diffText) {
+            const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
+            const curDiffs = get().diffs;
+            set({ diffs: [...curDiffs.slice(-19), { toolName, diff: diffText }] });
+          }
+        }
         // omp 把待办建模成 "todo" 工具：当前显示会话时，把结构化结果同步到全局 Todo 面板
         if (isDisplay && (frame.toolName === 'todo' || frame.name === 'todo')) {
           const phases = normalizeTodoPhases(result);

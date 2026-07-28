@@ -33,6 +33,12 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   const busyRef = React.useRef(false);
   const lastPayload = React.useRef<{ value?: string; confirmed?: boolean; cancelled?: boolean }>({});
 
+  // open_url 请求：批准后才真正打开链接（issue #5）。req.raw.method 在 App 中保留为 'open_url'。
+  const openUrl = (req.raw as unknown as { __openUrl?: string; method?: string } | undefined)?.['__openUrl']
+    ?? (req.raw as unknown as { __openUrl?: string; method?: string } | undefined)?.method === 'open_url'
+      ? (req.launchUrl ?? req.url)
+      : undefined;
+
   const respond = async (payload: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
     // 防重复点击：RPC 进行中直接丢弃后续调用
     if (busyRef.current) return;
@@ -46,6 +52,10 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
       if (payload.confirmed && always) {
         const tool = toolNameOf(req);
         if (tool) useApp.getState().setPermAllow(req.sessionPath ?? '', tool);
+      }
+      // open_url：用户批准后才打开外部链接（scheme 由主进程 OpenExternal 再次校验为 http/https）。
+      if (payload.confirmed && openUrl) {
+        void window.omp.openExternal(openUrl).catch(() => undefined);
       }
     } catch (e) {
       // 进程已离线（被 LRU 淘汰 / 崩溃 / temp→real 迁移没跟上）：保持弹窗，给重试/关闭。
@@ -67,10 +77,12 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
         return (
           <>
             <div className="modal-message">{req.message ?? req.prompt ?? '确认执行此操作？'}</div>
-            <label className="modal-check">
-              <input type="checkbox" checked={always} onChange={(e) => setAlways(e.target.checked)} />
-              始终允许此工具（本会话）
-            </label>
+            {!openUrl && (
+              <label className="modal-check">
+                <input type="checkbox" checked={always} onChange={(e) => setAlways(e.target.checked)} />
+                始终允许此工具（本会话）
+              </label>
+            )}
             <div className="modal-actions">
               <button className="btn" onClick={() => respond({ confirmed: false })} disabled={busy}>拒绝</button>
               <button className="btn btn-primary" onClick={() => respond({ confirmed: true })} disabled={busy}>

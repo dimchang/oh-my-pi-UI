@@ -2,14 +2,27 @@ import React, { useState } from 'react';
 import type { ToolPart } from '../store';
 import { DiffView, extractDiff } from './DiffView';
 
+// 工具结果预览的最大字符数，超过则截断，避免超大结果（如整文件内容）撑爆 DOM 导致卡顿（issue 15）
+const MAX_TOOL_PREVIEW = 20000;
+
 function stringify(v: unknown): string {
   if (v === undefined || v === null) return '';
-  if (typeof v === 'string') return v;
-  try {
-    return JSON.stringify(v, null, 2);
-  } catch {
-    return String(v);
+  if (typeof v === 'string') {
+    if (v.length > MAX_TOOL_PREVIEW) {
+      return v.slice(0, MAX_TOOL_PREVIEW) + `\n\n… (内容已截断，原始长度 ${v.length} 字符)`;
+    }
+    return v;
   }
+  let s: string;
+  try {
+    s = JSON.stringify(v, null, 2);
+  } catch {
+    s = String(v);
+  }
+  if (s.length > MAX_TOOL_PREVIEW) {
+    return s.slice(0, MAX_TOOL_PREVIEW) + `\n\n… (内容已截断，原始长度 ${s.length} 字符)`;
+  }
+  return s;
 }
 
 /** 针对不同工具做友好摘要 */
@@ -30,7 +43,7 @@ function summaryOf(tool: ToolPart): string {
   return '';
 }
 
-export const ToolCard: React.FC<{ tool: ToolPart }> = ({ tool }) => {
+export const ToolCard = React.memo(function ToolCard({ tool }: { tool: ToolPart }) {
   const [open, setOpen] = useState(tool.status === 'error');
   const diff = extractDiff(tool.result);
   const summary = summaryOf(tool);
@@ -80,4 +93,4 @@ export const ToolCard: React.FC<{ tool: ToolPart }> = ({ tool }) => {
       )}
     </div>
   );
-};
+});

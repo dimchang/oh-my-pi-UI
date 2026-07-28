@@ -66,6 +66,10 @@ export const IPC = {
   OmpPickCssFile: 'omp:pick-css-file', // () => Promise<string | null> — 选择 .css 文件（单选）
   OmpReadCssFile: 'omp:read-css-file', // (path: string) => Promise<{ content: string; error?: string }> — 读取 CSS 文件内容
   OmpSyncCustomCss: 'omp:sync-custom-css', // (list: CustomCssConfig[]) => Promise<{ error?: string }> — 同步自定义 CSS 到 styles.css
+
+  // 上下文文件（AGENTS.md / SYSTEM.md / APPEND_SYSTEM.md / RULES.md）读写
+  ContextFileRead: 'context:read', // (filePath: string) => Promise<string> — 读取上下文文件（不存在返回空串）
+  ContextFileWrite: 'context:write', // (filePath: string, content: string) => Promise<void> — 写入上下文文件（自动创建目录）
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -269,14 +273,17 @@ export interface OmpProviderConfig {
 /** models.yml 顶层结构 */
 export interface OmpModelsConfig {
   providers?: Record<string, OmpProviderConfig>;
-  [k: string]: unknown;
+  // issue 16: 移除宽松索引签名 [k: string]: unknown，改为显式键；
+  // 顶层未知键不再被任意访问，类型检查能捕获拼写错误。
 }
 
 /** preload 暴露给 window.omp 的 API 形状 */
 export interface OmpApi {
   /** 运行平台，用于 renderer 判断是否需要绘制自定义标题栏等 */
   platform: 'win32' | 'darwin' | 'linux' | string;
-  send(sessionPath: string, cmd: RpcCommand): Promise<unknown>;
+  // issue 18: 泛型化返回类型，调用方可声明期望的响应类型（如 send<MyData>(...)），
+  // 不再强制 any/unknown 断言；preload 实现返回 Promise<any> 可安全赋给 Promise<T>。
+  send<T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T>;
   /** 懒拉起某会话的进程（带 -c 续接历史）。已在线则 no-op。 */
   acquire(sessionPath: string, cwd: string, approvalMode?: ApprovalMode): Promise<void>;
   /** 新建会话：spawn 不带 -c，返回新 sessionPath（主进程 listSessions 解析最新）。 */
@@ -352,4 +359,10 @@ export interface OmpApi {
   readCssFile(path: string): Promise<{ content: string; error?: string }>;
   /** 把当前自定义 CSS 列表同步到 styles.css（embed=写入内容；link=顶部 @import；禁用项移除） */
   syncCustomCss(list: CustomCssConfig[]): Promise<{ error?: string }>;
+
+  // 上下文文件读写（AGENTS.md / SYSTEM.md / APPEND_SYSTEM.md / RULES.md）
+  /** 读取上下文文件（不存在返回空串） */
+  readContextFile(filePath: string): Promise<string>;
+  /** 写入上下文文件（自动创建父目录，空内容则删除文件） */
+  writeContextFile(filePath: string, content: string): Promise<void>;
 }

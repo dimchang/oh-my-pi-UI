@@ -1,10 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp, type Attachment } from '../store';
+import { rpc } from '../rpc-client';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
 import { PermissionPicker } from './PermissionPicker';
 import { Icon } from './Icon';
 import type { ApprovalMode } from '../../shared/ipc-channels';
+import type { SlashCommand } from '../../shared/rpc-types';
 
 export const InputBox: React.FC<{
   onSend: (text: string, attachments?: Attachment[]) => void;
@@ -46,13 +48,37 @@ export const InputBox: React.FC<{
     }
   }, [draftInput, setDraftInput]);
 
+  // 兜底：用户输入 / 但命令列表为空时，主动拉取一次（防止 onReady 时拉取失败导致永远无命令）
+  const cmdFetchedRef = useRef(false);
+  useEffect(() => {
+    if (draft.startsWith('/') && slashCommands.length === 0 && !cmdFetchedRef.current) {
+      cmdFetchedRef.current = true;
+      const sp = useApp.getState().currentSessionPath;
+      if (sp) {
+        void rpc.getAvailableCommands(sp).then((r) => {
+          if (r.success && r.data) {
+            const cmds = r.data.commands;
+            if (Array.isArray(cmds) && cmds.length > 0) {
+              useApp.getState().setState({ slashCommands: cmds as SlashCommand[] });
+            }
+          }
+        }).catch(() => undefined);
+      }
+      // 5秒后允许再次尝试（避免永久锁死）
+      setTimeout(() => { cmdFetchedRef.current = false; }, 5000);
+    }
+  }, [draft, slashCommands]);
+
   const slashMatch = useMemo(() => {
     if (!draft.startsWith('/')) return null;
-    const q = (draft.slice(1).split(/\s/)[0] ?? '').toLowerCase();
+    const afterSlash = draft.slice(1);
+    // 命令名后出现空格 → 用户正在输入参数，关闭弹窗让 Enter 正常提交
+    if (/\s/.test(afterSlash)) return null;
+    const q = afterSlash.toLowerCase();
     const list = slashCommands.filter(
       (c) => c.name.toLowerCase().startsWith(q) || c.aliases?.some((a) => a.toLowerCase().startsWith(q)),
     );
-    return { q, list: list.slice(0, 12) };
+    return { q, list };
   }, [draft, slashCommands]);
 
   const autoGrow = () => {
@@ -82,9 +108,9 @@ export const InputBox: React.FC<{
     setAttachments((prev) => prev.filter((a) => a.path !== path));
   };
 
-  // 打开附件：本地文件走 shell.openPath（window.omp.openExternal 已对本地路径回退 openPath）
+  // 打开附件：本地文件走 shell.showItemInFolder（在文件管理器中定位并高亮）
   const openAttachment = (path: string) => {
-    void window.omp.openExternal(path).catch((err) => console.error('openAttachment 失败', err));
+    void window.omp.showItemInFolder(path).catch((err) => console.error('openAttachment 失败', err));
   };
 
   /**
@@ -123,7 +149,18 @@ export const InputBox: React.FC<{
       if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
         e.preventDefault();
         const c = slashMatch.list[selIdx];
-        if (c) setDraft('/' + c.name + ' ');
+        if (c) {
+          const takesArgs = !!(c.input?.hint || (c.subcommands && c.subcommands.length > 0));
+          if (takesArgs) {
+            // 需要参数的命令：补全名称 + 空格，让用户继续输入参数
+            setDraft('/' + c.name + ' ');
+          } else {
+            // 无参数命令：补全后直接提交
+            setDraft('');
+            requestAnimationFrame(autoGrow);
+            onSend('/' + c.name);
+          }
+        }
         return;
       }
     }
@@ -164,9 +201,21 @@ export const InputBox: React.FC<{
               <div
                 key={c.name}
                 className={`slash-item ${i === selIdx ? 'sel' : ''}`}
-                onMouseDown={(e) => { e.preventDefault(); setDraft('/' + c.name + ' '); taRef.current?.focus(); }}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  const takesArgs = !!(c.input?.hint || (c.subcommands && c.subcommands.length > 0));
+                  if (takesArgs) {
+                    setDraft('/' + c.name + ' ');
+                    taRef.current?.focus();
+                  } else {
+                    setDraft('');
+                    requestAnimationFrame(autoGrow);
+                    onSend('/' + c.name);
+                  }
+                }}
               >
                 <span className="slash-name">/{c.name}</span>
+                {c.input?.hint && <span className="slash-hint">{c.input.hint}</span>}
                 <span className="slash-desc">{c.description ?? ''}</span>
               </div>
             ))}

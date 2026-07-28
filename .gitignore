@@ -56,3 +56,6 @@ minimap-density-scrollbar.md
 
 # ===== Runtime temp dir (omp stderr logs, etc.) =====
 .temp/
+
+# ===== Local agent/IDE workspace cache (like .workbuddy) =====
+.qoder/

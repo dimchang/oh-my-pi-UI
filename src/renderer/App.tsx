@@ -11,6 +11,7 @@ import { PermissionModal } from './components/PermissionModal';
 import { FileTree } from './components/FileTree';
 import { TitleBar } from './components/TitleBar';
 import { TodoPanel } from './components/TodoPanel';
+import { DiffView } from './components/DiffView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
 import { applyAppearance } from './store';
@@ -30,7 +31,7 @@ export default function App(): React.ReactElement {
     useApp.getState().pushToast(text, level);
   }, []);
 
-  const togglePanel = useCallback((panel: 'files' | 'todo') => {
+  const togglePanel = useCallback((panel: 'files' | 'todo' | 'diff') => {
     const st = useApp.getState();
     st.setState({ rightPanel: st.rightPanel === panel ? 'off' : panel });
   }, []);
@@ -81,16 +82,26 @@ export default function App(): React.ReactElement {
       .catch(() => undefined);
   }, []);
 
-  /** 拉取某会话进程的可用技能 / 命令列表。 */
-  const refreshCommands = useCallback((sessionPath: string): void => {
+  /** 拉取某会话进程的可用技能 / 命令列表。
+   *  若首次返回空（omp 刚 ready 可能尚未注册完命令），自动延迟重试一次。 */
+  const refreshCommands = useCallback((sessionPath: string, retry = true): void => {
     void rpc.getAvailableCommands(sessionPath).then((r) => {
       if (r.success && r.data) {
         const cmds = r.data.commands;
         if (Array.isArray(cmds) && cmds.length > 0) {
           useApp.getState().setState({ slashCommands: cmds as SlashCommand[] });
+          return;
         }
       }
-    }).catch(() => undefined);
+      // 返回空 / 失败：延迟重试一次（omp 刚 ready 时命令可能尚未全部注册）
+      if (retry) {
+        setTimeout(() => refreshCommands(sessionPath, false), 1500);
+      }
+    }).catch(() => {
+      if (retry) {
+        setTimeout(() => refreshCommands(sessionPath, false), 1500);
+      }
+    });
   }, []);
 
   /** 迁移中的 temp key 集合（并发保护）：同一 __new_ 会话的多次 agent_end 只处理一次。 */
@@ -190,7 +201,13 @@ export default function App(): React.ReactElement {
       }
       if (f.type === 'notice') {
         const n = frame as { message?: string; level?: string };
-        if (n.message) pushToast(n.message, n.level ?? 'info');
+        if (n.message) {
+          // 抑制 omp 启动时的 MCP 挂载噪声：通知消息以 `xd://` 开头说明是 omp 内部扩展协议
+          // （如 `xd://: mounted mcp__node_repl_js, mcp__node_repl_js_add_node_module_dir, ...`），
+          // 属于每次启动都会刷的运行时注册日志，对用户无意义，弹窗只会污染视线。直接丢弃。
+          if (/^xd:\/\//i.test(n.message)) return;
+          pushToast(n.message, n.level ?? 'info');
+        }
         return;
       }
       if (f.type === 'thinking_level_changed') {
@@ -232,9 +249,36 @@ export default function App(): React.ReactElement {
 
     const offExit = window.omp.onExit(({ sessionPath, code }) => {
       useApp.getState().setProcState(sessionPath, { status: 'offline', isStreaming: false, isAborting: false });
-      // 仅当退出的是当前显示会话，弹"已退出"遮罩
+      // 仅当退出的是当前显示会话，弹“已退出”遮罩
       if (sessionPath === useApp.getState().currentSessionPath) {
         useApp.getState().setOmpExited(code);
+      }
+      // 自动恢复：非正常退出（code !== 0）且非用户主动 release，延迟后尝试重新拉起。
+      // 避免崩溃后用户必须手动切换再切回才能继续。
+      if (code !== 0 && code !== null) {
+        const st = useApp.getState();
+        const ws = st.workspaces.find((w) => st.sessions.some((s) => s.path === sessionPath && cwdKey(s.cwd) === cwdKey(w.cwd)));
+        const cwd = ws?.cwd;
+        if (cwd) {
+          const approvalMode = ws?.approvalMode ?? 'write';
+          setTimeout(() => {
+            // 仅当该会话仍处于 offline 状态时才恢复（避免用户已手动操作）
+            const ps = useApp.getState().procStateMap[sessionPath];
+            if (ps?.status === 'offline') {
+              void rpc.acquire(sessionPath, cwd, approvalMode)
+                .then(() => {
+                  useApp.getState().pushToast(`会话进程已自动恢复`, 'info');
+                  // 如果恢复的是当前显示会话，清除退出遮罩
+                  if (sessionPath === useApp.getState().currentSessionPath) {
+                    useApp.getState().setOmpExited(null);
+                  }
+                })
+                .catch(() => {
+                  // 恢复失败不弹错，用户可手动切换触发重试
+                });
+            }
+          }, 2000);
+        }
       }
     });
 
@@ -457,7 +501,9 @@ export default function App(): React.ReactElement {
       // 已在线：刷新状态栏（model/thinking 等可能与其他会话不同）
       void refreshState(s.path);
     }
-  }, [pushToast, refreshState]);
+    // 无论在线与否都刷新命令列表（在线直接拉，离线等 acquire → onReady 再拉一次）
+    if (ps?.status === 'online') refreshCommands(s.path);
+  }, [pushToast, refreshState, refreshCommands]);
 
   const onDeleteSession = useCallback((s: SessionSummary) => {
     // 删除会话：先释放该会话的进程（避免占用池），再删磁盘文件
@@ -561,8 +607,11 @@ export default function App(): React.ReactElement {
       if (cwdKey(s.cwd) === cwdKey(ws.cwd)) {
         const ps = st.procStateMap[s.path];
         if (ps && ps.status === 'online') {
-          void rpc.release(s.path).catch(() => undefined);
-          st.setProcState(s.path, { status: 'offline' });
+          // 先等待 release 成功，再置 offline；release 失败则保持 online，
+          // 避免「状态已是 offline 但进程实际仍在线」的不同步（issue 11）
+          void rpc.release(s.path)
+            .then(() => st.setProcState(s.path, { status: 'offline' }))
+            .catch(() => undefined);
         }
       }
     }
@@ -689,6 +738,13 @@ export default function App(): React.ReactElement {
             >
               <Icon name="todo" size={16} />
             </button>
+            <button
+              className={`icon-btn ${rightPanel === 'diff' ? 'active' : ''}`}
+              onClick={() => togglePanel('diff')}
+              title="Diff 视图"
+            >
+              <Icon name="diff" size={16} />
+            </button>
           </div>
         </div>
         {mainView === 'skills' ? (
@@ -711,6 +767,7 @@ export default function App(): React.ReactElement {
             return wd ? <FileTree cwd={wd} /> : <div className="panel-empty">请先选择工作空间</div>;
           })()}
           {rightPanel === 'todo' && <TodoPanel />}
+          {rightPanel === 'diff' && <DiffPanel />}
         </div>
       )}
       </div>
@@ -753,6 +810,27 @@ export default function App(): React.ReactElement {
 /** 是否 Windows（模块级常量，避免每次 render 都访问 window.omp.platform）。 */
 const IS_WIN32 = window.omp?.platform === 'win32';
 
+/** Diff 右栏面板：展示从 tool_execution_end 提取的 unified diff 列表。 */
+const DiffPanel: React.FC = () => {
+  const diffs = useApp((s) => s.diffs);
+  if (diffs.length === 0) {
+    return <div className="panel-empty">暂无 Diff（工具执行产生的文件修改会显示在这里）</div>;
+  }
+  return (
+    <div className="diff-panel">
+      <div className="panel-header">Diff 视图 ({diffs.length})</div>
+      <div className="diff-panel-scroll">
+        {diffs.map((d, i) => (
+          <details key={i} className="diff-block" open={i === diffs.length - 1}>
+            <summary>{d.toolName}</summary>
+            <DiffView diff={d.diff} />
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 /** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */
 /** 把附件绝对路径拼进发给 omp 的 prompt（agent 用其文件读取工具按需读取）。
  *  UI 里消息正文保持用户原文本、附件以芯片展示，不污染正文可读性。
@@ -787,12 +865,19 @@ function handleUiRequest(
     return;
   }
   if (method === 'open_url') {
-    // open_url 是单向通知，不应入队弹窗（无法自动清除）；直接打开并自动放行应答。
+    // open_url 原实现直接打开并自动放行（confirmed:true），用户无法审查 URL，存在钓鱼/恶意下载风险。
+    // 改为入队 confirm 请求，让用户审核 URL 后再决定是否打开（issue #5）。
+    // 通过 raw.__openUrl 把待打开链接带给 PermissionModal，用户批准后才真正打开。
     const url = req.launchUrl ?? req.url;
-    if (url) void window.omp.openExternal(url);
-    const sp = req.__sessionPath;
-    if (sp) void Promise.resolve(rpc.respondUI(sp, { id: req.id, confirmed: true }))
-      .catch(() => pushToast(`打开链接放行失败`, 'error'));
+    if (!url) return;
+    const ui = toUiRequest(req);
+    st.enqueueUi({
+      ...ui,
+      method: 'confirm',
+      title: ui.title ?? '打开外部链接',
+      message: `是否打开以下外部链接？\n\n${url}`,
+      raw: { ...req, __openUrl: url, __sessionPath: req.__sessionPath },
+    });
     return;
   }
   if (method === 'cancel') {

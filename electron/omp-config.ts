@@ -18,6 +18,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { parseDocument, Document, YAMLMap } from 'yaml';
 import type { OmpModelsConfig, OmpProviderConfig } from '../src/shared/ipc-channels';
 
@@ -91,7 +92,7 @@ async function loadDoc(file: string): Promise<Document> {
 /** 原子写（issue 31）：先写同目录临时文件再 rename，避免进程崩溃留下截断的 YAML。 */
 async function writeDoc(file: string, doc: Document): Promise<void> {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const tmp = `${file}.tmp-${randomUUID()}`;
   await fs.promises.writeFile(tmp, doc.toString(), 'utf8');
   await fs.promises.rename(tmp, file);
 }

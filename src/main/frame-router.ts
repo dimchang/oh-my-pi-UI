@@ -26,8 +26,8 @@ export class FrameRouter {
 
   constructor(private deps: FrameRouterDeps) {}
 
-  /** 发送命令并等待响应。自动赋 id。 */
-  send<T = unknown>(cmd: RpcCommand): Promise<RpcResponse<T>> {
+  /** 发送命令并等待响应。自动赋 id。timeoutMs 可覆盖默认 5 分钟超时（issue 19）。 */
+  send<T = unknown>(cmd: RpcCommand, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<RpcResponse<T>> {
     // issue 38: 空字符串 id 会被 ?? 放行，导致空 key；改用 || 同时兜底 undefined 与 ''
     const id = cmd.id || randomUUID();
     const withId = { ...cmd, id } as RpcCommand;
@@ -35,7 +35,7 @@ export class FrameRouter {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`rpc timeout: ${withId.type}`));
-      }, DEFAULT_TIMEOUT_MS);
+      }, timeoutMs);
       // issue 4: 重复 id 静默覆盖 pending 会丢失旧 promise，先 reject 旧的
       const existing = this.pending.get(id);
       if (existing) {

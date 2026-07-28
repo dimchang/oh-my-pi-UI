@@ -92,6 +92,16 @@ export class OmpProcessPool {
     return n;
   }
 
+  /** 当前在途（spawning 或 online）进程数，用于容量判断（issue #1）。
+   *  spawnEntry 会同步把新 entry 以 'spawning' 状态写入 this.entries，
+   *  故并发 acquire 不同 sessionPath 时，先到者立即被计入，后到者能正确感知池已满，
+   *  不会两个都越过 onlineCount() < maxPool 的检查而突破 maxPool 上限。 */
+  inflightCount(): number {
+    let n = 0;
+    for (const e of this.entries.values()) if (e.status === 'spawning' || e.status === 'online') n++;
+    return n;
+  }
+
   /** 获取（或懒拉起）某会话的进程。带 -c 续接该会话历史。
    *  - 已 online → 直接返回（更新 lastActiveAt）。
    *  - 池满 → 先 LRU 淘汰最久未活跃的 idle 进程。
@@ -104,7 +114,7 @@ export class OmpProcessPool {
     }
     const pending = this.spawning.get(sessionPath);
     if (pending) return pending;
-    if (this.onlineCount() >= this.maxPool) {
+    if (this.inflightCount() >= this.maxPool) {
       // 池已满：尝试 LRU 淘汰。若全部 online 进程都被 pin（等用户确认），
       // 无法安全淘汰——拒绝本次 acquire，保证池大小永不超过 maxPool（issue 24）。
       if (!this.evictLRU()) {
@@ -112,9 +122,10 @@ export class OmpProcessPool {
       }
     }
     // 历史会话（磁盘文件存在）→ -r resume 指定文件；
-    // 否则（tempKey 或文件不存在，如新建会话）→ 全新 spawn（不带 -r/-c）
-    const resumePath = sessionPath && fs.existsSync(sessionPath) ? sessionPath : undefined;
-    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, resumePath, undefined, hooks);
+    // 否则（tempKey 或文件不存在，如新建会话）→ 全新 spawn（不带 -r/-c）。
+    // resume 判定已下移到 spawnEntry 内部用异步 stat 完成（issue 7），这里不再同步 existsSync，
+    // 以保证容量检查 → spawning 注册之间不插入 await（维持 issue 1 的并发安全）。
+    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, undefined, undefined, hooks);
     this.spawning.set(sessionPath, p);
     try {
       return await p;
@@ -130,7 +141,7 @@ export class OmpProcessPool {
   async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'write', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
     const pending = this.spawning.get(tempKey);
     if (pending) return pending;
-    if (this.onlineCount() >= this.maxPool) {
+    if (this.inflightCount() >= this.maxPool) {
       if (!this.evictLRU()) {
         throw new Error('进程池已满且所有会话都在等待用户确认，无法新建会话（请先关闭或回应某个会话）');
       }
@@ -227,13 +238,9 @@ export class OmpProcessPool {
     hooks?: string[],
   ): Promise<PoolEntry> {
     return new Promise<PoolEntry>((resolve, reject) => {
-      if (!fs.existsSync(cwd)) {
-        reject(new Error(`工作目录不存在: ${cwd}`));
-        return;
-      }
       const normalizedCwd = path.normalize(cwd);
-      // 用 ctx 包装让 proc 回调能引用尚未声明的 entry/router（闭包运行时解析）
-      const ctx: { entry?: PoolEntry; router?: FrameRouter } = {};
+      // 用 ctx 包装让 proc 回调能引用尚未声明的 entry/router/proc（闭包运行时解析）
+      const ctx: { entry?: PoolEntry; router?: FrameRouter; proc?: OmpProcess } = {};
       let settled = false;
       const timeout = setTimeout(() => {
         if (!settled) {
@@ -242,42 +249,9 @@ export class OmpProcessPool {
           reject(new Error(`omp spawn timeout (${SPAWN_TIMEOUT_MS}ms) for ${sessionPath}`));
         }
       }, SPAWN_TIMEOUT_MS);
-      const proc = new OmpProcess(
-        { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession, systemPrompt, hooks },
-        {
-          onReady: () => {
-            if (ctx.entry) ctx.entry.status = 'online';
-            if (ctx.entry) ctx.entry.lastActiveAt = Date.now();
-            if (!settled) {
-              settled = true;
-              clearTimeout(timeout);
-              if (ctx.entry) resolve(ctx.entry);
-              else reject(new Error('entry missing on ready'));
-            }
-            this.events.onReady(sessionPath);
-          },
-          onFrame: (frame) => ctx.router?.dispatch(frame),
-          onExit: (code) => {
-            if (ctx.entry) {
-              ctx.entry.status = 'evicted';
-              // 进程退出（无论就绪前还是之后）都必须从 entries 移除，否则会残留
-              // status='evicted' 的僵尸 entry（issue 77）。注意用 entry 当前的
-              // sessionPath（renameKey 后已更新），确保删对 key。
-              this.entries.delete(ctx.entry.sessionPath);
-            }
-            ctx.router?.rejectAll(`omp exited (code=${code})`);
-            if (!settled) {
-              settled = true;
-              clearTimeout(timeout);
-              reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
-            }
-            this.events.onExit(sessionPath, code);
-          },
-          onStderr: (line) => this.events.onStderr(sessionPath, line),
-        },
-      );
       const router = new FrameRouter({
-        write: (cmd) => proc.write(cmd),
+        // proc 在异步 I/O 之后才创建（issue 7），用 ctx.proc 间接引用。
+        write: (cmd) => { if (ctx.proc) ctx.proc.write(cmd); },
         pushEvent: (frame) => this.events.onFrame(sessionPath, frame),
         onLog: (line) => this.events.onLog(line),
       });
@@ -286,23 +260,97 @@ export class OmpProcessPool {
         sessionPath,
         cwd: normalizedCwd,
         approvalMode,
-        proc,
+        // 占位，proc 创建后立即覆盖（entry 已同步注册，killAll 在 spawn 完成前不会用到它）。
+        proc: undefined as unknown as OmpProcess,
         router,
         lastActiveAt: Date.now(),
         status: 'spawning',
       };
       ctx.entry = entry;
+      // 同步注册 spawning entry（issue 1 并发安全：必须在任意 await 之前完成，
+      // 保证并发 acquire 能通过 inflightCount 互相感知，不会同时越过容量上限）。
       this.entries.set(sessionPath, entry);
-      try {
-        proc.start();
-      } catch (e) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          this.entries.delete(sessionPath);
-          reject(e as Error);
+      void (async () => {
+        try {
+          // issue 7：cwd 校验由同步 existsSync 改为异步 stat + isDirectory。
+          let st: fs.Stats;
+          try {
+            st = await fs.promises.stat(normalizedCwd);
+          } catch {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timeout);
+              this.entries.delete(sessionPath);
+              reject(new Error(`工作目录不存在: ${cwd}`));
+            }
+            return;
+          }
+          if (!st.isDirectory()) {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timeout);
+              this.entries.delete(sessionPath);
+              reject(new Error(`工作目录不是目录: ${cwd}`));
+            }
+            return;
+          }
+          // issue 7：resume 判定由 acquire 里的同步 existsSync 改为此处异步 stat。
+          let resolvedResume = resumeSession;
+          if (!resolvedResume && sessionPath) {
+            try {
+              await fs.promises.stat(sessionPath);
+              resolvedResume = sessionPath;
+            } catch {
+              resolvedResume = undefined;
+            }
+          }
+          const proc = new OmpProcess(
+            { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession: resolvedResume, systemPrompt, hooks },
+            {
+              onReady: () => {
+                if (ctx.entry) ctx.entry.status = 'online';
+                if (ctx.entry) ctx.entry.lastActiveAt = Date.now();
+                if (!settled) {
+                  settled = true;
+                  clearTimeout(timeout);
+                  if (ctx.entry) resolve(ctx.entry);
+                  else reject(new Error('entry missing on ready'));
+                }
+                this.events.onReady(sessionPath);
+              },
+              onFrame: (frame) => ctx.router?.dispatch(frame),
+              onExit: (code) => {
+                if (ctx.entry) {
+                  ctx.entry.status = 'evicted';
+                  // 进程退出（无论就绪前还是之后）都必须从 entries 移除，否则会残留
+                  // status='evicted' 的僵尸 entry（issue 77）。注意用 entry 当前的
+                  // sessionPath（renameKey 后已更新），确保删对 key。
+                  this.entries.delete(ctx.entry.sessionPath);
+                }
+                ctx.router?.rejectAll(`omp exited (code=${code})`);
+                if (!settled) {
+                  settled = true;
+                  clearTimeout(timeout);
+                  reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
+                }
+                this.events.onExit(sessionPath, code);
+              },
+              onStderr: (line) => this.events.onStderr(sessionPath, line),
+            },
+          );
+          ctx.proc = proc;
+          entry.proc = proc;
+          // issue 7：start() 已改为 async（内部 mkdir 异步），这里 await。
+          await proc.start();
+        } catch (e) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            this.entries.delete(sessionPath);
+            reject(e as Error);
+          }
         }
-      }
+      })();
     });
   }
 }

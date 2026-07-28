@@ -13,11 +13,15 @@ export const ModelPicker: React.FC = () => {
   const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  // 组件卸载后置 true，避免 fetchModels 的延迟回调在卸载后 setState（issue 13）
+  const cancelledRef = useRef(false);
+  useEffect(() => () => { cancelledRef.current = true; }, []);
 
   const fetchModels = React.useCallback(() => {
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
     void rpc.getAvailableModels(sp).then((r) => {
+      if (cancelledRef.current) return;
       if (r.success && r.data) setModels(r.data.models ?? []);
     }).catch(() => undefined);
   }, []);

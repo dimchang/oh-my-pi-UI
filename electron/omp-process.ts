@@ -172,7 +172,7 @@ export class OmpProcess {
    *  - newApprovalMode：若与当前不同，则即使 cwd 相同也重启（用于同工作空间切权限）。
    *  - continueSession：true 时给新进程加 -c，继续上一个会话（切权限时保留上下文）。 */
   restart(newCwd: string, newApprovalMode?: ApprovalMode, continueSession?: boolean): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<void>(async (resolve, reject) => {
       const prevMode = this.opts.approvalMode;
       if (newApprovalMode) this.opts.approvalMode = newApprovalMode;
       if (continueSession !== undefined) this.opts.continueSession = continueSession;
@@ -220,7 +220,7 @@ export class OmpProcess {
         return reject(e);
       }
       try {
-        this.start();
+        await this.start();
       } catch (e) {
         this.restartResolve = null;
         this.restartReject = null;
@@ -229,7 +229,7 @@ export class OmpProcess {
     });
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.child) return;
 
     const args = ['--mode', 'rpc-ui', '--approval-mode', this.opts.approvalMode ?? 'write'];
@@ -248,9 +248,17 @@ export class OmpProcess {
     // 日志（按日轮转 + 旧文件清理，issue 82）
     try {
       const dir = this.opts.logDir ?? path.join(process.cwd(), '.temp');
-      fs.mkdirSync(dir, { recursive: true });
+      // issue 7：mkdir 改用异步，避免热路径 IPC 调用中同步阻塞主进程事件循环。
+      await fs.promises.mkdir(dir, { recursive: true });
       const day = new Date().toISOString().slice(0, 10);
       this.logStream = fs.createWriteStream(path.join(dir, `omp-stderr-${day}.log`), { flags: 'a' });
+      // issue #2: WriteStream 未挂 error 监听，磁盘满/权限不足/路径无效时会抛 'error' 事件，
+      // 未处理即以 uncaughtException 崩溃主进程。挂上监听，best-effort 记录并置空，
+      // 使后续 this.logStream?.write 变为 no-op，不影响 omp 进程运行。
+      this.logStream.on('error', (err) => {
+        this.events.onStderr(`[log-stream-error] ${err.message}`);
+        this.logStream = null;
+      });
       // 删除超过保留期的旧 stderr 日志，避免无限增长（best-effort，异步不阻塞 spawn）。
       void OmpProcess.pruneOldStderrLogs(dir);
     } catch {
@@ -351,8 +359,20 @@ export class OmpProcess {
   }
 
   private cleanup(): void {
+    // issue 9：先 flush stderrDecoder，把增量解码器里残留的未完整多字节序列吐出，
+    // 避免进程被杀时丢失最后几字节解码输出。
+    if (this.stderrDecoder) {
+      const tail = this.stderrDecoder.write(Buffer.alloc(0));
+      if (tail) {
+        this.logStream?.write(`[${new Date().toISOString()}] ${tail}`);
+        this.events.onStderr(tail);
+      }
+    }
     this.rl?.close();
     this.rl = null;
+    // issue 9：显式销毁 stdout/stderr 流，释放文件描述符，避免依赖 GC 回收（不可靠）。
+    try { this.child?.stdout?.destroy(); } catch { /* noop */ }
+    try { this.child?.stderr?.destroy(); } catch { /* noop */ }
     this.child = null;
     this.logStream?.end();
     this.logStream = null;

@@ -18,7 +18,7 @@ import type {
 import type { WorkspacesFile, ApprovalMode } from '../shared/ipc-channels';
 
 async function send<T>(sessionPath: string, cmd: RpcCommand): Promise<RpcResponse<T>> {
-  const resp = (await window.omp.send(sessionPath, cmd)) as RpcResponse<T>;
+  const resp = (await window.omp.send<T>(sessionPath, cmd)) as RpcResponse<T>;
   return resp;
 }
 

@@ -14,7 +14,8 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 
 const api: OmpApi = {
   platform: process.platform,
-  send: (sessionPath: string, cmd: RpcCommand) => ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
+  send: <T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T> =>
+    ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
     ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode),
   newSessionForCwd: (cwd: string, approvalMode?: ApprovalMode) =>
@@ -76,6 +77,10 @@ const api: OmpApi = {
   pickCssFile: () => ipcRenderer.invoke(IPC.OmpPickCssFile),
   readCssFile: (path: string) => ipcRenderer.invoke(IPC.OmpReadCssFile, path),
   syncCustomCss: (list: CustomCssConfig[]) => ipcRenderer.invoke(IPC.OmpSyncCustomCss, list),
+
+  // 上下文文件读写
+  readContextFile: (filePath: string) => ipcRenderer.invoke(IPC.ContextFileRead, filePath),
+  writeContextFile: (filePath: string, content: string) => ipcRenderer.invoke(IPC.ContextFileWrite, filePath, content),
 };
 
 contextBridge.exposeInMainWorld('omp', api);

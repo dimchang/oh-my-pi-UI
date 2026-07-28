@@ -16,7 +16,7 @@ import { randomUUID, createHash } from 'crypto';
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 import { OmpProcessPool } from './omp-pool';
 import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
-import { readModelsConfig, writeProvider, deleteProvider } from './omp-config';
+import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
 import { IPC } from '../src/shared/ipc-channels';
 import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand } from '../src/shared/rpc-types';
@@ -144,15 +144,24 @@ async function loadWorkspacesFile(): Promise<WorkspacesFile> {
   }
 }
 
+// issue 8：写入串行化。多个事件短内并发触发 saveWorkspacesFile 时，若各自直接 writeFile，
+// 后一次写入可能基于旧数据覆盖前一次（写交错）。用模块级 Promise 队列保证 writeFile 严格串行，
+// 每次写入都用调用时传入的 file 快照，避免互相覆盖。
+let saveWorkspacesQueue: Promise<void> = Promise.resolve();
 async function saveWorkspacesFile(file: WorkspacesFile): Promise<void> {
-  try {
-    await fs.promises.mkdir(path.dirname(WORKSPACES_FILE), { recursive: true });
-    await fs.promises.writeFile(WORKSPACES_FILE, JSON.stringify(file, null, 2), 'utf8');
-    // 写入后让下次 load 重新读取（mtime 已变，这里顺手清掉避免同 tick 内读到旧缓存）。
-    wsCache = null;
-  } catch (e) {
-    sendToRenderer(IPC.OmpStderr, { sessionPath: '', line: `[workspaces-save-error] ${e instanceof Error ? e.message : String(e)}` });
-  }
+  const run = saveWorkspacesQueue.then(async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(WORKSPACES_FILE), { recursive: true });
+      await fs.promises.writeFile(WORKSPACES_FILE, JSON.stringify(file, null, 2), 'utf8');
+      // 写入后让下次 load 重新读取（mtime 已变，这里顺手清掉避免同 tick 内读到旧缓存）。
+      wsCache = null;
+    } catch (e) {
+      sendToRenderer(IPC.OmpStderr, { sessionPath: '', line: `[workspaces-save-error] ${e instanceof Error ? e.message : String(e)}` });
+    }
+  });
+  // 维持队列尾部；单条写入失败仅记录，不中断后续写入。
+  saveWorkspacesQueue = run.catch(() => undefined);
+  return run;
 }
 
 function sendToRenderer(channel: string, payload: unknown): void {
@@ -162,6 +171,26 @@ function sendToRenderer(channel: string, payload: unknown): void {
 }
 
 const USE_CUSTOM_TITLE_BAR = process.platform === 'win32';
+
+/** 简单的滑动窗口速率限制器：防止渲染进程被 XSS 攻陷后批量调用敏感 IPC。
+ *  每个 key 独立计数，超过 maxCalls 次/窗口期则拒绝。 */
+class RateLimiter {
+  private hits = new Map<string, number[]>();
+  constructor(private maxCalls: number, private windowMs: number) {}
+  /** 返回 true 表示允许，false 表示被限流。 */
+  allow(key: string): boolean {
+    const now = Date.now();
+    let arr = this.hits.get(key);
+    if (!arr) { arr = []; this.hits.set(key, arr); }
+    // 清除窗口外的记录
+    while (arr.length > 0 && arr[0]! <= now - this.windowMs) arr.shift();
+    if (arr.length >= this.maxCalls) return false;
+    arr.push(now);
+    return true;
+  }
+}
+/** 敏感操作限流：每个操作 10 秒内最多 20 次（正常用户操作远达不到）。 */
+const sensitiveLimiter = new RateLimiter(20, 10_000);
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -348,11 +377,14 @@ function registerIpc(): void {
   });
 
   ipcMain.handle(IPC.SessionList, async (_e, cwd?: string) => listSessions(cwd));
-  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => { await deleteSession(p); });
+  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => {
+    if (!sensitiveLimiter.allow('session-delete')) throw new Error('操作过于频繁，请稍后再试');
+    await deleteSession(p);
+  });
   ipcMain.handle(IPC.SessionMessages, async (_e, p: string) => readSessionMessages(p));
   ipcMain.handle(IPC.SessionUserEntries, async (_e, p: string) => readUserEntries(p));
 
-  ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown' }));
+  ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown', agentDir: getAgentDir() }));
 
   ipcMain.handle(IPC.OpenExternal, async (_e, url: string) => {
     // 只允许 http/https，其余（file://、自定义协议、裸路径）一律拒绝，避免借 IPC 打开任意资源。
@@ -386,7 +418,9 @@ function registerIpc(): void {
   // ---- 工作空间 ----
   ipcMain.handle(IPC.WorkspacesGet, async () => await loadWorkspacesFile());
   ipcMain.handle(IPC.WorkspacesSave, async (_e, file: WorkspacesFile) => {
+    if (!sensitiveLimiter.allow('workspaces-save')) throw new Error('操作过于频繁，请稍后再试');
     if (!file || file.version !== 1) throw new Error('invalid workspaces file');
+    if (!Array.isArray(file.workspaces)) throw new Error('invalid workspaces: workspaces must be an array');
     await saveWorkspacesFile(file);
   });
   ipcMain.handle(IPC.DialogOpenDir, async (_e, defaultPath?: string) => {
@@ -440,15 +474,24 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.OmpReadCssFile, async (_e, filePath: string) => {
     try {
-      // 安全校验（issue 1）：renderer 传入任意路径可读文件。
-      // 采用"限定为 .css 扩展名 + 拒绝路径穿越"的保守策略：
-      //   - 扩展名必须是 .css（杜绝读取 /etc/passwd 等任意文件）；
-      //   - 路径中不得出现 '..' 段（杜绝 ../../ 逃逸到 allowed 目录之外）。
+      // 安全校验（issue 6）：符号链接绕过。renderer 可传入指向系统文件（如 /etc/passwd）
+      // 的符号链接，仅校验"源路径"的 .css 扩展名无法拦截（源是 evil.css，目标是任意文件）。
+      // 修复：先用 realpath 解析出真实目标，再对"目标"做扩展名 + 工作区边界双重校验。
       if (typeof filePath !== 'string' || !filePath) return { content: '', error: 'invalid path' };
-      if (path.extname(filePath).toLowerCase() !== '.css') return { content: '', error: 'only .css files are allowed' };
-      const normalized = path.normalize(filePath);
-      if (filePath.includes('..') || normalized.includes('..')) return { content: '', error: 'path traversal is not allowed' };
-      const content = await fs.promises.readFile(filePath, 'utf8');
+      let realPath: string;
+      try {
+        realPath = await fs.promises.realpath(filePath);
+      } catch {
+        return { content: '', error: 'file not accessible' };
+      }
+      if (path.extname(realPath).toLowerCase() !== '.css') {
+        return { content: '', error: 'only .css files are allowed' };
+      }
+      // 边界校验：realpath 后的真实目标必须位于已注册工作区之内，杜绝 symlink 逃逸读取任意文件。
+      if (!(await isWithinWorkspaces(realPath))) {
+        return { content: '', error: 'css file must be inside a registered workspace' };
+      }
+      const content = await fs.promises.readFile(realPath, 'utf8');
       return { content };
     } catch (e: any) {
       return { content: '', error: String(e?.message ?? e) };
@@ -459,10 +502,36 @@ function registerIpc(): void {
     return await syncCustomCss(list);
   });
 
+  // ---- 上下文文件读写（AGENTS.md / SYSTEM.md / APPEND_SYSTEM.md / RULES.md）----
+  ipcMain.handle(IPC.ContextFileRead, async (_e, filePath: string) => {
+    if (typeof filePath !== 'string' || !filePath) return '';
+    try {
+      return await fs.promises.readFile(filePath, 'utf8');
+    } catch {
+      return ''; // 文件不存在返回空串
+    }
+  });
+  ipcMain.handle(IPC.ContextFileWrite, async (_e, filePath: string, content: string) => {
+    if (typeof filePath !== 'string' || !filePath) throw new Error('无效路径');
+    // 空内容 = 删除文件（清理不需要的上下文）
+    if (!content || !content.trim()) {
+      try { await fs.promises.unlink(filePath); } catch { /* 不存在也无妨 */ }
+      return;
+    }
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.promises.writeFile(filePath, content, 'utf8');
+  });
+
   // ---- 模型配置 ----
   ipcMain.handle(IPC.OmpModelsRead, async () => await readModelsConfig());
-  ipcMain.handle(IPC.OmpModelsWriteProvider, async (_e, id: string, cfg: OmpProviderConfig) => { await writeProvider(id, cfg); });
-  ipcMain.handle(IPC.OmpModelsDeleteProvider, async (_e, id: string) => { await deleteProvider(id); });
+  ipcMain.handle(IPC.OmpModelsWriteProvider, async (_e, id: string, cfg: OmpProviderConfig) => {
+    if (!sensitiveLimiter.allow('models-write')) throw new Error('操作过于频繁，请稍后再试');
+    await writeProvider(id, cfg);
+  });
+  ipcMain.handle(IPC.OmpModelsDeleteProvider, async (_e, id: string) => {
+    if (!sensitiveLimiter.allow('models-delete')) throw new Error('操作过于频繁，请稍后再试');
+    await deleteProvider(id);
+  });
 
   // ---- 自定义标题栏 ----
   if (USE_CUSTOM_TITLE_BAR) {

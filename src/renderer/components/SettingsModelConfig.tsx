@@ -83,6 +83,10 @@ export const SettingsModelConfig: React.FC = () => {
     [ymlConfig],
   );
 
+  // issue #4: 传入全部可用模型 key（而非 []），确保首次切换白名单时初始化为"全集-本项"，
+  // 而不是空数组导致所有模型被禁用。
+  const allModelKeys = useMemo(() => models.map(modelKey), [models]);
+
   // 搜索过滤（issue 156）：provider 名 / 模型名 / 模型 id 任一匹配即可；空查询显示全部
   const filteredGroups = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -264,7 +268,7 @@ export const SettingsModelConfig: React.FC = () => {
                         <input
                           type="checkbox"
                           checked={isEnabled(key)}
-                          onChange={() => useApp.getState().toggleEnabledModel(key, [])}
+                          onChange={() => useApp.getState().toggleEnabledModel(key, allModelKeys)}
                         />
                         <span className="provider-model-name">{m.name ?? m.id}</span>
                         {m.contextWindow ? (

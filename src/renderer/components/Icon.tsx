@@ -24,8 +24,12 @@ export type IconName =
   // 输入行为二态按钮
   | 'queue'
   | 'guide'
+  // Diff 视图
+  | 'diff'
   // 关闭 / 移除（附件芯片上的 ×）
-  | 'close';
+  | 'close'
+  // 时钟（生效时机提示）
+  | 'clock';
 
 const PATHS: Record<IconName, React.ReactNode> = {
   folder: <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />,
@@ -126,7 +130,7 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M16 12l4 3-4 3" />
     </>
   ),
-  // 引导（guide）：魔力棒，隐喻"中途引导"
+  // 引导（guide）：魔力棒，隐喻“中途引导”
   guide: (
     <>
       <path d="M9 4l1.5 1.5L9 7" />
@@ -137,11 +141,28 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M9 20h6" />
     </>
   ),
+  // Diff 视图：左右分栏 + 加减号，隐喻“文件修改对比”
+  diff: (
+    <>
+      <path d="M12 3v18" />
+      <path d="M5 8h4" />
+      <path d="M7 6v4" />
+      <path d="M15 8h4" />
+      <path d="M5 16h4" />
+      <path d="M15 16h4" />
+    </>
+  ),
   // 关闭（移除）图标：单线 X
   close: (
     <>
       <path d="M18 6 6 18" />
       <path d="M6 6l12 12" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 6v6l4 2" />
     </>
   ),
 };

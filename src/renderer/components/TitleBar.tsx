@@ -96,20 +96,20 @@ export function TitleBar(): React.ReactElement | null {
             </button>
             {activeMenu === menu.label && (
               <div className="titlebar-dropdown">
-                {menu.items.map((item, idx) =>
-                  item.separator ? (
-                    <div key={idx} className="titlebar-dropdown-separator" />
-                  ) : (
-                    <button
-                      key={idx}
-                      className={`titlebar-dropdown-item ${item.disabled ? 'disabled' : ''}`}
-                      onClick={() => exec(item)}
-                      disabled={item.disabled}
-                    >
-                      {item.label}
-                    </button>
-                  ),
-                )}
+              {menu.items.map((item, idx) =>
+                item.separator ? (
+                  <div key={`sep-${idx}`} className="titlebar-dropdown-separator" />
+                ) : (
+                  <button
+                    key={item.label ?? idx}
+                    className={`titlebar-dropdown-item ${item.disabled ? 'disabled' : ''}`}
+                    onClick={() => exec(item)}
+                    disabled={item.disabled}
+                  >
+                    {item.label}
+                  </button>
+                ),
+              )}
               </div>
             )}
           </div>

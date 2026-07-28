@@ -8,15 +8,11 @@
 
 import React, { useState } from 'react';
 import { useApp } from '../store';
-import { cwdKey } from '../utils/path-key';
+import { cwdKey, basename } from '../utils/path-key';
 import type { HookFileConfig, HookFileInfo, HookUnit } from '../../shared/ipc-channels';
 
-function basename(p: string): string {
-  const norm = p.replace(/\\/g, '/');
-  return norm.slice(norm.lastIndexOf('/') + 1);
-}
-
-/** 把主进程解析结果转成 UI 单元列表。无默认导出且无具名导出 → 空数组（omp 无法加载，UI 提示）。 */
+/** 把主进程解析结果转成 UI 单元列表。无默认导出且无具名导出 → 空数组（omp 无法加载，UI 提示）。
+ *  basename 统一引用 path-key.ts 的到处函数（issue 21，消除本地重复实现）。 */
 function buildUnits(info: HookFileInfo): HookUnit[] {
   if (info.hasDefault) {
     return [{ name: basename(info.path), fileLevel: true, events: info.events }];
