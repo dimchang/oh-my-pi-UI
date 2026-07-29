@@ -68,6 +68,8 @@ const api: OmpApi = {
   menuZoomOut: () => ipcRenderer.invoke(IPC.MenuZoomOut),
   menuToggleFullscreen: () => ipcRenderer.invoke(IPC.MenuToggleFullscreen),
   menuShowAbout: () => ipcRenderer.invoke(IPC.MenuShowAbout),
+  menuStats: () => ipcRenderer.invoke(IPC.MenuStatsClick),
+  onMenuStats: (cb) => subscribe<void>(IPC.MenuStats, cb),
 
   // 钩子（Hooks）管理
   pickHookFiles: () => ipcRenderer.invoke(IPC.OmpPickHookFiles),

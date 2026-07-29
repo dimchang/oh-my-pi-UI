@@ -4,6 +4,9 @@ import { rpc } from '../rpc-client';
 import { modelKey } from '../utils/path-key';
 import type { ModelInfo } from '../../shared/rpc-types';
 
+/** get_available_models 的客户端超时（ms）。FrameRouter 默认 5 分钟对 UI 下拉太长。 */
+const MODELS_FETCH_TIMEOUT_MS = 10_000;
+
 export const ModelPicker: React.FC = () => {
   const model = useApp((s) => s.model);
   const ready = useApp((s) => s.ready);
@@ -11,19 +14,42 @@ export const ModelPicker: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   // 组件卸载后置 true，避免 fetchModels 的延迟回调在卸载后 setState（issue 13）
+  // 注意：React 18 StrictMode 开发模式会 mount→cleanup→remount，必须在 effect body 里重置为 false
   const cancelledRef = useRef(false);
-  useEffect(() => () => { cancelledRef.current = true; }, []);
+  useEffect(() => { cancelledRef.current = false; return () => { cancelledRef.current = true; }; }, []);
 
-  const fetchModels = React.useCallback(() => {
+  const fetchModels = React.useCallback((showLoading = false) => {
     const sp = useApp.getState().currentSessionPath;
-    if (!sp) return;
-    void rpc.getAvailableModels(sp).then((r) => {
+    if (!sp) {
+      if (showLoading) setFetchError(true);
+      return;
+    }
+    if (showLoading) setLoading(true);
+    setFetchError(false);
+
+    const timer = setTimeout(() => {
       if (cancelledRef.current) return;
+      setLoading(false);
+      setFetchError(true);
+    }, MODELS_FETCH_TIMEOUT_MS);
+
+    rpc.getAvailableModels(sp).then((r) => {
+      clearTimeout(timer);
+      if (cancelledRef.current) return;
+      setLoading(false);
       if (r.success && r.data) setModels(r.data.models ?? []);
-    }).catch(() => undefined);
+      else setFetchError(true);
+    }).catch(() => {
+      clearTimeout(timer);
+      if (cancelledRef.current) return;
+      setLoading(false);
+      setFetchError(true);
+    });
   }, []);
 
   // 首次 ready 预热一次（让首次打开下拉不白屏）
@@ -44,7 +70,7 @@ export const ModelPicker: React.FC = () => {
   useEffect(() => {
     if (open) {
       setQuery('');
-      fetchModels();
+      fetchModels(true);
       // 等下一帧再 focus，input 已经被挂载
       requestAnimationFrame(() => searchRef.current?.focus());
     }
@@ -126,7 +152,20 @@ export const ModelPicker: React.FC = () => {
             />
           </div>
           <div className="model-list">
-            {totalMatched === 0 ? (
+            {loading ? (
+              <div className="model-empty">加载模型列表中…</div>
+            ) : fetchError ? (
+              <div className="model-empty">
+                模型加载失败
+                <button
+                  className="btn"
+                  style={{ marginLeft: 8, fontSize: '0.85em' }}
+                  onClick={() => fetchModels(true)}
+                >
+                  重试
+                </button>
+              </div>
+            ) : totalMatched === 0 ? (
               <div className="model-empty">没有匹配的模型</div>
             ) : (
               Object.entries(groups).map(([provider, list]) => (

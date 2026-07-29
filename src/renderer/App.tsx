@@ -318,7 +318,7 @@ export default function App(): React.ReactElement {
   // ---- 用户操作 ----
   const onSend = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
-    const sp = st.currentSessionPath;
+    let sp = st.currentSessionPath;
     if (!sp) {
       pushToast('请先选择一个会话', 'error');
       return;
@@ -327,22 +327,35 @@ export default function App(): React.ReactElement {
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
     const promptText = buildPromptWithAttachments(text, attachments);
     const doSend = async () => {
-      // 懒拉起该会话的进程（带 -c 续接）。已在线则 no-op。**不影响其他会话**。
-      await rpc.acquire(sp, cwd, approvalMode);
+      // temp key 保护：若当前会话仍是临时 key（迁移未完成），先尝试迁移到真实路径
+      if (sp!.startsWith('__new_')) {
+        await refreshSessions();
+        migrateTempSession();
+        const migrated = useApp.getState().currentSessionPath;
+        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
+      }
+      // 懒拉起该会话的进程。已在线则 no-op。
+      await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { attachments });
-      await rpc.prompt(sp, promptText);
+      await rpc.prompt(sp!, promptText);
       refreshSessions();
     };
     void doSend().catch((err) =>
       pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, migrateTempSession]);
+
+  /** Help 菜单 "Stats" 子项：等同于在当前会话输入 /stats 并提交。 */
+  useEffect(() => {
+    const off = window.omp.onMenuStats(() => onSend('/stats'));
+    return off;
+  }, [onSend]);
 
   /** 引导（steer mid-run）：生成中途按 Enter → omp 在当前 tool 完成后立即按新方向继续，
    *  跳过剩余 tool 队列，再走一次模型。空闲时同 onSend 的效果。 */
   const onGuide = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
-    const sp = st.currentSessionPath;
+    let sp = st.currentSessionPath;
     if (!sp) {
       pushToast('请先选择一个会话', 'error');
       return;
@@ -351,20 +364,26 @@ export default function App(): React.ReactElement {
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
     const promptText = buildPromptWithAttachments(text, attachments);
     const doGuide = async () => {
-      await rpc.acquire(sp, cwd, approvalMode);
+      if (sp!.startsWith('__new_')) {
+        await refreshSessions();
+        migrateTempSession();
+        const migrated = useApp.getState().currentSessionPath;
+        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
+      }
+      await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { steered: true, attachments });
-      await rpc.steer(sp, promptText);
+      await rpc.steer(sp!, promptText);
       refreshSessions();
     };
     void doGuide().catch((err) =>
       pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, migrateTempSession]);
 
   /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
   const onQueue = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
-    const sp = st.currentSessionPath;
+    let sp = st.currentSessionPath;
     if (!sp) {
       pushToast('请先选择一个会话', 'error');
       return;
@@ -373,15 +392,21 @@ export default function App(): React.ReactElement {
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
     const promptText = buildPromptWithAttachments(text, attachments);
     const doQueue = async () => {
-      await rpc.acquire(sp, cwd, approvalMode);
+      if (sp!.startsWith('__new_')) {
+        await refreshSessions();
+        migrateTempSession();
+        const migrated = useApp.getState().currentSessionPath;
+        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
+      }
+      await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { queued: true, attachments });
-      await rpc.followUp(sp, promptText);
+      await rpc.followUp(sp!, promptText);
       refreshSessions();
     };
     void doQueue().catch((err) =>
       pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, migrateTempSession]);
 
   // 中止当前 agent 轮
   const onAbort = useCallback(() => {

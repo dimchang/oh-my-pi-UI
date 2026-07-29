@@ -336,9 +336,9 @@ function registerIpc(): void {
     if (cmd.type === 'extension_ui_response') {
       try {
         pool.write(sessionPath, cmd as ExtensionUIResponseCommand);
+      } catch {
+        // 进程已离线（如 temp key 被释放）——静默忽略，不影响用户体验
       } finally {
-        // 不论成败都释放该会话的 UI pin（应答已结束）。
-        // 失败（进程已离线）时 IPC 会 reject，由渲染端弹错提示，不静默吞掉。
         pool.unpin(sessionPath);
       }
       return { type: 'response', command: 'extension_ui_response', success: true };
@@ -547,6 +547,7 @@ function registerIpc(): void {
     ipcMain.handle(IPC.MenuZoomOut, () => { const wc = mainWindow?.webContents; if (wc) wc.setZoomLevel(wc.getZoomLevel() - 0.5); });
     ipcMain.handle(IPC.MenuToggleFullscreen, () => { if (!mainWindow) return; mainWindow.setFullScreen(!mainWindow.isFullScreen()); });
     ipcMain.handle(IPC.MenuShowAbout, () => showAboutDialog());
+    ipcMain.handle(IPC.MenuStatsClick, () => { mainWindow?.webContents.send(IPC.MenuStats); });
   }
 }
 
@@ -596,7 +597,11 @@ function buildAppMenu(): void {
         { role: 'toggleDevTools' },
       ],
     },
-    { role: 'help', label: 'Help', submenu: [{ label: '关于 OMP UI', click: () => showAboutDialog() }] },
+    { role: 'help', label: 'Help', submenu: [
+      { label: '关于 OMP UI', click: () => showAboutDialog() },
+      { type: 'separator' },
+      { label: 'Stats (会话统计)', click: () => { mainWindow?.webContents.send(IPC.MenuStats); } },
+    ] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }

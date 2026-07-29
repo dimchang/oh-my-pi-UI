@@ -50,6 +50,8 @@ export const IPC = {
   MenuZoomOut: 'menu:zoom-out', // () => Promise<void>
   MenuToggleFullscreen: 'menu:toggle-fullscreen', // () => Promise<void>
   MenuShowAbout: 'menu:show-about', // () => Promise<void>
+  MenuStatsClick: 'menu:stats-click', // () => Promise<void> — 渲染进程 → 主进程：标题栏 Help 菜单 Stats 项点击
+  MenuStats: 'menu:stats', // (void) — 主进程 → 渲染：触发当前会话发送 /stats
 
   // main → renderer (webContents.send)
   RpcEvent: 'rpc:event', // (frame: OmpFrame & { __sessionPath: string }) — 帧带会话标记，renderer 按此路由
@@ -347,6 +349,10 @@ export interface OmpApi {
   menuZoomOut(): Promise<void>;
   menuToggleFullscreen(): Promise<void>;
   menuShowAbout(): Promise<void>;
+  /** 标题栏 Help 菜单 "Stats" 项点击 → 主进程转发为 MenuStats 事件 */
+  menuStats(): Promise<void>;
+  /** 订阅 Help 菜单 "Stats" 项点击（主进程 → 渲染），触发后渲染进程向当前会话发送 /stats */
+  onMenuStats(cb: () => void): () => void;
 
   // 钩子（Hooks）管理
   pickHookFiles(): Promise<string[] | null>;

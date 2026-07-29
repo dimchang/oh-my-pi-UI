@@ -17,6 +17,7 @@ export const InputBox: React.FC<{
 }> = ({ onSend, onGuide, onQueue, onAbort, onChangeApprovalMode }) => {
   const [draft, setDraft] = useState('');
   const [selIdx, setSelIdx] = useState(0);
+  const [focused, setFocused] = useState(false);
   const isStreaming = useApp((s) => s.isStreaming);
   const isAborting = useApp((s) => s.isAborting);
   const ready = useApp((s) => s.ready);
@@ -70,6 +71,7 @@ export const InputBox: React.FC<{
   }, [draft, slashCommands]);
 
   const slashMatch = useMemo(() => {
+    if (!focused) return null; // 失焦时关闭弹窗
     if (!draft.startsWith('/')) return null;
     const afterSlash = draft.slice(1);
     // 命令名后出现空格 → 用户正在输入参数，关闭弹窗让 Enter 正常提交
@@ -79,7 +81,7 @@ export const InputBox: React.FC<{
       (c) => c.name.toLowerCase().startsWith(q) || c.aliases?.some((a) => a.toLowerCase().startsWith(q)),
     );
     return { q, list };
-  }, [draft, slashCommands]);
+  }, [draft, slashCommands, focused]);
 
   const autoGrow = () => {
     const ta = taRef.current;
@@ -247,6 +249,8 @@ export const InputBox: React.FC<{
             value={draft}
             placeholder={placeholder}
             onChange={(e) => { setDraft(e.target.value); setSelIdx(0); autoGrow(); }}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             onKeyDown={onKeyDown}
           />
           <div className="input-toolbar">

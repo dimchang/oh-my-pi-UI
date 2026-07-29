@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useApp } from '../store';
 
 interface MenuItem {
-  label: string;
+  label?: string;
   action?: () => void;
   separator?: boolean;
   disabled?: boolean;
@@ -26,6 +26,8 @@ const MENUS: MenuDef[] = [
     label: 'Help',
     items: [
       { label: '关于 OMP UI', action: () => window.omp.menuShowAbout() },
+      { separator: true },
+      { label: 'Stats (会话统计)', action: () => window.omp.menuStats() },
     ],
   },
 ];

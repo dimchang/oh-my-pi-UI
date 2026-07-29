@@ -1,178 +1,195 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useApp, type ChatMessage } from '../store';
 
 /**
- * 密度滚动条小地图（移植自 Tiffa）。
- * 纯 Canvas + 原生 ResizeObserver / MutationObserver / scroll，零依赖。
- * 右侧一条 14px 色带：用户消息=强调色(宽)、助手消息=中性灰(窄)，叠加跟随滚动的视口框，点击/拖拽跳转。
+ * 密度指示条（左侧集中横线簇）。
+ *
+ * 设计（参考截图）：
+ * 1. 所有用户消息的横线**紧凑堆叠成一簇**，不是散布在整个聊天区高度
+ * 2. 鼠标靠近时，**离鼠标最近的横线最长**，上下依次递减（距离驱动渐变长度）
+ * 3. 不需要精准 hover 到某条线上——整个密度区都是热区
+ * 4. 最近的那条自动弹出用户输入气泡；点击跳转
  */
 
-const MINIMAP_WIDTH = 14;
-const SCROLLABLE_THRESHOLD = 40; // 低于此差值则不显示 minimap
-const MIN_BLOCK_H = 2; // 色块最小高度，保证极短消息可见
-const MIN_VIEWPORT_H = 6; // 视口框最小高度
-const USER_X = 3;
-const USER_W = 8;
-const ASSISTANT_X = 4;
-const ASSISTANT_W = 6;
+const SCROLLABLE_THRESHOLD = 40;
+const TICK_GAP = 3;            /* 横线间距 */
+const LINE_H = 2;              /* 横线高度 */
+const MIN_LINE_W = 8;          /* 最短横线宽 */
+const MAX_LINE_W = 40;         /* 最长横线宽（最近那条） */
+/** 洛伦兹衰减：y = 1/(1 + x²/σ²)，中间陡峭、边缘快速归零。σ 越小越陡 */
+function lorentzFalloff(d: number, sigma: number): number {
+  return 1 / (1 + (d * d) / (sigma * sigma));
+}
 
-/** 主题变量是 HSL 三元组（如 "210 90% 50%"），转成 canvas 可用的 hsla 字符串 */
-function hsl(varVal: string, alpha: number): string {
-  const parts = varVal.trim().split(/\s+/);
-  if (parts.length < 3) return `rgba(128,128,128,${alpha})`;
-  return `hsla(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+/** 从 ChatMessage.parts 里提取用户输入纯文本 */
+function getUserText(msg: ChatMessage): string {
+  const texts: string[] = [];
+  for (const p of msg.parts) {
+    if (p.kind === 'text') texts.push(p.text);
+  }
+  return texts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+interface TickItem {
+  id: string;
+  msgIndex: number;
+  totalMessages: number;
+  preview: string;
 }
 
 export const Minimap: React.FC<{ scrollRef: React.RefObject<HTMLDivElement | null> }> = ({ scrollRef }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const draggingRef = useRef(false);
-  const redrawPendingRef = useRef(false);
+  const messages = useApp((s) => s.messages);
+  const [visible, setVisible] = useState(false);
+  const barRef = useRef<HTMLDivElement>(null);
+  const clusterRef = useRef<HTMLDivElement>(null);
+
+  /** 鼠标在 bar 内的 Y 坐标（相对于 bar 顶部） */
+  const [mouseY, setMouseY] = useState<number | null>(null);
+
+  const tickItems = useMemo<TickItem[]>(() => {
+    const items: TickItem[] = [];
+    const total = messages.length;
+    for (let i = 0; i < total; i++) {
+      const msg = messages[i];
+      if (!msg || msg.role !== 'user') continue;
+      items.push({
+        id: msg.id,
+        msgIndex: i,
+        totalMessages: total,
+        preview: getUserText(msg),
+      });
+    }
+    return items;
+  }, [messages]);
+
+  // ---- 可滚动性检测 ----
+  const updateVisibility = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const canScroll = el.scrollHeight > el.clientHeight + SCROLLABLE_THRESHOLD;
+    setVisible(canScroll && tickItems.length > 0);
+  }, [scrollRef, tickItems.length]);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const scrollEl = scrollRef.current;
-    if (!canvas || !scrollEl) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    let cssW = MINIMAP_WIDTH;
-    let cssH = 0;
-
-    const syncSize = () => {
-      const h = scrollEl.clientHeight;
-      const w = MINIMAP_WIDTH;
-      cssW = w;
-      cssH = h;
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // 绘制坐标用 CSS 像素，高分屏清晰
-    };
-
-    const draw = () => {
-      const root = document.documentElement;
-      const userHsl = getComputedStyle(root).getPropertyValue('--accent-main-000').trim();
-      const textHsl = getComputedStyle(root).getPropertyValue('--text-400').trim();
-
-      const scrollHeight = scrollEl.scrollHeight;
-      const clientHeight = scrollEl.clientHeight;
-      const scrollTop = scrollEl.scrollTop;
-
-      // 可滚动性判定：不可滚动则隐藏 minimap 并恢复原生滚动条
-      if (scrollHeight <= clientHeight + SCROLLABLE_THRESHOLD) {
-        canvas.style.display = 'none';
-        scrollEl.classList.remove('minimap-active');
-        return;
-      }
-      canvas.style.display = 'block';
-      scrollEl.classList.add('minimap-active');
-
-      const w = cssW;
-      const h = cssH;
-      ctx.clearRect(0, 0, w, h);
-      if (scrollHeight <= 0) return;
-
-      const scale = h / scrollHeight;
-      // 滚动内容顶部在视口中的坐标：用于把每个消息的视口坐标换算成 scroll 内容坐标
-      const rect = scrollEl.getBoundingClientRect();
-      const contentTopInViewport = rect.top - scrollTop;
-
-      const msgs = scrollEl.querySelectorAll<HTMLElement>('.message');
-
-      // 先画助手（窄、半透明，在后）
-      ctx.fillStyle = hsl(textHsl, 0.45);
-      for (const el of msgs) {
-        if (!el.classList.contains('assistant')) continue;
-        const r = el.getBoundingClientRect();
-        const y = (r.top - contentTopInViewport) * scale;
-        const bh = Math.max(r.height * scale, MIN_BLOCK_H);
-        ctx.fillRect(ASSISTANT_X, y, ASSISTANT_W, bh);
-      }
-      // 再画用户（宽、实心，在前）一眼区分角色与密度
-      ctx.fillStyle = hsl(userHsl, 1);
-      for (const el of msgs) {
-        if (!el.classList.contains('user')) continue;
-        const r = el.getBoundingClientRect();
-        const y = (r.top - contentTopInViewport) * scale;
-        const bh = Math.max(r.height * scale, MIN_BLOCK_H);
-        ctx.fillRect(USER_X, y, USER_W, bh);
-      }
-
-      // 视口指示框：实时反映当前可见区域
-      const vy = scrollTop * scale;
-      const vh = Math.max(clientHeight * scale, MIN_VIEWPORT_H);
-      ctx.fillStyle = 'rgba(128,128,128,0.18)';
-      ctx.fillRect(0, vy, w, vh);
-      ctx.strokeStyle = 'rgba(128,128,128,0.5)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(0.5, vy + 0.5, w - 1, vh - 1);
-    };
-
-    const runRedraw = () => {
-      redrawPendingRef.current = false;
-      draw();
-    };
-    // 节流：redrawPending 防止一帧内多次重绘；rAF 为主，setTimeout 兜底（后台页 rAF 可能不触发）
-    const scheduleRedraw = () => {
-      if (redrawPendingRef.current) return;
-      redrawPendingRef.current = true;
-      requestAnimationFrame(runRedraw);
-      window.setTimeout(() => {
-        if (redrawPendingRef.current) runRedraw();
-      }, 100);
-    };
-
-    const jump = (clientY: number) => {
-      const rect = canvas.getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
-      const maxScroll = scrollEl.scrollHeight - scrollEl.clientHeight;
-      // 拖拽时临时切 auto，避免 smooth 平滑滚动拖慢跟随
-      const prev = scrollEl.style.scrollBehavior;
-      scrollEl.style.scrollBehavior = 'auto';
-      scrollEl.scrollTop = ratio * maxScroll;
-      scrollEl.style.scrollBehavior = prev;
-    };
-
-    syncSize();
-    scheduleRedraw();
-
-    const ro = new ResizeObserver(() => {
-      syncSize();
-      scheduleRedraw();
-    });
-    ro.observe(scrollEl);
-
-    const mo = new MutationObserver(() => scheduleRedraw());
-    mo.observe(scrollEl, { childList: true, subtree: true, characterData: true });
-
-    const onScroll = () => scheduleRedraw();
-    scrollEl.addEventListener('scroll', onScroll, { passive: true });
-
-    const onMouseDown = (e: MouseEvent) => {
-      draggingRef.current = true;
-      jump(e.clientY);
-    };
-    const onMouseMove = (e: MouseEvent) => {
-      if (draggingRef.current) jump(e.clientY);
-    };
-    const onMouseUp = () => {
-      draggingRef.current = false;
-    };
-
-    canvas.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-
+    const el = scrollRef.current;
+    if (!el) return;
+    updateVisibility();
+    const ro = new ResizeObserver(updateVisibility);
+    ro.observe(el);
+    const mo = new MutationObserver(updateVisibility);
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    el.addEventListener('scroll', updateVisibility, { passive: true });
     return () => {
       ro.disconnect();
       mo.disconnect();
-      scrollEl.removeEventListener('scroll', onScroll);
-      canvas.removeEventListener('mousedown', onMouseDown);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
+      el.removeEventListener('scroll', updateVisibility);
     };
+  }, [scrollRef, updateVisibility]);
+
+  // ---- 鼠标跟踪：整个 bar 区域都是热区 ----
+  const onMouseMove = useCallback((e: React.MouseEvent) => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setMouseY(e.clientY - rect.top);
+  }, []);
+
+  const onMouseLeave = useCallback(() => {
+    setMouseY(null);
+  }, []);
+
+  // ---- 计算每条线的宽度 + 找到最近的线 ----
+  const { lineWidths, nearestIdx } = useMemo(() => {
+    const n = tickItems.length;
+    if (n === 0 || mouseY === null) {
+      return { lineWidths: new Array(n).fill(MIN_LINE_W), nearestIdx: -1 };
+    }
+
+    // 每条线的中心 Y（紧凑堆叠，相对 cluster 内容区）
+    const centers: number[] = [];
+    for (let i = 0; i < n; i++) {
+      centers.push(i * (TICK_GAP + LINE_H) + LINE_H / 2);
+    }
+
+    // 用实际 DOM 位置计算鼠标相对 cluster 的偏移（避免硬编码 padding 常量出错）
+    let myRel = mouseY;
+    if (barRef.current && clusterRef.current) {
+      const barRect = barRef.current.getBoundingClientRect();
+      const clRect = clusterRef.current.getBoundingClientRect();
+      // cluster 相对 bar 的顶部偏移
+      const clusterOffsetY = clRect.top - barRect.top;
+      myRel = mouseY - clusterOffsetY;
+    }
+
+    let minDist = Infinity;
+    let nearest = -1;
+    const widths: number[] = [];
+
+    for (let i = 0; i < n; i++) {
+      const dist = Math.abs(centers[i]! - myRel);
+      if (dist < minDist) { minDist = dist; nearest = i; }
+      const f = lorentzFalloff(dist, 10); // σ=10：约 ±17px 处衰减到 0.25
+      widths.push(Math.round(MIN_LINE_W + (MAX_LINE_W - MIN_LINE_W) * f));
+    }
+
+    return { lineWidths: widths, nearestIdx: nearest };
+  }, [tickItems, mouseY]);
+
+  // ---- 点击跳转（用 DOM 实际位置，而非比例估算）----
+  const jumpTo = useCallback((item: TickItem) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // 优先用 DOM 实际位置：消息元素有 data-msg-id 属性
+    const msgEl = el.querySelector(`[data-msg-id="${item.id}"]`) as HTMLElement | null;
+    if (msgEl) {
+      // 消息在 DOM 中 → 精确滚动到该消息
+      msgEl.scrollIntoView({ behavior: 'auto', block: 'center' });
+      return;
+    }
+    // 消息不在 DOM 中（被虚拟化裁掉了）→ 退回比例估算
+    if (item.totalMessages <= 0) return;
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    const ratio = item.msgIndex / item.totalMessages;
+    const prev = el.style.scrollBehavior;
+    el.style.scrollBehavior = 'auto';
+    el.scrollTop = ratio * maxScroll;
+    el.style.scrollBehavior = prev;
   }, [scrollRef]);
 
-  return <canvas id="minimap" ref={canvasRef} style={{ display: 'none' }} />;
+  // 点击整个 bar 时跳转到最近的线对应的消息
+  const onBarClick = useCallback(() => {
+    if (nearestIdx >= 0 && nearestIdx < tickItems.length) jumpTo(tickItems[nearestIdx]!);
+  }, [nearestIdx, tickItems, jumpTo]);
+
+  if (!visible || tickItems.length === 0) return null;
+
+  const isHovered = mouseY !== null;
+
+  return (
+    <div
+      className="density-bar"
+      ref={barRef}
+      onMouseMove={onMouseMove}
+      onMouseLeave={onMouseLeave}
+      onClick={onBarClick}
+    >
+      <div className="density-cluster" ref={clusterRef} style={{ height: `${tickItems.length * (TICK_GAP + LINE_H) - TICK_GAP}px` }}>
+        {tickItems.map((item, i) => {
+          const w = i < lineWidths.length ? lineWidths[i] : MIN_LINE_W;
+          const isNearest = i === nearestIdx && isHovered;
+          return (
+            <div key={item.id} className="density-tick" style={{ top: `${i * (TICK_GAP + LINE_H)}px` }}>
+              <span
+                className={`density-line${isNearest ? ' nearest' : ''}`}
+                style={{ width: w }}
+              />
+              {/* 只有最近的一条显示 tooltip */}
+              {isNearest && (
+                <span className="density-tooltip">{item.preview || '(空消息)'}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 };
