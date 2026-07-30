@@ -19,7 +19,7 @@ import type {
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 import { buildThemeCSS, getThemePreset } from './themes';
-import { extractDiff } from './components/DiffView';
+import { extractDiff, extractChangeSummary } from './components/DiffView';
 
 export type PartKind = 'text' | 'thinking' | 'tool';
 
@@ -890,9 +890,18 @@ export const useApp = create<AppState>((set, get) => ({
         bufferTouched = true;
         // 提取 diff 到右栏面板（仅当前显示会话）
         if (isDisplay && !isError) {
-          const diffText = extractDiff(result);
+          const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
+          let diffText = extractDiff(result);
+          // 兜底：Write 等工具的 result 不是 unified diff 格式时，
+          // 从 result + args 生成变更摘要（至少显示"改了哪个文件"）
+          if (!diffText) {
+            // 从 buffer 中找该工具的 args（tool_execution_start 时存入）
+            const toolPart = buf.flatMap((m) => m.parts).find(
+              (p) => p.kind === 'tool' && p.toolCallId === toolCallId,
+            ) as ToolPart | undefined;
+            diffText = extractChangeSummary(result, toolName, toolPart?.args);
+          }
           if (diffText) {
-            const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
             const curDiffs = get().diffs;
             set({ diffs: [...curDiffs.slice(-19), { toolName, diff: diffText }] });
           }
