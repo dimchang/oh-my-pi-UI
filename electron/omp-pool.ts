@@ -20,6 +20,8 @@ export interface PoolEntry {
   sessionPath: string;
   cwd: string;
   approvalMode: ApprovalMode;
+  /** 该进程启动时注入的 hook 路径列表（顺序无关）。用于配置变更后识别是否需要重起。 */
+  hooks: string[];
   proc: OmpProcess;
   router: FrameRouter;
   lastActiveAt: number;
@@ -36,6 +38,15 @@ export interface PoolEvents {
 
 const DEFAULT_MAX_POOL = 5;
 const SPAWN_TIMEOUT_MS = 30_000;
+
+/** 比较两组 hook 路径是否等价（忽略顺序与重复）。 */
+function hooksEqual(a: string[] | undefined, b: string[] | undefined): boolean {
+  const sa = new Set(a ?? []);
+  const sb = new Set(b ?? []);
+  if (sa.size !== sb.size) return false;
+  for (const x of sa) if (!sb.has(x)) return false;
+  return true;
+}
 
 export class OmpProcessPool {
   private entries = new Map<string, PoolEntry>();
@@ -109,8 +120,14 @@ export class OmpProcessPool {
   async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'write', hooks?: string[]): Promise<PoolEntry> {
     const existing = this.entries.get(sessionPath);
     if (existing && existing.status === 'online') {
-      existing.lastActiveAt = Date.now();
-      return existing;
+      // hook 配置变更后必须重起进程，否则老进程不带新 --hook（issue: 导入钩子后不生效）。
+      if (!hooksEqual(existing.hooks, hooks)) {
+        this.events.onLog(`[pool] hooks changed for ${sessionPath}, respawning`);
+        this.evict(sessionPath);
+      } else {
+        existing.lastActiveAt = Date.now();
+        return existing;
+      }
     }
     const pending = this.spawning.get(sessionPath);
     if (pending) return pending;
@@ -260,6 +277,7 @@ export class OmpProcessPool {
         sessionPath,
         cwd: normalizedCwd,
         approvalMode,
+        hooks: hooks ? [...hooks] : [],
         // 占位，proc 创建后立即覆盖（entry 已同步注册，killAll 在 spawn 完成前不会用到它）。
         proc: undefined as unknown as OmpProcess,
         router,

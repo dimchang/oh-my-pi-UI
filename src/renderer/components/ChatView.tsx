@@ -42,6 +42,28 @@ const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown
   );
 };
 
+/** 判断一段文本是否像是原始文件/代码内容（而非普通 markdown 正文）。
+ *  用于把模型直接贴出的文件内容（如 JSDoc 注释、源码、grep 结果）按 <pre> 渲染，
+ *  避免 `*` 行被解释成 markdown 列表、同时启用默认折叠。 */
+function looksLikeFileContent(text: string): boolean {
+  if (text.includes('```')) return false; // 已有代码围栏，交给 markdown 处理
+  const lines = text.split('\n');
+  if (lines.length < 3) return false;
+  const nonEmpty = lines.filter((l) => l.trim() !== '');
+  if (nonEmpty.length < 2) return false;
+  const first = nonEmpty[0]!.trim();
+  // 常见源码/注释开头
+  if (/^(\/\*\*?|\/\/|#|import\b|export\b|function\b|class\b|const\b|let\b|var\b|package\b|using\b|module\b|<\?xml|^[\[\{])/.test(first)) {
+    return true;
+  }
+  // grep / glob 结果行：path[:line:content] 或纯路径
+  if (/^[\w.\-\/\\\\]+(:\d+:)?.+/.test(first)) {
+    const pathLike = nonEmpty.filter((l) => /^[\w.\-\/\\\\]+(:\d+:)?.+/.test(l.trim()));
+    if (pathLike.length / nonEmpty.length > 0.7) return true;
+  }
+  return false;
+}
+
 const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage }) {
   return (
       <div
@@ -55,6 +77,15 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
       <div className="msg-body">
         {msg.parts.map((p, i) => {
           if (p.kind === 'text') {
+            // 若文本像是直接贴出的文件/代码内容，按代码块渲染并默认折叠，
+            // 避免 JSDoc `*`、路径列表等被 markdown 错误解析。
+            if (looksLikeFileContent(p.text)) {
+              return (
+                <CollapsibleCodeBlock key={`text-${i}`}>
+                  <code>{p.text}</code>
+                </CollapsibleCodeBlock>
+              );
+            }
             return (
               <ReactMarkdown
                 key={`text-${i}`}

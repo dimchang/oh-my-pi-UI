@@ -421,6 +421,9 @@ function registerIpc(): void {
     if (!sensitiveLimiter.allow('workspaces-save')) throw new Error('操作过于频繁，请稍后再试');
     if (!file || file.version !== 1) throw new Error('invalid workspaces file');
     if (!Array.isArray(file.workspaces)) throw new Error('invalid workspaces: workspaces must be an array');
+    // hook 配置变更后需重起 omp 进程才生效，但不在保存时批量驱逐——那会误杀正在工作的进程
+    // （等 LLM 回复 / 处理文件 / 弹工具确认框）。改用懒驱逐：acquire 时比对 hooks，命中变更才在
+    // 下一轮交互（会话空闲、处于两轮之间）时重起该进程，不中断任何进行中的任务。
     await saveWorkspacesFile(file);
   });
   ipcMain.handle(IPC.DialogOpenDir, async (_e, defaultPath?: string) => {
