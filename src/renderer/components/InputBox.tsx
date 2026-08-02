@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useApp, type Attachment } from '../store';
+import { useApp, isImageFile, type Attachment } from '../store';
 import { rpc } from '../rpc-client';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
@@ -7,6 +7,52 @@ import { PermissionPicker } from './PermissionPicker';
 import { Icon } from './Icon';
 import type { ApprovalMode } from '../../shared/ipc-channels';
 import type { SlashCommand } from '../../shared/rpc-types';
+
+/** 单条附件芯片：图片附件懒加载缩略图，文件附件走原 file 芯片。
+ *  缩略图加载失败（文件被清理/无权限）自动回退为文件芯片，绝不白屏。 */
+const AttachmentChip: React.FC<{
+  att: Attachment;
+  onRemove: (p: string) => void;
+  onOpen: (p: string) => void;
+}> = ({ att, onRemove, onOpen }) => {
+  const [thumb, setThumb] = useState<string | null>(null);
+  const [thumbErr, setThumbErr] = useState(false);
+  const isImg = isImageFile(att.name);
+  useEffect(() => {
+    if (!isImg) return;
+    let cancelled = false;
+    window.omp.readImageAsDataUrl(att.path)
+      .then((r) => { if (!cancelled) setThumb(r.dataUrl); })
+      .catch(() => { if (!cancelled) setThumbErr(true); });
+    return () => { cancelled = true; };
+  }, [att.path, isImg]);
+
+  if (isImg && thumb && !thumbErr) {
+    return (
+      <span className="attachment-chip attachment-chip-img" title={att.path}>
+        <img className="attachment-thumb" src={thumb} alt={att.name} onClick={() => onOpen(att.path)} />
+        <button type="button" className="attachment-remove" title="移除附件" onClick={() => onRemove(att.path)}>
+          <Icon name="close" size={12} />
+        </button>
+      </span>
+    );
+  }
+  return (
+    <span className="attachment-chip" title={att.path}>
+      <Icon name="file" size={13} />
+      <span
+        className="attachment-name"
+        role="button"
+        tabIndex={0}
+        onClick={() => onOpen(att.path)}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onOpen(att.path); }}
+      >{att.name}</span>
+      <button type="button" className="attachment-remove" title="移除附件" onClick={() => onRemove(att.path)}>
+        <Icon name="close" size={12} />
+      </button>
+    </span>
+  );
+};
 
 export const InputBox: React.FC<{
   onSend: (text: string, attachments?: Attachment[]) => void;
@@ -30,6 +76,9 @@ export const InputBox: React.FC<{
   const cwd = useApp((s) => s.currentWorkspace()?.cwd ?? '');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // 拖拽高亮状态：dragDepth 计数器避免子元素触发 dragleave 导致高亮闪烁/误复位
+  const dragDepthRef = useRef(0);
+  const [isDragOver, setIsDragOver] = useState(false);
   // 提交防重复：onSend 把状态切到 streaming 有一帧延迟，期间按两次 Enter 会重复发送
   const submittingRef = useRef(false);
 
@@ -56,14 +105,18 @@ export const InputBox: React.FC<{
       cmdFetchedRef.current = true;
       const sp = useApp.getState().currentSessionPath;
       if (sp) {
-        void rpc.getAvailableCommands(sp).then((r) => {
-          if (r.success && r.data) {
-            const cmds = r.data.commands;
-            if (Array.isArray(cmds) && cmds.length > 0) {
-              useApp.getState().setState({ slashCommands: cmds as SlashCommand[] });
+        // 会话可能只是浏览（未拉起进程）：先按需拉起，再拉命令列表
+        void useApp.getState().ensureOnline(sp).then((ok) => {
+          if (!ok) return;
+          void rpc.getAvailableCommands(sp).then((r) => {
+            if (r.success && r.data) {
+              const cmds = r.data.commands;
+              if (Array.isArray(cmds) && cmds.length > 0) {
+                useApp.getState().setState({ slashCommands: cmds as SlashCommand[] });
+              }
             }
-          }
-        }).catch(() => undefined);
+          }).catch(() => undefined);
+        });
       }
       // 5秒后允许再次尝试（避免永久锁死）
       setTimeout(() => { cmdFetchedRef.current = false; }, 5000);
@@ -113,6 +166,70 @@ export const InputBox: React.FC<{
   // 打开附件：本地文件走 shell.showItemInFolder（在文件管理器中定位并高亮）
   const openAttachment = (path: string) => {
     void window.omp.showItemInFolder(path).catch((err) => console.error('openAttachment 失败', err));
+  };
+
+  // 把一张图片存盘并加入待发送附件（粘贴 / 拖拽共用）。渲染侧先做大小前置校验（避免大图白序列化跨进程）。
+  const addImageAttachment = async (buf: ArrayBuffer, ext: string) => {
+    try {
+      const res = await window.omp.savePastedImage(buf, ext);
+      if (res) {
+        setAttachments((prev) =>
+          prev.some((x) => x.path === res.path) ? prev : [...prev, { path: res.path, name: res.name, size: res.size, kind: 'image' }],
+        );
+      }
+    } catch (err) {
+      console.error('保存图片附件失败', err);
+    }
+  };
+
+  // 粘贴：仅当剪贴板含 image/* 才拦截；纯文本粘贴完全不拦（防回归：文本复制/粘贴行为不变）
+  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageItems = Array.from(items).filter((it) => it.type.startsWith('image/'));
+    if (imageItems.length === 0) return;
+    e.preventDefault(); // 同步拦截，避免图片被塞进文本框
+    const MAX = 10 * 1024 * 1024;
+    for (const item of imageItems) {
+      const blob = item.getAsFile();
+      if (!blob) continue;
+      if (blob.size > MAX) { console.warn('粘贴的图片超过 10MB，已忽略'); continue; }
+      const buf = await blob.arrayBuffer();
+      const ext = (item.type.split('/')[1] || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+      await addImageAttachment(buf, ext);
+    }
+  };
+
+  // 拖拽：仅对 Files 类型生效；onDragOver 必须 preventDefault 否则 drop 不触发
+  const isFileDrag = (e: React.DragEvent) => !!e.dataTransfer?.types?.includes('Files');
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDragOver(true);
+  };
+  const onDragOver = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    dragDepthRef.current -= 1;
+    if (dragDepthRef.current <= 0) { dragDepthRef.current = 0; setIsDragOver(false); }
+  };
+  const onDrop = async (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDragOver(false);
+    const MAX = 10 * 1024 * 1024;
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'));
+    for (const f of files) {
+      if (f.size > MAX) { console.warn('拖入的图片超过 10MB，已忽略'); continue; }
+      const buf = await f.arrayBuffer();
+      const ext = (f.name.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+      await addImageAttachment(buf, ext);
+    }
   };
 
   /**
@@ -223,23 +340,17 @@ export const InputBox: React.FC<{
             ))}
           </div>
         )}
-        <div className="input-box">
+        <div
+          className={`input-box${isDragOver ? ' drag-over' : ''}`}
+          onDragEnter={onDragEnter}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+        >
           {attachments.length > 0 && (
             <div className="attachment-chips">
               {attachments.map((a) => (
-                <span className="attachment-chip" key={a.path} title={a.path}>
-                  <Icon name="file" size={13} />
-                  <span
-                    className="attachment-name"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openAttachment(a.path)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openAttachment(a.path); }}
-                  >{a.name}</span>
-                  <button type="button" className="attachment-remove" title="移除附件" onClick={() => removeAttachment(a.path)}>
-                    <Icon name="close" size={12} />
-                  </button>
-                </span>
+                <AttachmentChip key={a.path} att={a} onRemove={removeAttachment} onOpen={openAttachment} />
               ))}
             </div>
           )}
@@ -249,9 +360,15 @@ export const InputBox: React.FC<{
             value={draft}
             placeholder={placeholder}
             onChange={(e) => { setDraft(e.target.value); setSelIdx(0); autoGrow(); }}
-            onFocus={() => setFocused(true)}
+            onFocus={() => {
+              setFocused(true);
+              // 仅浏览会话时进程未拉起：聚焦输入框即表示要开始对话，按需懒拉起
+              const sp = useApp.getState().currentSessionPath;
+              if (sp) void useApp.getState().ensureOnline(sp);
+            }}
             onBlur={() => setFocused(false)}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
           />
           <div className="input-toolbar">
             <div className="input-toolbar-left">

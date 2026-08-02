@@ -23,6 +23,12 @@ export const IPC = {
   ListFiles: 'fs:list-files', // (dirPath: string) => Promise<FileEntry[]>
   RendererReady: 'renderer:ready', // () => void — 渲染进程就绪（多进程下不再直接起 omp，仅通知）
 
+  // 技能（Skills）管理：扫描安装目录 + 读写 ~/.omp/agent/config.yml 的 skills.* 配置
+  SkillsList: 'skills:list', // () => Promise<SkillInfo[]> — 扫描已安装技能（含已停用），enabled 来自 config.yml skills.ignoredSkills
+  SkillsDetail: 'skills:detail', // (name: string) => Promise<SkillDetail> — 读 SKILL.md（front-matter + 正文）用于详情页
+  SkillsSetEnabled: 'skills:set-enabled', // (name: string, enabled: boolean) => Promise<SkillInfo[]> — 启停技能（改 config.yml skills.ignoredSkills）
+  SkillsUninstall: 'skills:uninstall', // (name: string) => Promise<{ ok: boolean; moved: string[]; error?: string }> — 卸载（移到 skills-trash）
+
   // M5: 工作空间（按目录归类管理会话）
   WorkspacesGet: 'workspaces:get', // () => Promise<WorkspacesFile>
   WorkspacesSave: 'workspaces:save', // (file: WorkspacesFile) => Promise<void>
@@ -72,9 +78,56 @@ export const IPC = {
   // 上下文文件（AGENTS.md / SYSTEM.md / APPEND_SYSTEM.md / RULES.md）读写
   ContextFileRead: 'context:read', // (filePath: string) => Promise<string> — 读取上下文文件（不存在返回空串）
   ContextFileWrite: 'context:write', // (filePath: string, content: string) => Promise<void> — 写入上下文文件（自动创建目录）
+
+  // 图片：粘贴/拖拽落盘 + 读取为 data URL（聊天框贴图功能）
+  SavePastedImage: 'image:save-pasted', // (data: ArrayBuffer, ext: string) => Promise<PastedImageResult> — 存剪贴板/拖拽图片到 userData/pasted-images
+  ReadImageAsDataUrl: 'image:read-as-dataurl', // (filePath: string) => Promise<ImageDataUrlResult> — 读图片为 data URL（白名单防本地文件泄露）
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
+
+/** 粘贴/拖拽图片落盘结果（主进程存盘后回传渲染进程，渲染进程按 Attachment 使用） */
+export interface PastedImageResult {
+  /** 文件绝对路径（userData/pasted-images/...） */
+  path: string;
+  /** 文件名（basename） */
+  name: string;
+  /** 字节大小 */
+  size: number;
+}
+
+/** 读取图片为 data URL 的结果 */
+export interface ImageDataUrlResult {
+  /** 形如 `data:image/png;base64,....` 的可直接用于 <img src> 的字符串 */
+  dataUrl: string;
+}
+
+/** 技能条目（技能页卡片用） */
+export interface SkillInfo {
+  /** 技能名（如 agentmail，不带 skill: 前缀） */
+  name: string;
+  /** SKILL.md front-matter 里的 description */
+  description?: string;
+  /** 是否启用（= 不在 config.yml skills.ignoredSkills 里） */
+  enabled: boolean;
+  /** 技能目录（SKILL.md 所在目录；扫描到才给，用于详情/卸载） */
+  path?: string;
+  /** 技能来源（agents / claude / codex / custom，可空） */
+  source?: string;
+}
+
+/** 技能详情（点卡片后展示，对应 SKILL.md 内容） */
+export interface SkillDetail {
+  name: string;
+  description?: string;
+  enabled: boolean;
+  /** SKILL.md 所在目录（扫描到才给） */
+  path?: string;
+  /** SKILL.md 正文（去掉 front-matter 后的 Markdown） */
+  body?: string;
+  /** front-matter 元数据键值（name/description/agent_created 等） */
+  metadata?: Record<string, unknown>;
+}
 
 /** 文件选择结果（主进程 stat 后回传：绝对路径 + 名称 + 字节数） */
 export interface PickedFile {
@@ -333,6 +386,12 @@ export interface OmpApi {
   writeOmpProvider(id: string, cfg: OmpProviderConfig): Promise<void>;
   deleteOmpProvider(id: string): Promise<void>;
 
+  // 技能（Skills）管理
+  skillsList(): Promise<SkillInfo[]>;
+  skillsDetail(name: string): Promise<SkillDetail>;
+  skillsSetEnabled(name: string, enabled: boolean): Promise<SkillInfo[]>;
+  skillsUninstall(name: string): Promise<{ ok: boolean; moved: string[]; error?: string }>;
+
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow(): Promise<void>;
   maximizeWindow(): Promise<void>;
@@ -371,4 +430,11 @@ export interface OmpApi {
   readContextFile(filePath: string): Promise<string>;
   /** 写入上下文文件（自动创建父目录，空内容则删除文件） */
   writeContextFile(filePath: string, content: string): Promise<void>;
+
+  // 图片：粘贴/拖拽落盘 + 读取为 data URL
+  /** 保存粘贴/拖拽的图片到临时目录（userData/pasted-images），返回路径 + 名称 + 大小。
+   *  主进程做扩展名白名单 + 10MB 大小校验 + 位图自动 resize（gif/svg 原样）。 */
+  savePastedImage(data: ArrayBuffer, ext: string): Promise<PastedImageResult>;
+  /** 读取图片文件为 data URL（仅允许 pasted-images/ 或工作区内图片，防本地文件泄露）。失败抛错。 */
+  readImageAsDataUrl(filePath: string): Promise<ImageDataUrlResult>;
 }

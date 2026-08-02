@@ -5,7 +5,7 @@
  * pool 上限 5（可配），LRU 淘汰 idle 进程，懒加载。
  */
 
-import { app, BrowserWindow, ipcMain, shell, dialog, clipboard, Menu, type MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog, clipboard, Menu, nativeImage, type MenuItemConstructorOptions } from 'electron';
 import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -17,8 +17,9 @@ app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 import { OmpProcessPool } from './omp-pool';
 import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
 import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
+import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
 import { IPC } from '../src/shared/ipc-channels';
-import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig } from '../src/shared/ipc-channels';
+import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -383,6 +384,14 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.SessionMessages, async (_e, p: string) => readSessionMessages(p));
   ipcMain.handle(IPC.SessionUserEntries, async (_e, p: string) => readUserEntries(p));
+  // 技能（Skills）管理
+  ipcMain.handle(IPC.SkillsList, async () => listSkills());
+  ipcMain.handle(IPC.SkillsDetail, async (_e, name: string) => readSkillDetail(name));
+  ipcMain.handle(IPC.SkillsSetEnabled, async (_e, name: string, enabled: boolean) => {
+    await setSkillEnabled(name, enabled);
+    return listSkills();
+  });
+  ipcMain.handle(IPC.SkillsUninstall, async (_e, name: string) => uninstallSkill(name));
 
   ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown', agentDir: getAgentDir() }));
 
@@ -449,6 +458,79 @@ function registerIpc(): void {
       }),
     );
   });
+
+  // ---- 图片：粘贴/拖拽落盘 + 读取为 data URL ----
+  ipcMain.handle(IPC.SavePastedImage, async (_e, data: ArrayBuffer, ext: string) => {
+    // 扩展名白名单（决定能不能存）：png/jpg/jpeg/gif/webp/bmp/svg
+    const SAVE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
+    // resize 白名单（仅位图；gif/svg 不支持/会丢信息，原样写盘）
+    const RESIZE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp']);
+    const MAX_BYTES = 10 * 1024 * 1024; // 10MB 上限
+
+    const e = (ext || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!SAVE_EXT.has(e)) throw new Error('不支持的图片格式: ' + (ext || ''));
+    const bytes: Buffer = Buffer.from(data);
+    if (bytes.byteLength > MAX_BYTES) throw new Error('图片过大（超过 10MB），请改用更小的图片');
+
+    const dir = path.join(app.getPath('userData'), 'pasted-images');
+    await fs.promises.mkdir(dir, { recursive: true });
+
+    let out: Buffer = bytes;
+    let outExt = e;
+    // 大位图自动缩放（最长边 1280px），缩小跨进程 data URL / 磁盘占用；gif/svg 跳过
+    if (RESIZE_EXT.has(e) && bytes.byteLength > 1024 * 1024) {
+      try {
+        const img = nativeImage.createFromBuffer(bytes);
+        if (!img.isEmpty()) {
+          const d = img.getSize();
+          const maxW = 1280;
+          if (d.width > maxW) {
+            const rbuf = img.resize({ width: maxW }).toPNG();
+            if (rbuf && rbuf.byteLength) { out = rbuf; outExt = 'png'; } // resize 后统一转 PNG，避免格式错位
+          }
+        }
+      } catch { /* resize 失败就原样写盘 */ }
+    }
+
+    const name = `paste-${Date.now()}-${randomUUID().slice(0, 8)}.${outExt}`;
+    const filePath = path.join(dir, name);
+    await fs.promises.writeFile(filePath, out);
+    return { path: filePath, name, size: out.byteLength } as PastedImageResult;
+  });
+
+  ipcMain.handle(IPC.ReadImageAsDataUrl, async (_e, filePath: string) => {
+    const MIME: Record<string, string> = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+      webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+    };
+    const VIEW_EXT = new Set(Object.keys(MIME));
+    const e = path.extname(filePath || '').toLowerCase().replace(/^\./, '').replace(/[^a-z0-9]/g, '');
+    if (!VIEW_EXT.has(e)) throw new Error('不支持的图片格式');
+
+    // 安全白名单：仅允许读取 pasted-images/ 或工作区内的图片，防本地文件泄露（含符号链接逃逸）
+    const userDataDir = app.getPath('userData');
+    const pastedDir = path.join(userDataDir, 'pasted-images');
+    let pastedDirReal: string | null = null;
+    try { pastedDirReal = (await fs.promises.realpath(pastedDir)).toLowerCase(); } catch { pastedDirReal = null; }
+    let allowed = false;
+    if (pastedDirReal) {
+      let real: string;
+      try { real = (await fs.promises.realpath(filePath)).toLowerCase(); }
+      catch { real = path.resolve(filePath).toLowerCase(); }
+      if (real === pastedDirReal || real.startsWith(pastedDirReal + path.sep)) allowed = true;
+    }
+    if (!allowed && (await isWithinWorkspaces(filePath))) allowed = true;
+    if (!allowed) throw new Error('禁止读取该路径的图片');
+
+    const buf = await fs.promises.readFile(filePath);
+    const b64 = buf.toString('base64');
+    const mime = MIME[e] || 'application/octet-stream';
+    return { dataUrl: `data:${mime};base64,${b64}` } as ImageDataUrlResult;
+  });
+
+
+  // 启动清理：删除 pasted-images/ 中超过 14 天的文件，避免无限增长（fire-and-forget）
+  void cleanupPastedImages();
 
   // ---- 钩子（Hooks）管理 ----
   ipcMain.handle(IPC.OmpPickHookFiles, async () => {
@@ -563,6 +645,9 @@ app.whenReady().then(() => {
   }
   ompVersion = resolveOmpVersion(ompPath);
 
+  // 启动时确保 vision 模式为 on（默认 auto 不会对已配置视觉模型的 provider 强制启用 inspect_image）
+  try { execSync(`"${ompPath}" config set inspect_image.mode on`, { encoding: 'utf8', timeout: 5000 }); } catch { /* best-effort */ }
+
   // 初始化进程池
   pool = new OmpProcessPool(ompPath, {
     onFrame: (sessionPath, frame) => {
@@ -668,6 +753,26 @@ async function isWithinWorkspaces(dirPath: string): Promise<boolean> {
     if (target === base || target.startsWith(base + path.sep)) return true;
   }
   return false;
+}
+
+/** 删除 userData/pasted-images 中超过 14 天的文件，避免粘贴图片无限增长。
+ *  只触碰 pasted-images 目录本身，任何异常都吞掉（不影响启动）。 */
+async function cleanupPastedImages(): Promise<void> {
+  try {
+    const dir = path.join(app.getPath('userData'), 'pasted-images');
+    let entries: fs.Dirent[];
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+    catch { return; } // 目录不存在则跳过
+    const MAX_AGE = 14 * 24 * 3600 * 1000;
+    const now = Date.now();
+    await Promise.all(entries.filter((en) => en.isFile()).map(async (en) => {
+      try {
+        const fp = path.join(dir, en.name);
+        const st = await fs.promises.stat(fp);
+        if (now - st.mtimeMs > MAX_AGE) await fs.promises.unlink(fp);
+      } catch { /* ignore */ }
+    }));
+  } catch { /* ignore */ }
 }
 
 /** 静态解析一个 .ts 钩子文件：默认导出 / 具名导出 / pi.on 事件名。不执行代码。 */

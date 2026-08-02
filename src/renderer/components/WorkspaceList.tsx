@@ -69,6 +69,8 @@ export const WorkspaceList: React.FC<{
   const currentWorkspaceId = useApp((s) => s.currentWorkspaceId);
   // 已加载的 omp 命令（含 skills / 插件来源）—— 仅用于技能卡片计数
   const slashCommands = useApp((s) => s.slashCommands);
+  // 已安装技能列表（技能页网格；加载后优先用它计数，更完整）
+  const installedSkills = useApp((s) => s.skills);
   // 主工作区当前视图（chat | skills）—— 技能卡片激活态
   const mainView = useApp((s) => s.mainView);
   const [search, setSearch] = useState('');
@@ -195,7 +197,9 @@ export const WorkspaceList: React.FC<{
         <span className="skill-card-icon"><Icon name="skill" size={15} /></span>
         <span className="skill-card-label">技能</span>
         <span className="skill-card-count">
-          {slashCommands.filter((c) => c.source === 'skill').length}
+          {installedSkills.length > 0
+            ? installedSkills.length
+            : slashCommands.filter((c) => c.source === 'skill').length}
         </span>
       </button>
 

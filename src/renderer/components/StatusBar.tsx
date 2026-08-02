@@ -15,13 +15,20 @@ export const StatusBar: React.FC = () => {
   const thinking = useApp((s) => s.thinkingLevel);
   // 直接从 selector 参数 s 中 find，避免在 selector 内调用 get() 破坏响应式订阅
   const currentWorkspace = useApp((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId) ?? null);
+  // 当前会话的进程状态：仅浏览未拉起的会话显示"未连接"（输入时自动连接）
+  const currentSessionPath = useApp((s) => s.currentSessionPath);
+  const ps = useApp((s) => (s.currentSessionPath ? s.procStateMap[s.currentSessionPath] : undefined));
+  const browsing = !!currentSessionPath && (!ps || ps.status === 'offline' || ps.status === 'evicted');
+  const spawning = !!currentSessionPath && ps?.status === 'spawning';
 
   // sessionStats 不再在这里一次性拉取：改由 App.refreshState 统一驱动
   // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
 
-  const dot = typeof exited === 'number' ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
+  const dot = browsing ? 'off' : spawning ? 'busy' : typeof exited === 'number' ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
   const statusText =
-    typeof exited === 'number' ? `omp 已退出 (${exited})`
+    browsing ? '未连接（输入时自动连接）'
+      : spawning ? '连接中'
+      : typeof exited === 'number' ? `omp 已退出 (${exited})`
       : isCompacting ? '压缩中'
       : isRetrying ? '重试中'
       : isStreaming ? '生成中'

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useApp, type UiRequest, type Attachment, toolNameOf } from './store';
+import { useApp, type UiRequest, type Attachment, toolNameOf, isImageFile } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -14,8 +14,9 @@ import { TodoPanel } from './components/TodoPanel';
 import { DiffView } from './components/DiffView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
+import { stripDataUrlPrefix } from './utils/image-data-url';
 import { applyAppearance } from './store';
-import type { OmpFrame, RpcExtensionUIRequest, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
+import type { OmpFrame, RpcExtensionUIRequest, RpcImage, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
 
 export default function App(): React.ReactElement {
@@ -85,6 +86,10 @@ export default function App(): React.ReactElement {
   /** 拉取某会话进程的可用技能 / 命令列表。
    *  若首次返回空（omp 刚 ready 可能尚未注册完命令），自动延迟重试一次。 */
   const refreshCommands = useCallback((sessionPath: string, retry = true): void => {
+    // 会话进程已不在线（被 LRU 淘汰 / 退出 / 尚未拉起）→ 不盲发命令，避免主进程抛
+    // "omp process not online"（渲染层状态由 OmpExit 事件同步为 offline）；
+    // 重新拉起后 onReady 会再次调用本函数拉取命令列表。
+    if (useApp.getState().procStateMap[sessionPath]?.status !== 'online') return;
     void rpc.getAvailableCommands(sessionPath).then((r) => {
       if (r.success && r.data) {
         const cmds = r.data.commands;
@@ -106,6 +111,9 @@ export default function App(): React.ReactElement {
 
   /** 迁移中的 temp key 集合（并发保护）：同一 __new_ 会话的多次 agent_end 只处理一次。 */
   const migratingTempKeys = useRef<Set<string>>(new Set());
+  /** 新建会话前已知的真实 session path 快照。
+   *  tempKey→realPath 迁移时不再靠 mtime 猜，而是找同 cwd 下"本次新建之后才出现"的真实 path。 */
+  const knownSessionPathsBeforeNew = useRef<Set<string>>(new Set());
 
   /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
    *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
@@ -120,10 +128,13 @@ export default function App(): React.ReactElement {
     const done = () => migratingTempKeys.current.delete(cur);
     const cwd = st.currentWorkspace()?.cwd;
     if (!cwd) { done(); return; }
-    const newest = st.sessions
-      .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
-      .sort((a, b) => b.mtime - a.mtime)[0];
+    // 用"新建前快照"找真正刚落盘的新会话，而不是靠 mtime 猜（否则首条消息 agent_end 前可能命中旧会话）。
+    const candidates = st.sessions
+      .filter((x) => cwdKey(x.cwd) === cwdKey(cwd) && x.path !== cur && !knownSessionPathsBeforeNew.current.has(x.path))
+      .sort((a, b) => b.mtime - a.mtime);
+    const newest = candidates[0];
     if (!newest || newest.path === cur) { done(); return; }
+    knownSessionPathsBeforeNew.current.add(newest.path);
     const buf = st.sessionsMap[cur];
     const ps = st.procStateMap[cur];
     const sessionsMap = { ...st.sessionsMap };
@@ -325,25 +336,26 @@ export default function App(): React.ReactElement {
     }
     const cwd = st.currentWorkspace()?.cwd ?? '';
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+    // 图片始终通过 prompt.images 内联发送（与原生 OMP 行为一致）。
+    // omp 运行时会自动处理：视觉模型直接看图；纯文本 orchestrator 则通过 vision 角色
+    // 预处理生成图片描述注入上下文（image-attachment-description 帧）。
+    // 关键：images 必须是「图片对象数组」(RpcImage)，裸字符串数组会被 OMP 当文本透传。
+    // 更进一步：对象须带 blob:sha256: URI（经 omp blob 入库）才能触发 vision 路由，
+    // 等同原生 OMP 的 @image.png 入库机制（见 probe-blob*.mjs / probe-img-shapes.mjs 实测）。
     const promptText = buildPromptWithAttachments(text, attachments);
     const doSend = async () => {
-      // temp key 保护：若当前会话仍是临时 key（迁移未完成），先尝试迁移到真实路径
-      if (sp!.startsWith('__new_')) {
-        await refreshSessions();
-        migrateTempSession();
-        const migrated = useApp.getState().currentSessionPath;
-        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
-      }
-      // 懒拉起该会话的进程。已在线则 no-op。
+      const imageRefs = await collectImageRefs(attachments);
+      // temp key 会话直接发给它绑定的进程即可；agent_end 时 migrateTempSession 会正确迁移到真实 path。
+      // 不在发送前做 mtime 猜测式迁移——那会在真实 .jsonl 落盘前误迁到旧会话（issue: 新会话输入串到旧会话）。
       await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { attachments });
-      await rpc.prompt(sp!, promptText);
+      await rpc.prompt(sp!, promptText, imageRefs);
       refreshSessions();
     };
     void doSend().catch((err) =>
       pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, migrateTempSession]);
+  }, [pushToast, refreshSessions]);
 
   /** Help 菜单 "Stats" 子项：等同于在当前会话输入 /stats 并提交。 */
   useEffect(() => {
@@ -364,21 +376,17 @@ export default function App(): React.ReactElement {
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
     const promptText = buildPromptWithAttachments(text, attachments);
     const doGuide = async () => {
-      if (sp!.startsWith('__new_')) {
-        await refreshSessions();
-        migrateTempSession();
-        const migrated = useApp.getState().currentSessionPath;
-        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
-      }
+      const imageRefs = await collectImageRefs(attachments);
+      // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
       await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { steered: true, attachments });
-      await rpc.steer(sp!, promptText);
+      await rpc.steer(sp!, promptText, imageRefs);
       refreshSessions();
     };
     void doGuide().catch((err) =>
       pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, migrateTempSession]);
+  }, [pushToast, refreshSessions]);
 
   /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
   const onQueue = useCallback((text: string, attachments?: Attachment[]) => {
@@ -392,21 +400,17 @@ export default function App(): React.ReactElement {
     const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
     const promptText = buildPromptWithAttachments(text, attachments);
     const doQueue = async () => {
-      if (sp!.startsWith('__new_')) {
-        await refreshSessions();
-        migrateTempSession();
-        const migrated = useApp.getState().currentSessionPath;
-        if (migrated && !migrated.startsWith('__new_')) sp = migrated;
-      }
+      const imageRefs = await collectImageRefs(attachments);
+      // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
       await rpc.acquire(sp!, cwd, approvalMode);
       useApp.getState().appendUserMessage(text, { queued: true, attachments });
-      await rpc.followUp(sp!, promptText);
+      await rpc.followUp(sp!, promptText, imageRefs);
       refreshSessions();
     };
     void doQueue().catch((err) =>
       pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, migrateTempSession]);
+  }, [pushToast, refreshSessions]);
 
   // 中止当前 agent 轮
   const onAbort = useCallback(() => {
@@ -451,6 +455,10 @@ export default function App(): React.ReactElement {
     try {
       pushToast('正在新建会话…', 'info');
       // 多进程：spawn 不带 -c（新 .jsonl），主进程 listSessions 解析新 path 返回
+      // 先快照当前已知真实 path，tempKey→realPath 迁移时用它识别真正的新会话，避免误迁到旧会话。
+      knownSessionPathsBeforeNew.current = new Set(
+        st.sessions.map((s) => s.path).filter((p) => !p.startsWith('__new_')),
+      );
       const { sessionPath } = await rpc.newSessionForCwd(targetCwd, targetMode);
       await resolveAndSelectNewSession(sessionPath);
     } catch (e) {
@@ -516,18 +524,22 @@ export default function App(): React.ReactElement {
     if (!stNow.sessionsMap[s.path]) {
       useApp.getState().loadSessionMessages(s.path);
     }
-    // 若进程未在线，懒拉起（带 -c 续接，用户切来即续接，不必等发消息）
-    if (!ps || ps.status !== 'online') {
-      const approvalMode = targetWs?.approvalMode ?? 'write';
-      void rpc.acquire(s.path, s.cwd, approvalMode).catch((e) =>
-        pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
-      );
-    } else if (s.path === useApp.getState().currentSessionPath) {
+    if (ps?.status === 'online') {
       // 已在线：刷新状态栏（model/thinking 等可能与其他会话不同）
       void refreshState(s.path);
+      refreshCommands(s.path);
+    } else {
+      // 仅浏览历史：**不立刻拉起 omp 进程**（issue: 连续点不同会话会触发
+      // "进程池已满且所有会话都在等待用户确认" 且白白占用进程）。
+      // 等用户真正输入/发送时，由 InputBox 聚焦 / ensureOnline / onSend 按需懒拉起。
+      // 清掉上一会话残留的状态栏数据，避免串数据（新值在拉起后由 refreshState 填充）。
+      useApp.getState().setState({
+        model: undefined,
+        thinkingLevel: undefined,
+        contextUsage: undefined,
+        sessionStats: undefined,
+      });
     }
-    // 无论在线与否都刷新命令列表（在线直接拉，离线等 acquire → onReady 再拉一次）
-    if (ps?.status === 'online') refreshCommands(s.path);
   }, [pushToast, refreshState, refreshCommands]);
 
   const onDeleteSession = useCallback((s: SessionSummary) => {
@@ -857,14 +869,52 @@ const DiffPanel: React.FC = () => {
 };
 
 /** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */
-/** 把附件绝对路径拼进发给 omp 的 prompt（agent 用其文件读取工具按需读取）。
+/** 把非图片附件的绝对路径拼进发给 omp 的 prompt（agent 用其文件读取工具按需读取）。
  *  UI 里消息正文保持用户原文本、附件以芯片展示，不污染正文可读性。
- *  仅当文本为空（纯附件消息）时，prompt 退化为附件列表本身。 */
+ *  仅当文本为空（纯附件消息）时，prompt 退化为附件列表本身。
+ *  图片类附件统一走 prompt.images 内联发送（不塞路径），避免 inspect_image 慢/abort。 */
 function buildPromptWithAttachments(text: string, atts?: Attachment[]): string {
-  if (!atts || atts.length === 0) return text;
-  const lines = atts.map((a) => `- ${a.path}`).join('\n');
+  const fileAtts = (atts ?? []).filter((a) => a.kind !== 'image' && !isImageFile(a.name));
+  if (fileAtts.length === 0) return text;
+  const lines = fileAtts.map((a) => `- ${a.path}`).join('\n');
   const block = `Attached files (absolute paths, read them as needed):\n${lines}`;
   return text ? `${text}\n\n${block}` : block;
+}
+
+/** 收集图片类附件，转成 rpc-ui 要求的「图片对象数组」(RpcImage) 用于 prompt.images 内联。
+ *  关键：omp 的 ImageContent.data 契约是「裸 base64」（不带 data: 前缀，与原生 OMP 一致）。
+ *  所以 readImageAsDataUrl 返回的 data:image/...;base64,... 必须先去掉前缀再发给 omp：
+ *  若带前缀，omp 侧 Buffer.from(data,'base64') 会把 "data:image/png;base64," 连同真实
+ *  base64 一起解码（其中 '/' 是合法 base64 字符）→ 得到损坏字节 → blob 入库为垃圾、
+ *  vision 描述失败（"[Image description unavailable]"）、inspect_image 报
+ *  "only supports PNG, JPEG, GIF, and WEBP"、agent 只能退化成 bash 瞎折腾。
+ *  readImageAsDataUrl 已有完整安防校验（白名单路径 + realpath 防逃逸），可直接复用。
+ *  失败则退回 path 对象（OMP 自行读文件内联，等同原生行为）。 */
+async function collectImageRefs(atts?: Attachment[]): Promise<RpcImage[]> {
+  if (!atts) return [];
+  const imgs = atts.filter((a) => a.kind === 'image' || isImageFile(a.name));
+  const out: RpcImage[] = [];
+  for (const a of imgs) {
+    const mimeType = imageMimeFromName(a.name);
+    try {
+      const { dataUrl } = await window.omp.readImageAsDataUrl(a.path);
+      // 只发裸 base64（去掉 data:image/...;base64, 前缀），与原生 OMP 一致
+      out.push({ type: 'image', data: stripDataUrlPrefix(dataUrl), mimeType });
+    } catch {
+      out.push({ type: 'image', path: a.path, mimeType });
+    }
+  }
+  return out;
+}
+
+/** 由文件名扩展名推断图片 MIME（默认 image/png）。 */
+function imageMimeFromName(name: string): string {
+  const ext = (name.split('.').pop() || 'png').toLowerCase();
+  const map: Record<string, string> = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+    webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', avif: 'image/avif',
+  };
+  return map[ext] ?? 'image/png';
 }
 
 /** 获取当前工作目录。从 store 的 currentWorkspace() 拿；空则用 cwdProcess 兜底。 */

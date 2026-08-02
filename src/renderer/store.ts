@@ -17,6 +17,7 @@ import type {
   TodoItem,
 } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
+import type { SkillInfo } from '../shared/ipc-channels';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 import { buildThemeCSS, getThemePreset } from './themes';
 import { extractDiff, extractChangeSummary } from './components/DiffView';
@@ -47,6 +48,15 @@ export interface Attachment {
   name: string;
   /** 字节大小（可选，仅用于展示） */
   size?: number;
+  /** 附件类型：image 走缩略图预览，file 走文件芯片。可选——渲染侧以 isImageFile(name) 为准，kind 仅作可选加速。 */
+  kind?: 'file' | 'image';
+}
+
+/** 按扩展名判定文件是否为图片（用于附件缩略图分支）。覆盖常见位图与 svg。
+ *  注意：gif/svg 虽为图片也按此判定，缩略图统一走 readImageAsDataUrl（不依赖浏览器原生 <img> file://）。 */
+export function isImageFile(name: string): boolean {
+  const e = (name || '').toLowerCase().split('.').pop() || '';
+  return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(e);
 }
 
 /**
@@ -128,6 +138,8 @@ interface AppState {
   contextUsage?: ContextUsage;
   sessionId?: string;
   slashCommands: SlashCommand[];
+  /** 已安装技能（技能页网格）：来自主进程扫描（含已停用项），enabled 反映 config.yml */
+  skills: SkillInfo[];
   sessions: SessionSummary[];
   currentSessionPath?: string;
   uiQueue: UiRequest[]; // extension_ui_request 待应答队列（单队列顺序展示）
@@ -202,6 +214,7 @@ interface AppState {
   isPermAllowed(sessionPath: string, toolName: string): boolean;
 
   setSessions(list: SessionSummary[]): void;
+  setSkills(list: SkillInfo[]): void;
   setCurrentSessionPath(p?: string): void;
 
   // M5: 工作空间
@@ -254,6 +267,9 @@ interface AppState {
   // 进程池状态
   /** 部分更新某会话的进程状态（合并写入） */
   setProcState(sessionPath: string, partial: Partial<ProcState>): void;
+  /** 确保某会话的 omp 进程在线：已在线直接返回 true；否则按需懒拉起（静默失败返回 false）。
+   *  用于"仅浏览历史不拉起进程"后，需要进程能力（输入/模型列表/思考档位等）时再拉起。 */
+  ensureOnline(sessionPath: string): Promise<boolean>;
 
   // ---- 轻量全局 toast（供 RPC 失败等场景在任意组件里弹提示）----
   toasts: Array<{ id: number; text: string; level: string }>;
@@ -293,7 +309,8 @@ function cssId(path: string, mode: string): string {
 
 /** 把 omp 的全量 content[] 映射为 UI parts（text/thinking）。
  *  实测 content type 有：text / output_text（assistant 正文）/ thinking / toolCall。
- *  output_text 与 text 同义，toolCall 由 tool_execution_* 事件单独建卡，此处跳过。 */
+ *  output_text 与 text 同义，toolCall 由 tool_execution_* 事件单独建卡，此处跳过。
+ *  相邻 thinking 合并为一个 part，避免渲染出多个"思考过程"折叠块。 */
 function contentToParts(msg: AgentMessage): MessagePart[] {
   const parts: MessagePart[] = [];
   for (const c of msg.content ?? []) {
@@ -302,10 +319,30 @@ function contentToParts(msg: AgentMessage): MessagePart[] {
     if (t === 'text' || t === 'output_text') {
       if (cc.text) parts.push({ kind: 'text', text: cc.text });
     } else if (t === 'thinking') {
-      if (cc.thinking) parts.push({ kind: 'thinking', text: cc.thinking });
+      if (cc.thinking) {
+        const last = parts[parts.length - 1];
+        if (last && last.kind === 'thinking') {
+          last.text += '\n' + cc.thinking;
+        } else {
+          parts.push({ kind: 'thinking', text: cc.thinking });
+        }
+      }
     }
   }
   return parts;
+}
+
+/** 将 content-derived parts 与已存在的 tool parts 合并，保持合理顺序：
+ *  thinking 在前 → tool 卡在中 → text/output 在后。避免 message_update 重建 parts 时把 tool 卡弄丢。 */
+function mergeContentAndTools(contentParts: MessagePart[], toolParts: ToolPart[]): MessagePart[] {
+  if (toolParts.length === 0) return contentParts;
+  const thinking: MessagePart[] = [];
+  const text: MessagePart[] = [];
+  for (const p of contentParts) {
+    if (p.kind === 'thinking') thinking.push(p);
+    else text.push(p);
+  }
+  return [...thinking, ...toolParts, ...text];
 }
 
 // issue 10：persistWorkspaces 去抖。多次高频触发时只在静默窗口后写一次，
@@ -322,6 +359,7 @@ export const useApp = create<AppState>((set, get) => ({
   procStateMap: {},
   toasts: [],
   slashCommands: [],
+  skills: [],
   sessions: [],
   uiQueue: [],
   permAllow: {},
@@ -417,6 +455,7 @@ export const useApp = create<AppState>((set, get) => ({
     set((s) => ({ stderrTail: [...s.stderrTail.slice(-199), line] })),
 
   setSessions: (list) => set({ sessions: list }),
+  setSkills: (list) => set({ skills: list }),
   setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [] }),
 
   // M5: 工作空间
@@ -659,6 +698,23 @@ export const useApp = create<AppState>((set, get) => ({
     set({ sessionsMap, procStateMap, messages: [], isStreaming: false, isAborting: false });
   },
 
+  ensureOnline: async (sessionPath) => {
+    const s = get();
+    if (!sessionPath) return false;
+    const ps = s.procStateMap[sessionPath];
+    if (ps?.status === 'online') return true;
+    const session = s.sessions.find((x) => x.path === sessionPath);
+    const ws = session && s.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(session.cwd));
+    const cwd = ws?.cwd ?? session?.cwd;
+    if (!cwd) return false;
+    const mode = ws?.approvalMode ?? 'write';
+    try {
+      await window.omp.acquire(sessionPath, cwd, mode);
+      return true;
+    } catch {
+      return false;
+    }
+  },
   setProcState: (sessionPath, partial) =>
     set((s) => ({
       procStateMap: {
@@ -771,18 +827,20 @@ export const useApp = create<AppState>((set, get) => ({
     const s = get();
     // 多进程：每帧带 __sessionPath 标记属于哪个会话，直接按此路由到对应缓冲槽。
     // 不再依赖 ompCurrentPath 猜测（那是单进程时代的 hack）。
-    const targetPath = (frame.__sessionPath as string | undefined) ?? '';
-    if (!targetPath) return; // 无会话标记的帧丢弃（不应发生）
-    const isDisplay = targetPath === (s.currentSessionPath ?? '');
+    const rawTargetPath = (frame.__sessionPath as string | undefined) ?? '';
+    if (!rawTargetPath) return; // 无会话标记的帧丢弃（不应发生）
+    // sessionsMap 的 key 始终用原始格式（与 loadSessionMessages/appendUserMessage 一致），
+    // 仅在 isDisplay 比较时归一化（__sessionPath 可能含 \ 而 currentSessionPath 含 /）。
+    const isDisplay = pathsEqual(rawTargetPath, s.currentSessionPath ?? '');
     // per-session 流式状态（后台会话独立维护，不污染全局 isStreaming）
-    let procStreaming = s.procStateMap[targetPath]?.isStreaming ?? false;
-    let procAborting = s.procStateMap[targetPath]?.isAborting ?? false;
+    let procStreaming = s.procStateMap[rawTargetPath]?.isStreaming ?? false;
+    let procAborting = s.procStateMap[rawTargetPath]?.isAborting ?? false;
     const type = frame.type as string;
 
     // 惰性复制：仅当真正要修改 buffer 时才复制原数组，避免每个事件都复制。
     let buffer: ChatMessage[] | null = null;
     const getBuf = (): ChatMessage[] =>
-      (buffer ??= s.sessionsMap[targetPath] ? [...s.sessionsMap[targetPath]] : []);
+      (buffer ??= s.sessionsMap[rawTargetPath] ? [...s.sessionsMap[rawTargetPath]] : []);
     let bufferTouched = false;
 
     switch (type) {
@@ -812,7 +870,8 @@ export const useApp = create<AppState>((set, get) => ({
         for (let i = buf.length - 1; i >= 0; i--) {
           const m = buf[i];
           if (m && m.role === 'assistant' && m.streaming) {
-            buf[i] = { ...m, parts: contentToParts(msg) };
+            const toolParts = m.parts.filter((p): p is ToolPart => p.kind === 'tool');
+            buf[i] = { ...m, parts: mergeContentAndTools(contentToParts(msg), toolParts) };
             bufferTouched = true;
             break;
           }
@@ -826,14 +885,15 @@ export const useApp = create<AppState>((set, get) => ({
         const errorText = isError
           ? (msg.errorMessage ?? `请求失败${msg.errorStatus ? ` (${msg.errorStatus})` : ''}`)
           : undefined;
-        let parts = contentToParts(msg);
-        if (parts.length === 0 && errorText) {
-          parts = [{ kind: 'text', text: `⚠️ **模型请求失败**\n\n${errorText}\n\n请检查模型是否可用（右上角切换模型），或查看 .temp/omp-stderr-*.log。` }];
-        }
         const buf = getBuf();
         for (let i = buf.length - 1; i >= 0; i--) {
           const m = buf[i];
           if (m && m.role === msg.role && (m.streaming || msg.role === 'user')) {
+            const toolParts = m.parts.filter((p): p is ToolPart => p.kind === 'tool');
+            let parts = mergeContentAndTools(contentToParts(msg), toolParts);
+            if (parts.length === 0 && errorText) {
+              parts = [{ kind: 'text', text: `⚠️ **模型请求失败**\n\n${errorText}\n\n请检查模型是否可用（右上角切换模型），或查看 .temp/omp-stderr-*.log。` }];
+            }
             buf[i] = {
               ...m,
               parts,
@@ -954,8 +1014,8 @@ export const useApp = create<AppState>((set, get) => ({
       // 更新该会话的 per-session 进程状态（agent_start/agent_end 会用到）
       procStateMap: {
         ...s.procStateMap,
-        [targetPath]: {
-          ...(s.procStateMap[targetPath] ?? { status: 'online' as const, isStreaming: false, isAborting: false }),
+        [rawTargetPath]: {
+          ...(s.procStateMap[rawTargetPath] ?? { status: 'online' as const, isStreaming: false, isAborting: false }),
           status: 'online' as const,
           isStreaming: procStreaming,
           isAborting: procAborting,
@@ -963,7 +1023,7 @@ export const useApp = create<AppState>((set, get) => ({
       },
     };
     if (bufferTouched) {
-      updates.sessionsMap = { ...s.sessionsMap, [targetPath]: buffer! };
+      updates.sessionsMap = { ...s.sessionsMap, [rawTargetPath]: buffer! };
       if (isDisplay) updates.messages = buffer!;
     }
     if (isDisplay) {

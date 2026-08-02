@@ -214,6 +214,11 @@ export class OmpProcessPool {
     e.router.rejectAll('evicted by pool');
     try { e.proc.kill(); } catch { /* noop */ }
     this.entries.delete(sessionPath);
+    // 通知渲染层该会话已下线：proc.kill() 会摘掉子进程的 exit 监听（omp-process.ts），
+    // 若不在 evict 里主动推 onExit，渲染层 procStateMap 会残留 online，之后对该会话的
+    // 任意 rpc:send 都会抛 "omp process not online"（LRU 淘汰后点会话即复现）。
+    // code=null：标记 offline、不弹"已退出"遮罩、也不触发自动恢复（被淘汰是预期行为）。
+    this.events.onExit(sessionPath, null);
   }
 
   /** LRU 淘汰：找 lastActiveAt 最小的 online 进程杀掉。不淘汰 spawning 状态的，
@@ -258,6 +263,9 @@ export class OmpProcessPool {
       const normalizedCwd = path.normalize(cwd);
       // 用 ctx 包装让 proc 回调能引用尚未声明的 entry/router/proc（闭包运行时解析）
       const ctx: { entry?: PoolEntry; router?: FrameRouter; proc?: OmpProcess } = {};
+      /** 当前池 key：renameKey 会更新 entry.sessionPath，而闭包不能引用 spawn 时捕获的
+       *  初始 sessionPath（tempKey）——否则 rename 后帧/事件仍按旧 key 标记。 */
+      const currentSessionKey = (): string => (ctx.entry ? ctx.entry.sessionPath : sessionPath);
       let settled = false;
       const timeout = setTimeout(() => {
         if (!settled) {
@@ -269,7 +277,9 @@ export class OmpProcessPool {
       const router = new FrameRouter({
         // proc 在异步 I/O 之后才创建（issue 7），用 ctx.proc 间接引用。
         write: (cmd) => { if (ctx.proc) ctx.proc.write(cmd); },
-        pushEvent: (frame) => this.events.onFrame(sessionPath, frame),
+        // 帧标记必须用 entry 当前的 sessionPath（renameKey temp→real 后仍指向新 key），
+        // 否则渲染层把帧路由到已迁移走的旧 temp key 缓冲，消息不显示（issue: turn2 无回应）。
+        pushEvent: (frame) => this.events.onFrame(currentSessionKey(), frame),
         onLog: (line) => this.events.onLog(line),
       });
       ctx.router = router;
@@ -334,7 +344,7 @@ export class OmpProcessPool {
                   if (ctx.entry) resolve(ctx.entry);
                   else reject(new Error('entry missing on ready'));
                 }
-                this.events.onReady(sessionPath);
+                this.events.onReady(currentSessionKey());
               },
               onFrame: (frame) => ctx.router?.dispatch(frame),
               onExit: (code) => {
@@ -351,9 +361,9 @@ export class OmpProcessPool {
                   clearTimeout(timeout);
                   reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
                 }
-                this.events.onExit(sessionPath, code);
+                this.events.onExit(currentSessionKey(), code);
               },
-              onStderr: (line) => this.events.onStderr(sessionPath, line),
+              onStderr: (line) => this.events.onStderr(currentSessionKey(), line),
             },
           );
           ctx.proc = proc;

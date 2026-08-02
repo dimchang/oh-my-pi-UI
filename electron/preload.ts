@@ -52,6 +52,13 @@ const api: OmpApi = {
     ipcRenderer.invoke(IPC.OmpModelsWriteProvider, id, cfg),
   deleteOmpProvider: (id: string) => ipcRenderer.invoke(IPC.OmpModelsDeleteProvider, id),
 
+  // 技能（Skills）管理
+  skillsList: () => ipcRenderer.invoke(IPC.SkillsList),
+  skillsDetail: (name: string) => ipcRenderer.invoke(IPC.SkillsDetail, name),
+  skillsSetEnabled: (name: string, enabled: boolean) =>
+    ipcRenderer.invoke(IPC.SkillsSetEnabled, name, enabled),
+  skillsUninstall: (name: string) => ipcRenderer.invoke(IPC.SkillsUninstall, name),
+
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow: () => ipcRenderer.invoke(IPC.WindowMinimize),
   maximizeWindow: () => ipcRenderer.invoke(IPC.WindowMaximize),
@@ -83,6 +90,12 @@ const api: OmpApi = {
   // 上下文文件读写
   readContextFile: (filePath: string) => ipcRenderer.invoke(IPC.ContextFileRead, filePath),
   writeContextFile: (filePath: string, content: string) => ipcRenderer.invoke(IPC.ContextFileWrite, filePath, content),
+
+  // 图片：粘贴/拖拽落盘 + 读取为 data URL
+  savePastedImage: (data: ArrayBuffer, ext: string) =>
+    ipcRenderer.invoke(IPC.SavePastedImage, data, ext),
+  readImageAsDataUrl: (filePath: string) =>
+    ipcRenderer.invoke(IPC.ReadImageAsDataUrl, filePath),
 };
 
 contextBridge.exposeInMainWorld('omp', api);

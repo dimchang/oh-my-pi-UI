@@ -118,10 +118,33 @@ export interface RpcCommandBase {
   type: string & {};
 }
 
+/** 内联图片引用。rpc-ui 要求图片以「对象」形式给出：
+ *  - 裸字符串会被 OMP 当普通文本追加进 content（模型看不到图，deepseek 还会说 "image omitted"）；
+ *  - 对象形式（type:'image' + data 或 path + mimeType）才会被 OMP 内联为真正的 {type:'image'} 图片块。
+ *  契约：data 必须是「裸 base64」（不带 data: 前缀），与原生 OMP 的 ImageContent.data 完全一致。
+ *  切勿传 readImageAsDataUrl 返回的完整 data:image/...;base64,... URL——OMP 侧
+ *  Buffer.from(data,'base64') 会把前缀一并解码（'/' 是合法 base64 字符），
+ *  得到损坏字节，导致 blob 入库为垃圾、vision 描述失败、inspect_image 无法识别
+ *  （实证 session 019fc31c）。发送前用 stripDataUrlPrefix（src/renderer/utils/image-data-url.ts）去掉前缀。
+ *  path 为绝对文件路径时 OMP 自行读文件内联（等同原生），仅作 data 读取失败的兜底。 */
+export interface RpcImage {
+  type: 'image';
+  /** 图片内容：裸 base64（不带 data: 前缀），OMP 据此内联为 {type:'image'} 块并触发 vision 路由 */
+  data?: string;
+  /** 绝对文件路径，OMP 自行读文件内联 */
+  path?: string;
+  /** 图片 MIME，必须提供（image/png、image/jpeg、image/webp…），OMP 据此识别类型 */
+  mimeType: string;
+}
+
 export interface PromptCommand extends RpcCommandBase {
   type: 'prompt';
   /** 用户输入文本（实测字段名为 message） */
   message: string;
+  /** 内联图片：图片对象数组（RpcImage）。带此字段时 OMP 把图内联为 {type:'image'} 块、
+   *  直接喂给模型（原生多模态走内联、快），而非把路径当文本（慢且模型看不到图）。
+   *  注意：必须是对象数组，裸字符串数组会被当文本透传！ */
+  images?: RpcImage[];
 }
 
 /** steer：引导当前 agent 轮次（mid-run 中断）。
@@ -136,6 +159,8 @@ export interface SteerCommand extends RpcCommandBase {
   type: 'steer';
   /** 引导文本（字段名同 prompt：message） */
   message: string;
+  /** 内联图片（同 PromptCommand.images，图片对象数组） */
+  images?: RpcImage[];
 }
 
 /** follow_up：把消息追加到当前会话末尾，等当前 agent turn 跑完后处理（不打断、不 mid-run 介入）。
@@ -143,6 +168,8 @@ export interface SteerCommand extends RpcCommandBase {
 export interface FollowUpCommand extends RpcCommandBase {
   type: 'follow_up';
   message: string;
+  /** 内联图片（同 PromptCommand.images，图片对象数组） */
+  images?: RpcImage[];
 }
 
 export interface SetModelCommand extends RpcCommandBase {

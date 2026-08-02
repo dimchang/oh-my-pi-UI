@@ -6,6 +6,7 @@ export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
     build: {
+      emptyOutDir: false,
       sourcemap: 'hidden',
       outDir: 'out/main',
       rollupOptions: {
@@ -19,6 +20,7 @@ export default defineConfig({
   preload: {
     plugins: [externalizeDepsPlugin()],
     build: {
+      emptyOutDir: false,
       sourcemap: 'hidden',
       outDir: 'out/preload',
       rollupOptions: {
@@ -32,6 +34,7 @@ export default defineConfig({
   renderer: {
     root: 'src/renderer',
     build: {
+      emptyOutDir: false,
       sourcemap: 'hidden',
       outDir: 'out/renderer',
       rollupOptions: {

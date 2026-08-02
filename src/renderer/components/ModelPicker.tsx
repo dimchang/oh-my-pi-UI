@@ -38,17 +38,27 @@ export const ModelPicker: React.FC = () => {
       setFetchError(true);
     }, MODELS_FETCH_TIMEOUT_MS);
 
-    rpc.getAvailableModels(sp).then((r) => {
-      clearTimeout(timer);
-      if (cancelledRef.current) return;
-      setLoading(false);
-      if (r.success && r.data) setModels(r.data.models ?? []);
-      else setFetchError(true);
-    }).catch(() => {
-      clearTimeout(timer);
-      if (cancelledRef.current) return;
-      setLoading(false);
-      setFetchError(true);
+    // 会话可能只是浏览（未拉起进程）：先按需拉起再拉模型列表
+    void useApp.getState().ensureOnline(sp).then((ok) => {
+      if (!ok) {
+        clearTimeout(timer);
+        if (cancelledRef.current) return;
+        setLoading(false);
+        setFetchError(true);
+        return;
+      }
+      rpc.getAvailableModels(sp).then((r) => {
+        clearTimeout(timer);
+        if (cancelledRef.current) return;
+        setLoading(false);
+        if (r.success && r.data) setModels(r.data.models ?? []);
+        else setFetchError(true);
+      }).catch(() => {
+        clearTimeout(timer);
+        if (cancelledRef.current) return;
+        setLoading(false);
+        setFetchError(true);
+      });
     });
   }, []);
 

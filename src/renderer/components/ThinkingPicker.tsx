@@ -37,16 +37,23 @@ export const ThinkingPicker: React.FC = () => {
     setOpen(false);
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
-    void rpc.setThinkingLevel(sp, l).catch((e) => {
-      useApp.getState().pushToast(`切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    // 会话可能只是浏览（未拉起进程）：先按需拉起再设置
+    void useApp.getState().ensureOnline(sp).then((ok) => {
+      if (!ok) return;
+      void rpc.setThinkingLevel(sp, l).catch((e) => {
+        useApp.getState().pushToast(`切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+      });
     });
   };
 
   const cycle = () => {
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
-    void rpc.cycleThinkingLevel(sp).catch((e) => {
-      useApp.getState().pushToast(`循环切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    void useApp.getState().ensureOnline(sp).then((ok) => {
+      if (!ok) return;
+      void rpc.cycleThinkingLevel(sp).catch((e) => {
+        useApp.getState().pushToast(`循环切换思考等级失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+      });
     });
   };
 

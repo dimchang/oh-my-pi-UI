@@ -1,10 +1,55 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useApp, type ChatMessage } from '../store';
+import { useApp, isImageFile, type ChatMessage } from '../store';
 import { ToolCard } from './ToolCard';
 import { Icon } from './Icon';
 import { Minimap } from './Minimap';
+
+/** 单条消息附件芯片：图片懒加载缩略图（进入视口才请求 data URL），文件走原芯片。
+ *  缩略图加载失败（文件被清理/无权限）自动回退为文件芯片，绝不让整条消息渲染崩溃或白屏。 */
+const MsgAttachmentChip: React.FC<{ att: { path: string; name: string; size?: number } }> = ({ att }) => {
+  const isImg = isImageFile(att.name);
+  const [thumb, setThumb] = useState<string | null>(null);
+  const [thumbErr, setThumbErr] = useState(false);
+  const ref = useRef<HTMLButtonElement>(null);
+  const requestedRef = useRef(false);
+
+  useEffect(() => {
+    if (!isImg || requestedRef.current) return;
+    const el = ref.current;
+    if (!el) return;
+    // 懒加载：进入视口才请求 data URL
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting) && !requestedRef.current) {
+        requestedRef.current = true;
+        io.disconnect();
+        window.omp.readImageAsDataUrl(att.path)
+          .then((r) => setThumb(r.dataUrl))
+          .catch(() => setThumbErr(true));
+      }
+    }, { rootMargin: '200px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [att.path, isImg]);
+
+  if (isImg && thumb && !thumbErr) {
+    return (
+      <button type="button" className="msg-attachment-chip msg-attachment-img" ref={ref} title={att.path}
+        onClick={() => { void window.omp.showItemInFolder(att.path).catch(() => undefined); }}>
+        <img src={thumb} alt={att.name} />
+      </button>
+    );
+  }
+  // 文件芯片（或图片尚未加载/失败回退）
+  return (
+    <button type="button" className="msg-attachment-chip" ref={ref} title={att.path}
+      onClick={() => { void window.omp.showItemInFolder(att.path).catch(() => undefined); }}>
+      <Icon name="file" size={13} />
+      <span>{att.name}</span>
+    </button>
+  );
+};
 
 /** 正文里 markdown 代码块默认折叠（超过 ~6 行时收起） */
 const CollapsibleCodeBlock: React.FC<{ children: React.ReactNode; node?: unknown }> = ({ children, node: _node }) => {
@@ -118,16 +163,7 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
       {msg.role === 'user' && msg.attachments && msg.attachments.length > 0 && (
         <div className="msg-attachments">
           {msg.attachments.map((a) => (
-            <button
-              type="button"
-              className="msg-attachment-chip"
-              key={a.path}
-              title={a.path}
-              onClick={() => { void window.omp.showItemInFolder(a.path).catch(() => undefined); }}
-            >
-              <Icon name="file" size={13} />
-              <span>{a.name}</span>
-            </button>
+            <MsgAttachmentChip key={a.path} att={a} />
           ))}
         </div>
       )}
