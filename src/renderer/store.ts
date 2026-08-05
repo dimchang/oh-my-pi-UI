@@ -859,6 +859,7 @@ export const useApp = create<AppState>((set, get) => ({
         const msg = frame.message as AgentMessage;
         if (!msg) break;
         if (msg.role === 'user') break; // user 消息由本地输入 push
+        if (msg.role === 'toolResult') break; // 工具输出由 tool_execution_* 建折叠 ToolCard，这里跳过避免整段文本刷屏
         getBuf().push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true });
         bufferTouched = true;
         break;
@@ -880,7 +881,7 @@ export const useApp = create<AppState>((set, get) => ({
       }
       case 'message_end': {
         const msg = frame.message as AgentMessage;
-        if (!msg) break;
+        if (!msg || msg.role === 'toolResult') break; // 同 message_start：工具输出不落成文本消息
         const isError = msg.stopReason === 'error';
         const errorText = isError
           ? (msg.errorMessage ?? `请求失败${msg.errorStatus ? ` (${msg.errorStatus})` : ''}`)

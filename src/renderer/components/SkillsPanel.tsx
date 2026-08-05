@@ -245,6 +245,39 @@ export const SkillsPanel: React.FC = () => {
     return cmds.filter((c: SlashCommand) => !!c.source && c.source !== 'builtin' && c.source !== 'skill');
   }, [cmds]);
 
+  /** 把插件按 source 拆成「插件」与「扩展」两组：
+   *  - source === 'plugin' → 插件
+   *  - 其它非 builtin/skill 的命令 → 扩展（MCP / 用户扩展 / 自定义等） */
+  const pluginList = useMemo(
+    () => plugins.filter((c: SlashCommand) => c.source === 'plugin'),
+    [plugins],
+  );
+  const extensionList = useMemo(
+    () => plugins.filter((c: SlashCommand) => c.source !== 'plugin'),
+    [plugins],
+  );
+
+  /** 渲染「插件 / 扩展」小卡片：与技能卡同款（圆角 + 描述 + 顶角小图标），
+   *  但不提供开关 / 卸载：slash command 是 omp 运行时动态注册的命令，
+   *  数据层只有 name/description/source，没有 enabled/path 等可操作字段，
+   *  主进程也没暴露 enable/disable 或卸载 slash command 的 IPC。 */
+  const renderAddonCard = (c: SlashCommand, kind: 'plugin' | 'extension'): React.ReactElement => {
+    return (
+      <div
+        key={`${kind}:${c.name}`}
+        className="skill-card addon-card"
+        title={`调用 /${c.name}`}
+      >
+        <div className="skill-card-avatar addon-card-avatar" style={{ background: colorOf(c.name) }}>
+          <Icon name={kind === 'plugin' ? 'plug' : 'pkg'} size={18} />
+        </div>
+        <div className="skill-card-name">/{c.name}</div>
+        <div className="skill-card-desc">{c.description || '（无描述）'}</div>
+        <div className="skill-card-source" aria-label="来源">{c.source}</div>
+      </div>
+    );
+  };
+
   if (detailName) {
     return (
       <div className="skills-view">
@@ -268,7 +301,7 @@ export const SkillsPanel: React.FC = () => {
     <div className="skills-view">
       <div className="skills-topbar">
         <div className="skills-title">
-          <span className="skills-title-main">我安装的技能</span>
+          <span className="skills-title-main">已安装技能</span>
           <span className="skills-count">{installed.length}</span>
         </div>
         <div className="skills-actions">
@@ -311,19 +344,28 @@ export const SkillsPanel: React.FC = () => {
           </div>
         )}
 
-        {plugins.length > 0 && (
+        {(pluginList.length > 0 || extensionList.length > 0) && (
           <section className="skills-plugins">
-            <div className="skills-section-title">
-              <Icon name="plug" size={14} /> 插件 / 扩展 <span className="skills-section-count">{plugins.length}</span>
-            </div>
-            <div className="plugin-list">
-              {plugins.map((c: SlashCommand) => (
-                <div key={c.name} className="plugin-item">
-                  <span className="plugin-name">/{c.name}</span>
-                  {c.description && <span className="plugin-desc">{c.description}</span>}
+            {pluginList.length > 0 && (
+              <>
+                <div className="skills-section-title">
+                  <Icon name="plug" size={14} /> 插件 <span className="skills-section-count">{pluginList.length}</span>
                 </div>
-              ))}
-            </div>
+                <div className="skill-grid">
+                  {pluginList.map((c: SlashCommand) => renderAddonCard(c, 'plugin'))}
+                </div>
+              </>
+            )}
+            {extensionList.length > 0 && (
+              <>
+                <div className="skills-section-title">
+                  <Icon name="pkg" size={14} /> 扩展 <span className="skills-section-count">{extensionList.length}</span>
+                </div>
+                <div className="skill-grid">
+                  {extensionList.map((c: SlashCommand) => renderAddonCard(c, 'extension'))}
+                </div>
+              </>
+            )}
           </section>
         )}
       </div>

@@ -44,7 +44,9 @@ function summaryOf(tool: ToolPart): string {
 }
 
 export const ToolCard = React.memo(function ToolCard({ tool }: { tool: ToolPart }) {
-  const [open, setOpen] = useState(tool.status === 'error');
+  // 默认折叠：工具输出/失败详情都收进卡片（标题显示状态 + 命令摘要），点击再展开。
+  // 避免中间过程（如 gradle 构建日志）整段铺在主屏上。
+  const [open, setOpen] = useState(false);
   const diff = extractDiff(tool.result);
   const summary = summaryOf(tool);
 

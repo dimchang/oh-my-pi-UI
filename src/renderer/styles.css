@@ -2687,6 +2687,29 @@ body {
 }
 .skill-card-toggle { position: absolute; top: 14px; right: 14px; }
 
+/* 插件 / 扩展小卡片：复用 skill-card 视觉，但去掉开关/点击，
+   名称前缀 / + 源标签 chip */
+.skills-view .skill-card.addon-card { cursor: default; padding-bottom: 30px; }
+.skills-view .skill-card.addon-card:hover { transform: none; box-shadow: none; }
+.skills-view .skill-card.addon-card .skill-card-name { padding-right: 0; }
+.addon-card-avatar { color: #fff; }
+.skill-card-source {
+  position: absolute;
+  left: 14px;
+  bottom: 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: hsl(var(--text-400));
+  background: hsl(var(--bg-300));
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  letter-spacing: 0.02em;
+  max-width: calc(100% - 28px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 开关（iOS 风格） */
 .skill-toggle {
   width: 36px;
@@ -2739,20 +2762,6 @@ body {
   padding: 1px 8px;
   font-weight: 600;
   color: hsl(var(--text-300));
-}
-.plugin-list { display: flex; flex-direction: column; gap: 6px; }
-.plugin-item { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
-.plugin-name {
-  font-family: var(--font-mono);
-  color: hsl(var(--text-200));
-  font-weight: 500;
-  flex-shrink: 0;
-}
-.plugin-desc {
-  color: hsl(var(--text-400));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* 详情页（图2） */
