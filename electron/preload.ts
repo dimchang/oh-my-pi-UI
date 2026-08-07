@@ -28,6 +28,7 @@ const api: OmpApi = {
   getSessionUserEntries: (p: string) => ipcRenderer.invoke(IPC.SessionUserEntries, p),
   getOmpInfo: () => ipcRenderer.invoke(IPC.GetOmpInfo),
   openExternal: (url: string) => ipcRenderer.invoke(IPC.OpenExternal, url),
+  openInBrowser: (browser, url) => ipcRenderer.invoke(IPC.OpenInBrowser, browser, url),
   copyText: (text: string) => ipcRenderer.invoke(IPC.ClipboardWriteText, text),
   showItemInFolder: (fullPath: string) => ipcRenderer.invoke(IPC.ShowItemInFolder, fullPath),
   showSaveDialog: (defaultPath?: string) => ipcRenderer.invoke(IPC.ShowSaveDialog, defaultPath),

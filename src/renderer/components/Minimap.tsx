@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useApp, type ChatMessage } from '../store';
+import { type ChatMessage } from '../store';
 
 /**
  * 密度指示条（左侧集中横线簇）。
@@ -37,8 +37,11 @@ interface TickItem {
   preview: string;
 }
 
-export const Minimap: React.FC<{ scrollRef: React.RefObject<HTMLDivElement | null> }> = ({ scrollRef }) => {
-  const messages = useApp((s) => s.messages);
+export const Minimap: React.FC<{
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  messages: ChatMessage[];
+  onJump: (index: number) => void;
+}> = ({ scrollRef, messages, onJump }) => {
   const [visible, setVisible] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
   const clusterRef = useRef<HTMLDivElement>(null);
@@ -73,13 +76,22 @@ export const Minimap: React.FC<{ scrollRef: React.RefObject<HTMLDivElement | nul
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    updateVisibility();
-    const ro = new ResizeObserver(updateVisibility);
+    // DOM 高频变化（流式期间字符级变更）的回调加 100ms 防抖，
+    // 避免每帧读 scrollHeight/clientHeight 触发强制同步布局。
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedUpdate = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(updateVisibility, 100);
+    };
+
+    updateVisibility(); // 初始调用
+    const ro = new ResizeObserver(updateVisibility); // resize 频率低，无需防抖
     ro.observe(el);
-    const mo = new MutationObserver(updateVisibility);
+    const mo = new MutationObserver(debouncedUpdate);
     mo.observe(el, { childList: true, subtree: true, characterData: true });
-    el.addEventListener('scroll', updateVisibility, { passive: true });
+    el.addEventListener('scroll', updateVisibility, { passive: true }); // scroll 需实时响应
     return () => {
+      if (timer) clearTimeout(timer);
       ro.disconnect();
       mo.disconnect();
       el.removeEventListener('scroll', updateVisibility);
@@ -134,31 +146,12 @@ export const Minimap: React.FC<{ scrollRef: React.RefObject<HTMLDivElement | nul
     return { lineWidths: widths, nearestIdx: nearest };
   }, [tickItems, mouseY]);
 
-  // ---- 点击跳转（用 DOM 实际位置，而非比例估算）----
-  const jumpTo = useCallback((item: TickItem) => {
-    const el = scrollRef.current;
-    if (!el) return;
-    // 优先用 DOM 实际位置：消息元素有 data-msg-id 属性
-    const msgEl = el.querySelector(`[data-msg-id="${item.id}"]`) as HTMLElement | null;
-    if (msgEl) {
-      // 消息在 DOM 中 → 精确滚动到该消息
-      msgEl.scrollIntoView({ behavior: 'auto', block: 'center' });
-      return;
-    }
-    // 消息不在 DOM 中（被虚拟化裁掉了）→ 退回比例估算
-    if (item.totalMessages <= 0) return;
-    const maxScroll = el.scrollHeight - el.clientHeight;
-    const ratio = item.msgIndex / item.totalMessages;
-    const prev = el.style.scrollBehavior;
-    el.style.scrollBehavior = 'auto';
-    el.scrollTop = ratio * maxScroll;
-    el.style.scrollBehavior = prev;
-  }, [scrollRef]);
-
-  // 点击整个 bar 时跳转到最近的线对应的消息
+  // ---- 点击跳转（交给 ChatView 的 scrollToMessage：窗口内 scrollIntoView / 窗口外先移动窗口）----
   const onBarClick = useCallback(() => {
-    if (nearestIdx >= 0 && nearestIdx < tickItems.length) jumpTo(tickItems[nearestIdx]!);
-  }, [nearestIdx, tickItems, jumpTo]);
+    if (nearestIdx >= 0 && nearestIdx < tickItems.length) {
+      onJump(tickItems[nearestIdx]!.msgIndex);
+    }
+  }, [nearestIdx, tickItems, onJump]);
 
   if (!visible || tickItems.length === 0) return null;
 

@@ -17,6 +17,7 @@ export const IPC = {
   SessionUserEntries: 'session:user-entries', // (path: string) => Promise<{id:string;text:string}[]> — 分叉用，取 user entry id + 文本
   GetOmpInfo: 'omp:info', // () => Promise<{path:string; version:string}>
   OpenExternal: 'shell:open-external', // (url: string) => Promise<void>
+  OpenInBrowser: 'shell:open-in-browser', // (browser: 'chrome'|'edge', url: string) => Promise<void> — 用指定浏览器打开链接（找不到时回退系统默认）
   ClipboardWriteText: 'clipboard:write-text', // (text: string) => Promise<void> — 写系统剪贴板
   ShowItemInFolder: 'shell:show-item-in-folder', // (fullPath: string) => Promise<void> — 在文件管理器中定位文件
   ShowSaveDialog: 'dialog:save', // (defaultPath?: string) => Promise<string | null>
@@ -355,6 +356,8 @@ export interface OmpApi {
   getSessionUserEntries(path: string): Promise<{ id: string; text: string }[]>;
   getOmpInfo(): Promise<{ path: string; version: string }>;
   openExternal(url: string): Promise<void>;
+  /** 用指定外部浏览器打开链接（chrome / edge）；该浏览器找不到时回退系统默认浏览器 */
+  openInBrowser(browser: 'chrome' | 'edge', url: string): Promise<void>;
   /** 写系统剪贴板（用 electron clipboard，规避 renderer navigator.clipboard 的安全上下文限制） */
   copyText(text: string): Promise<void>;
   /** 在系统文件管理器中定位并高亮指定文件（Windows 资源管理器 / macOS Finder） */

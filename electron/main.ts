@@ -6,7 +6,7 @@
  */
 
 import { app, BrowserWindow, ipcMain, shell, dialog, clipboard, Menu, nativeImage, type MenuItemConstructorOptions } from 'electron';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -399,6 +399,28 @@ function registerIpc(): void {
     // 只允许 http/https，其余（file://、自定义协议、裸路径）一律拒绝，避免借 IPC 打开任意资源。
     if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
     await shell.openExternal(url);
+  });
+  ipcMain.handle(IPC.OpenInBrowser, async (_e, browser: 'chrome' | 'edge', url: string) => {
+    // 只允许 http/https，避免借 IPC 打开任意资源。
+    if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
+    let child: ReturnType<typeof spawn> | null = null;
+    try {
+      if (process.platform === 'win32') {
+        // start 是 cmd 内建命令；空标题参数 "" 占位，避免路径含空格被误判为标题。
+        const exe = browser === 'edge' ? 'msedge' : 'chrome';
+        child = spawn('cmd', ['/c', 'start', '', exe, url], { detached: true, stdio: 'ignore' });
+      } else if (process.platform === 'darwin') {
+        const app = browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome';
+        child = spawn('open', ['-a', app, url], { detached: true, stdio: 'ignore' });
+      } else {
+        const cmd = browser === 'edge' ? 'microsoft-edge' : 'google-chrome';
+        child = spawn(cmd, [url], { detached: true, stdio: 'ignore' });
+      }
+      child.unref();
+    } catch {
+      // 找不到该浏览器（命令不存在）时回退系统默认浏览器。
+      await shell.openExternal(url);
+    }
   });
   ipcMain.handle(IPC.ClipboardWriteText, async (_e, text: string) => { clipboard.writeText(String(text ?? '')); });
   ipcMain.handle(IPC.ShowItemInFolder, async (_e, fullPath: string) => {
