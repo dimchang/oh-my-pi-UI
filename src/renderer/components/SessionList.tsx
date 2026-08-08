@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useApp } from '../store';
 import type { SessionSummary } from '../../shared/ipc-channels';
 
 function relTime(mtime: number): string {
@@ -42,6 +43,8 @@ export const SessionList: React.FC<{
 }> = ({ sessions, currentPath, onSelect, onRename, onBranch, onExport, onDelete, onCopyId, onOpenDir }) => {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; session: SessionSummary } | null>(null);
   const closeMenu = () => setCtxMenu(null);
+  // 会话显示名覆盖层（host 侧重命名），优先于扫盘得到的 title
+  const sessionNames = useApp((s) => s.sessionNames);
 
   // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
   const openMenu = (menu: NonNullable<typeof ctxMenu>) => {
@@ -79,7 +82,7 @@ export const SessionList: React.FC<{
           }}
           title={s.path}
         >
-          <div className="session-title">{s.title}</div>
+          <div className="session-title">{sessionNames[s.path] ?? s.title}</div>
           <div className="session-time">{relTime(s.mtime)}</div>
         </div>
       ))}

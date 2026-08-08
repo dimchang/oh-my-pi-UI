@@ -149,17 +149,33 @@ export default function App(): React.ReactElement {
     const uiQueue = st.uiQueue.map((q) =>
       q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
     );
-    st.setState({ sessionsMap, procStateMap, currentSessionPath: newest.path, uiQueue });
+    // 移除临时占位条目（真实 path 已由 refreshSessions 写入 sessions）；
+    // 同时把"落盘前就被重命名"的覆盖名从 tempKey 迁移到真实 path，避免改名丢失。
+    const sessionNames = { ...st.sessionNames };
+    const renamed = sessionNames[cur];
+    delete sessionNames[cur];
+    if (renamed && !sessionNames[newest.path]) sessionNames[newest.path] = renamed;
+    st.setState({
+      sessionsMap,
+      procStateMap,
+      currentSessionPath: newest.path,
+      uiQueue,
+      sessions: st.sessions.filter((x) => x.path !== cur),
+      sessionNames,
+    });
     void rpc.renameKey(cur, newest.path).then(done, done);
   }, []);
 
   /** 新建会话后：设为 current + 清缓冲 + 刷新列表/状态。newSessionForCwd 已返回新 path。 */
-  const resolveAndSelectNewSession = useCallback(async (newSessionPath: string): Promise<void> => {
+  const resolveAndSelectNewSession = useCallback(async (newSessionPath: string, cwd?: string): Promise<void> => {
     useApp.getState().setCurrentSessionPath(newSessionPath);
     useApp.getState().setProcState(newSessionPath, { status: 'online' });
     useApp.getState().resetChat();
     // 新会话统计从零开始，先清掉旧会话残留（refreshState 会重新拉取）
     useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined });
+    // 乐观插入占位：新会话首条消息 agent_end 才落盘 .jsonl，在此之前先在侧栏显示，
+    // 否则用户要等 LLM 回完才能看到刚开的会话（setSessions 会保留 __new_ 占位不被扫盘冲掉）。
+    if (cwd) useApp.getState().upsertSessionPlaceholder(newSessionPath, cwd);
     await refreshSessions();
     await refreshState(newSessionPath);
   }, [refreshSessions, refreshState]);
@@ -460,7 +476,7 @@ export default function App(): React.ReactElement {
         st.sessions.map((s) => s.path).filter((p) => !p.startsWith('__new_')),
       );
       const { sessionPath } = await rpc.newSessionForCwd(targetCwd, targetMode);
-      await resolveAndSelectNewSession(sessionPath);
+      await resolveAndSelectNewSession(sessionPath, targetCwd);
     } catch (e) {
       pushToast(`新建会话失败：${e instanceof Error ? e.message : String(e)}`, 'error');
     }
@@ -494,9 +510,46 @@ export default function App(): React.ReactElement {
     });
   }, [workspacesLoaded, refreshSessions, pushToast, onNewSession]);
 
+  /** 丢弃空 temp 占位会话（path 以 __new_ 开头）：用户新建会话后没发消息就走了。
+   *  此时磁盘上还没有 .jsonl，直接释放 omp 进程 + 从 store 移除占位即可（无需走磁盘删除）。
+   *  返回是否丢弃的正是当前会话。 */
+  const discardTempSession = useCallback((path: string): boolean => {
+    if (!path.startsWith('__new_')) return false;
+    // 释放该 temp key 绑定的 omp 进程（避免进程池泄漏）
+    void rpc.release(path).catch(() => undefined);
+    const st = useApp.getState();
+    const sessionsMap = { ...st.sessionsMap };
+    delete sessionsMap[path];
+    const procStateMap = { ...st.procStateMap };
+    delete procStateMap[path];
+    const sessionNames = { ...st.sessionNames };
+    delete sessionNames[path];
+    const uiQueue = st.uiQueue.filter((q) => q.sessionPath !== path);
+    const sessions = st.sessions.filter((x) => x.path !== path);
+    // 清理并发保护 / 快照集合里残留的 key，避免污染后续新建会话
+    migratingTempKeys.current.delete(path);
+    knownSessionPathsBeforeNew.current.delete(path);
+    const wasCurrent = st.currentSessionPath === path;
+    useApp.getState().setState({
+      sessionsMap,
+      procStateMap,
+      sessionNames,
+      uiQueue,
+      sessions,
+      ...(wasCurrent ? { currentSessionPath: undefined, messages: [] } : {}),
+    });
+    return wasCurrent;
+  }, [rpc]);
+
   const onSelectSession = useCallback((s: SessionSummary) => {
     useApp.getState().setMainView('chat');
     const st = useApp.getState();
+    const cur = st.currentSessionPath;
+    // 切走时：若当前是"用户还没发过消息的空 temp 占位会话"，自动丢弃，避免留下删不掉的僵尸会话。
+    // （正在生成中的 temp 会话缓冲非空，不会命中此分支，等 agent_end 由 migrateTempSession 正常迁移。）
+    if (cur && cur.startsWith('__new_') && cur !== s.path && !(st.sessionsMap[cur]?.length)) {
+      discardTempSession(cur);
+    }
     const targetKey = cwdKey(s.cwd);
     const targetWs = st.workspaces.find((w) => cwdKey(w.cwd) === targetKey);
     if (targetWs && st.currentWorkspaceId !== targetWs.id) {
@@ -540,24 +593,57 @@ export default function App(): React.ReactElement {
         sessionStats: undefined,
       });
     }
-  }, [pushToast, refreshState, refreshCommands]);
+  }, [pushToast, refreshState, refreshCommands, discardTempSession]);
 
   const onDeleteSession = useCallback((s: SessionSummary) => {
-    // 删除会话：先释放该会话的进程（避免占用池），再删磁盘文件
+    // temp 占位会话（用户还没发过消息）：磁盘上还没落盘 .jsonl，无法走磁盘删除。
+    // 直接释放进程 + 移除占位即可；右键删除与切走无感清理都复用同一逻辑。
+    if (s.path.startsWith('__new_')) {
+      const wasCurrent = discardTempSession(s.path);
+      if (wasCurrent) {
+        const st = useApp.getState();
+        const real = st.sessions
+          .filter((x) => !x.path.startsWith('__new_'))
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (real) onSelectSession(real);
+        else void onNewSession(st.currentWorkspace()?.cwd);
+      }
+      return;
+    }
+    // 常规会话：先释放进程，再删磁盘文件；删完若删掉的是当前会话则切到其它会话
     void rpc.release(s.path).catch(() => undefined);
-    void window.omp.deleteSession(s.path).then(refreshSessions).catch(() => undefined);
-  }, [refreshSessions]);
+    void window.omp.deleteSession(s.path).then(async () => {
+      await refreshSessions();
+      if (useApp.getState().currentSessionPath === s.path) {
+        const nx = useApp.getState().sessions
+          .filter((x) => !x.path.startsWith('__new_'))
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (nx) onSelectSession(nx);
+        else useApp.getState().setCurrentSessionPath(undefined);
+      }
+    }).catch(() => undefined);
+  }, [refreshSessions, discardTempSession, onSelectSession, onNewSession]);
 
   // ---- 会话右键操作（透传给 SessionList）----
+  // 会话重命名：用自绘 modal 输入（Electron 渲染进程不支持 window.prompt，会直接抛错中断）；
+  // 改名写入宿主侧覆盖层 sessionNames（持久化到 workspaces.json），不依赖 omp 子进程，
+  // 因此即使会话进程离线也能立即生效（与"项目重命名"同思路）。
+  const [renameSessionTarget, setRenameSessionTarget] = useState<SessionSummary | null>(null);
+  const [renameSessionValue, setRenameSessionValue] = useState('');
   const onRenameSession = useCallback((s: SessionSummary) => {
-    const name = window.prompt('新名称', s.title);
-    if (name && name.trim()) {
-      // 始终用被右键的会话 s.path，而非 currentSessionPath，避免改错对象
-      void rpc.setSessionName(s.path, name.trim()).then(() => {
-        refreshSessions();
-      }).catch(() => undefined);
+    setRenameSessionTarget(s);
+    setRenameSessionValue(useApp.getState().sessionNames[s.path] ?? s.title);
+  }, []);
+  const submitSessionRename = useCallback(() => {
+    if (!renameSessionTarget) return;
+    const name = renameSessionValue.trim();
+    const prev = useApp.getState().sessionNames[renameSessionTarget.path] ?? renameSessionTarget.title;
+    if (name && name !== prev) {
+      useApp.getState().renameSession(renameSessionTarget.path, name);
     }
-  }, [refreshSessions]);
+    setRenameSessionTarget(null);
+    setRenameSessionValue('');
+  }, [renameSessionTarget, renameSessionValue]);
 
   const onBranchSession = useCallback((s: SessionSummary) => {
     useApp.getState().setMainView('chat');
@@ -727,9 +813,9 @@ export default function App(): React.ReactElement {
   const currentUi = uiQueue[0];
   const currentSessionPath = useApp((s) => s.currentSessionPath);
   const sessions = useApp((s) => s.sessions);
-  // 顶栏标题 = 当前会话名（而非硬编码「OMP · Codex」）
+  // 顶栏标题 = 当前会话名（优先用宿主侧覆盖名，否则用扫盘得到的 title）
   const currentSessionTitle = useApp(
-    (s) => s.sessions.find((x) => x.path === s.currentSessionPath)?.title ?? null,
+    (s) => s.sessionNames[s.currentSessionPath ?? ''] ?? s.sessions.find((x) => x.path === s.currentSessionPath)?.title ?? null,
   );
 
   const showTitleBar = IS_WIN32;
@@ -837,6 +923,31 @@ export default function App(): React.ReactElement {
           <div className="modal">
             <div className="modal-title">正在连接 omp…</div>
             <div className="modal-message">等待首个会话进程拉起（ready）。若长时间无响应，请检查 omp 路径配置。</div>
+          </div>
+        </div>
+      )}
+
+      {/* 会话重命名 modal（替代 window.prompt：Electron 渲染进程不支持 prompt） */}
+      {renameSessionTarget && (
+        <div className="modal-overlay" onMouseDown={() => { setRenameSessionTarget(null); setRenameSessionValue(''); }}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => {
+            if (e.key === 'Escape') { setRenameSessionTarget(null); setRenameSessionValue(''); }
+          }}>
+            <div className="modal-title">重命名会话</div>
+            <input
+              type="text"
+              autoFocus
+              value={renameSessionValue}
+              onChange={(e) => setRenameSessionValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submitSessionRename(); }
+                else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setRenameSessionTarget(null); setRenameSessionValue(''); }
+              }}
+            />
+            <div className="modal-actions">
+              <button className="btn" onClick={() => { setRenameSessionTarget(null); setRenameSessionValue(''); }}>取消</button>
+              <button className="btn btn-primary" onClick={submitSessionRename}>确定</button>
+            </div>
           </div>
         </div>
       )}

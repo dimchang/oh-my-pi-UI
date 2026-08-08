@@ -292,6 +292,9 @@ export interface WorkspacesFile {
    *  历史遗留：v0.3.5 之前是 \`steerDefault: 'restart' | 'steer'\`（含 abort+prompt 真中断），
    *  v0.3.6 移除\"立即中断\"入口并重命名为本字段，老字段被忽略。 */
   inputBehavior?: 'queue' | 'guide';
+  /** 会话显示名覆盖层：sessionPath -> 用户自定义名（host 侧，不依赖 omp 写盘）。
+   *  与"项目重命名"同思路——只覆盖 UI 展示，不修改磁盘 JSONL。 */
+  sessionNames?: Record<string, string>;
 }
 
 // ---- 模型配置：omp 原生 ~/.omp/agent/models.yml ----

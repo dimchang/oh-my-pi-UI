@@ -141,6 +141,9 @@ interface AppState {
   /** 已安装技能（技能页网格）：来自主进程扫描（含已停用项），enabled 反映 config.yml */
   skills: SkillInfo[];
   sessions: SessionSummary[];
+  /** 会话显示名覆盖层（host 侧，不依赖 omp 写盘）：sessionPath -> 用户自定义名。
+   *  持久化到 workspaces.json，UI 优先用覆盖名显示；与"项目重命名"同思路（覆盖层，不改 JSONL 本身）。 */
+  sessionNames: Record<string, string>;
   currentSessionPath?: string;
   uiQueue: UiRequest[]; // extension_ui_request 待应答队列（单队列顺序展示）
   /** per-session 工具级"始终允许"缓存：key = `${sessionPath}::${toolName.toLowerCase()}`，命中即自动放行。
@@ -214,6 +217,9 @@ interface AppState {
   isPermAllowed(sessionPath: string, toolName: string): boolean;
 
   setSessions(list: SessionSummary[]): void;
+  /** 乐观插入临时会话占位（__new_ 开头）：新会话首条消息 agent_end 才落盘 .jsonl，
+   *  在此之前先在侧栏显示占位条目，避免"等 LLM 回复完才出现"。 */
+  upsertSessionPlaceholder(path: string, cwd: string): void;
   setSkills(list: SkillInfo[]): void;
   setCurrentSessionPath(p?: string): void;
 
@@ -250,6 +256,8 @@ interface AppState {
   /** 彻底删除归档项：从归档区移除，并记录 cwd 到 removedCwds（防自动补全复活） */
   deleteArchivedWorkspace(id: string): void;
   renameWorkspace(id: string, displayName: string): void;
+  /** 会话重命名（host 侧覆盖层，不依赖 omp 写盘）：写入 sessionNames 并持久化。 */
+  renameSession(path: string, name: string): void;
   toggleWorkspaceCollapsed(id: string): void;
   /** 设置某工作空间的 omp 权限模式（同时持久化到 workspaces.json） */
   setWorkspaceApprovalMode(id: string, mode: ApprovalMode): void;
@@ -361,6 +369,7 @@ export const useApp = create<AppState>((set, get) => ({
   slashCommands: [],
   skills: [],
   sessions: [],
+  sessionNames: {},
   uiQueue: [],
   permAllow: {},
   stderrTail: [],
@@ -454,7 +463,32 @@ export const useApp = create<AppState>((set, get) => ({
   pushStderr: (line) =>
     set((s) => ({ stderrTail: [...s.stderrTail.slice(-199), line] })),
 
-  setSessions: (list) => set({ sessions: list }),
+  setSessions: (list) =>
+    set((s) => {
+      // 保留尚未落盘的临时会话占位（__new_ 开头）：新会话首条消息 agent_end 才写 .jsonl，
+      // 期间 refreshSessions 多次扫盘都扫不到，若直接覆盖会清掉刚乐观插入的占位条目。
+      // 占位在 migrateTempSession 时由真实 path 替换 / 移除（见 App.tsx）。
+      const placeholders = s.sessions.filter(
+        (x) => x.path.startsWith('__new_') && !list.some((y) => y.path === x.path),
+      );
+      if (placeholders.length === 0) return { sessions: list };
+      return { sessions: [...list, ...placeholders] };
+    }),
+  upsertSessionPlaceholder: (path, cwd) =>
+    set((s) => {
+      if (!path.startsWith('__new_')) return {};
+      // 已存在占位（如重入）则不重复插入
+      if (s.sessions.some((x) => x.path === path)) return {};
+      const placeholder: SessionSummary = {
+        path,
+        id: path,
+        cwd,
+        // 若用户在落盘前就已重命名过（sessionNames 里有该 tempKey 覆盖），沿用之
+        title: s.sessionNames[path] ?? '新会话',
+        mtime: Date.now(),
+      };
+      return { sessions: [...s.sessions, placeholder] };
+    }),
   setSkills: (list) => set({ skills: list }),
   setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [] }),
 
@@ -548,6 +582,7 @@ export const useApp = create<AppState>((set, get) => ({
       appearance: migratedAppearance,
       hooks: file.hooks,
       inputBehavior: file.inputBehavior ?? 'guide',
+      sessionNames: file.sessionNames ?? {},
     });
     // 若发生过迁移（任何 id 改了格式）或 customCss 补上 id，立即写回磁盘
     const dirty =
@@ -625,6 +660,12 @@ export const useApp = create<AppState>((set, get) => ({
       workspaces: s.workspaces.map((w) => (w.id === id ? { ...w, displayName } : w)),
     })),
 
+  renameSession: (path, name) => {
+    set((s) => ({ sessionNames: { ...s.sessionNames, [path]: name } }));
+    // 持久化到 workspaces.json（迁移 __new_ 临时 key 时 store 也会同步 key）
+    get().persistWorkspaces();
+  },
+
   toggleWorkspaceCollapsed: (id) =>
     set((s) => ({
       workspaces: s.workspaces.map((w) => (w.id === id ? { ...w, collapsed: !w.collapsed } : w)),
@@ -662,6 +703,7 @@ export const useApp = create<AppState>((set, get) => ({
         appearance: s.appearance,
         hooks: s.hooks,
         inputBehavior: s.inputBehavior,
+        sessionNames: s.sessionNames,
       };
       // 动态 import 避免循环依赖（rpc-client 也 import store）
       void import('./rpc-client').then(({ rpc }) => {
