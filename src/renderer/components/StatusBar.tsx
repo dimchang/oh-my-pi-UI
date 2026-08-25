@@ -20,6 +20,11 @@ export const StatusBar: React.FC = () => {
   const ps = useApp((s) => (s.currentSessionPath ? s.procStateMap[s.currentSessionPath] : undefined));
   const browsing = !!currentSessionPath && (!ps || ps.status === 'offline' || ps.status === 'evicted');
   const spawning = !!currentSessionPath && ps?.status === 'spawning';
+  // 流式看门狗：当前会话"生成中但长时间无任何帧" → 疑似卡死（stuckSince 由 App 的定时扫描写入）
+  const stuckMinutes =
+    currentSessionPath && ps?.isStreaming && ps?.stuckSince
+      ? Math.max(1, Math.round((Date.now() - ps.stuckSince) / 60000))
+      : 0;
 
   // sessionStats 不再在这里一次性拉取：改由 App.refreshState 统一驱动
   // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
@@ -31,13 +36,14 @@ export const StatusBar: React.FC = () => {
       : typeof exited === 'number' ? `omp 已退出 (${exited})`
       : isCompacting ? '压缩中'
       : isRetrying ? '重试中'
+      : stuckMinutes > 0 ? `疑似卡死（${stuckMinutes} 分钟无响应）`
       : isStreaming ? '生成中'
       : ready ? '就绪'
       : '连接中';
 
   return (
     <div className="statusbar">
-      <span className="status-item">
+      <span className="status-item" style={stuckMinutes > 0 ? { color: 'var(--yellow)' } : undefined}>
         <span className={`status-dot ${dot}`} />
         {statusText}
       </span>

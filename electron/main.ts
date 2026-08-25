@@ -20,7 +20,7 @@ import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './
 import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
 import { IPC } from '../src/shared/ipc-channels';
 import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult } from '../src/shared/ipc-channels';
-import type { RpcCommand, ExtensionUIResponseCommand } from '../src/shared/rpc-types';
+import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -400,6 +400,13 @@ function registerIpc(): void {
     if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
     await shell.openExternal(url);
   });
+  ipcMain.handle(IPC.OpenPath, async (_e, dirPath: string) => {
+    // 本地路径专用通道（目录→资源管理器 / 文件→关联应用）。与 openExternal 分离：
+    // openExternal 白名单只收 http/https；本地路径一律走 shell.openPath（issue：右键工作空间"打开目录"无反应）。
+    if (!dirPath || typeof dirPath !== 'string') throw new Error('路径为空');
+    const res = await shell.openPath(path.normalize(dirPath));
+    if (res) throw new Error(res); // openPath 返回非空字符串 = 失败原因
+  });
   ipcMain.handle(IPC.OpenInBrowser, async (_e, browser: 'chrome' | 'edge', url: string) => {
     // 只允许 http/https，避免借 IPC 打开任意资源。
     if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
@@ -638,6 +645,76 @@ function registerIpc(): void {
   ipcMain.handle(IPC.OmpModelsDeleteProvider, async (_e, id: string) => {
     if (!sensitiveLimiter.allow('models-delete')) throw new Error('操作过于频繁，请稍后再试');
     await deleteProvider(id);
+  });
+
+  // ---- get_available_models 结果缓存（跨重启恢复，缓解 omp 目录过大导致整片空白）----
+  // omp 的 get_available_models 把整份模型目录（内置 ~5700 + 各 provider 发现的）塞进单帧返回，
+  // 目录过大时 omp 返回 "RPC response exceeded the transport limit" 错误帧而非数据，UI 选择器整片空白。
+  // 这里把最后一次成功结果落盘，失败时 UI 回退到缓存（合并本地 models.yml），保证不空白。
+  const modelsCacheFile = () => path.join(app.getPath('userData'), 'available-models-cache.json');
+  ipcMain.handle(IPC.OmpModelsCacheGet, async () => {
+    try {
+      const raw = await fs.promises.readFile(modelsCacheFile(), 'utf8');
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : null;
+    } catch {
+      return null; // 无缓存（首次 / 文件损坏）不抛错，交给上层回退逻辑
+    }
+  });
+  ipcMain.handle(IPC.OmpModelsCacheSet, async (_e, models: unknown) => {
+    if (!Array.isArray(models)) return;
+    try {
+      const dir = path.dirname(modelsCacheFile());
+      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.writeFile(modelsCacheFile(), JSON.stringify(models), 'utf8');
+    } catch { /* 缓存写入失败不影响主流程 */ }
+  });
+
+  // ---- 直接拉取 discovery provider 的模型列表（绕过 omp 的 get_available_models 传输上限）----
+  // 当 omp 的 get_available_models 因目录过大返回 "transport limit" 错误帧时，UI 整片空白。
+  // 此时直接按 models.yml 里 discovery 配置，自己发 HTTP 拉各 provider 的 /models，
+  // 把模型补回可用列表，保证「新添加的 provider」在 omp RPC 失败时也能量化显示与选择。
+  ipcMain.handle(IPC.OmpFetchProviderModels, async (_e, providerId?: string) => {
+    const yml = await readModelsConfig();
+    const providers = yml.providers ?? {};
+    const targets = Object.entries(providers).filter(([pid, cfg]) => {
+      if (!cfg || !cfg.discovery) return false;
+      if (providerId) return pid === providerId;
+      return true;
+    });
+    const PER_PROVIDER_CAP = 1000;
+    const out: ModelInfo[] = [];
+    await Promise.all(targets.map(async ([pid, cfg]) => {
+      try {
+        const base = (cfg.baseUrl ?? '').replace(/\/+$/, '');
+        if (!base) return;
+        let url: string;
+        let parse: (json: any) => { id: string; name?: string }[];
+        if (cfg.discovery?.type === 'ollama') {
+          url = `${base}/api/tags`;
+          parse = (j) => Array.isArray(j?.models) ? j.models.map((m: any) => ({ id: m.name, name: m.name })) : [];
+        } else {
+          // openai-models-list（默认）：GET {base}/models
+          url = `${base}/models`;
+          parse = (j) => Array.isArray(j?.data) ? j.data.map((m: any) => ({ id: m.id, name: m.name ?? m.id })) : [];
+        }
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        if (cfg.auth !== 'none' && cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 8000);
+        try {
+          const res = await fetch(url, { headers, signal: ctrl.signal });
+          if (!res.ok) return;
+          const json = await res.json();
+          for (const m of parse(json).slice(0, PER_PROVIDER_CAP)) {
+            if (m?.id) out.push({ provider: pid, id: m.id, name: m.name ?? m.id });
+          }
+        } finally {
+          clearTimeout(t);
+        }
+      } catch { /* 单个 provider 拉取失败不影响其它 */ }
+    }));
+    return out;
   });
 
   // ---- 自定义标题栏 ----

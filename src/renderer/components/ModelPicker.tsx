@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 import { modelKey } from '../utils/path-key';
+import { fetchAvailableModels } from '../utils/available-models';
 import type { ModelInfo } from '../../shared/rpc-types';
 
 /** get_available_models 的客户端超时（ms）。FrameRouter 默认 5 分钟对 UI 下拉太长。 */
@@ -16,6 +17,8 @@ export const ModelPicker: React.FC = () => {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState(false);
+  /** 回退提示：get_available_models 因 omp 目录过大失败，已用缓存/本地配置回退 */
+  const [fallback, setFallback] = useState<{ reason?: string } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   // 组件卸载后置 true，避免 fetchModels 的延迟回调在卸载后 setState（issue 13）
@@ -31,6 +34,7 @@ export const ModelPicker: React.FC = () => {
     }
     if (showLoading) setLoading(true);
     setFetchError(false);
+    setFallback(null);
 
     const timer = setTimeout(() => {
       if (cancelledRef.current) return;
@@ -47,12 +51,14 @@ export const ModelPicker: React.FC = () => {
         setFetchError(true);
         return;
       }
-      rpc.getAvailableModels(sp).then((r) => {
+      void fetchAvailableModels(sp).then((res) => {
         clearTimeout(timer);
         if (cancelledRef.current) return;
         setLoading(false);
-        if (r.success && r.data) setModels(r.data.models ?? []);
-        else setFetchError(true);
+        setModels(res.models);
+        setFallback(res.fallback ? { reason: res.reason } : null);
+        // 回退且没有任何模型可得时才算真正失败（避免整片空白）
+        setFetchError(res.fallback && res.models.length === 0);
       }).catch(() => {
         clearTimeout(timer);
         if (cancelledRef.current) return;
@@ -162,6 +168,11 @@ export const ModelPicker: React.FC = () => {
             />
           </div>
           <div className="model-list">
+            {fallback && models.length > 0 && (
+              <div className="model-fallback-note" title={fallback.reason}>
+                模型列表为本地缓存/配置回退（omp 目录过大），可能不全
+              </div>
+            )}
             {loading ? (
               <div className="model-empty">加载模型列表中…</div>
             ) : fetchError ? (

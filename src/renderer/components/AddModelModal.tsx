@@ -291,27 +291,35 @@ export const AddModelModal: React.FC<Props> = ({
     }
     setPolling(true);
     const sp = useApp.getState().currentSessionPath ?? '';
-    void rpc.getAvailableModels(sp).then((r) => {
-      const list = (r.success && r.data ? r.data.models ?? [] : []).filter(
-        (m) => m.provider === providerId,
-      );
+    const commit = (list: ModelInfo[]): boolean => {
       if (list.length > 0) {
         setDiscovered(list);
         setChecked(new Set(list.map((m) => modelKey(m))));
         setPolling(false);
-        return;
+        return true;
       }
+      return false;
+    };
+    const retry = () => {
       if (attempt < 6) {
         pollTimer.current = window.setTimeout(() => pollModels(providerId, attempt + 1), 1500);
       } else {
         setPolling(false);
       }
+    };
+    void rpc.getAvailableModels(sp).then((r) => {
+      const list = (r.success && r.data ? r.data.models ?? [] : []).filter(
+        (m) => m.provider === providerId,
+      );
+      // omp 目录过大可能拿不到该 provider 的模型：回退到直接拉其 /models
+      if (commit(list)) return;
+      void window.omp.fetchProviderModels(providerId).then((disc) => {
+        if (!commit(disc)) retry();
+      }).catch(retry);
     }).catch(() => {
-      if (attempt < 6) {
-        pollTimer.current = window.setTimeout(() => pollModels(providerId, attempt + 1), 1500);
-      } else {
-        setPolling(false);
-      }
+      void window.omp.fetchProviderModels(providerId).then((disc) => {
+        if (!commit(disc)) retry();
+      }).catch(retry);
     });
   }, []);
 
@@ -391,7 +399,7 @@ export const AddModelModal: React.FC<Props> = ({
   }, [buildConfig, writeAndRestart, onSaved]);
 
   /** 第 2 步完成：把勾选结果并入 enabledModels 白名单 */
-  const onFinish = useCallback(() => {
+  const onFinish = useCallback(async () => {
     const st = useApp.getState();
     const providerPrefix = `${pid.trim()}\u0000`;
     const checkedKeys = Array.from(checked);
@@ -413,8 +421,33 @@ export const AddModelModal: React.FC<Props> = ({
     } else {
       st.setEnabledModels(allKeys.length > 0 ? allKeys : undefined);
     }
+
+    // 根因缓解：该 provider 是通过 discovery 自动发现拉到的模型时，
+    // 把发现到的模型显式写入 models.yml 并去掉 discovery 实时拉取。
+    // 否则 omp 会在每次 get_available_models 时把整份（可能巨大的）目录塞进单帧，
+    // 超出其传输上限 → 返回错误帧 → UI 整片空白。显式写死后目录变固定、变小，
+    // 且这些模型在 omp RPC 失败时仍可通过本地回退被选中。
+    if (discovered.length > 0) {
+      try {
+        const yml = await window.omp.readModelsConfig();
+        const pidVal = pid.trim();
+        const existing = yml.providers?.[pidVal];
+        if (existing && existing.discovery) {
+          const explicitModels = discovered.map((m) => ({
+            id: m.id,
+            name: m.name,
+            contextWindow: m.contextWindow,
+          }));
+          const newCfg: OmpProviderConfig = { ...existing, models: explicitModels };
+          delete (newCfg as Partial<OmpProviderConfig>).discovery;
+          await window.omp.writeOmpProvider(pidVal, newCfg);
+        }
+      } catch {
+        /* 回退写入失败不影响主流程（enabledModels 已更新） */
+      }
+    }
     onSaved();
-  }, [pid, checked, onSaved]);
+  }, [pid, checked, onSaved, discovered]);
 
   const toggleCheck = useCallback((key: string) => {
     setChecked((prev) => {

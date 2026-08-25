@@ -4,6 +4,7 @@
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig } from '../src/shared/ipc-channels';
+import type { ModelInfo } from '../src/shared/rpc-types';
 import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -28,6 +29,7 @@ const api: OmpApi = {
   getSessionUserEntries: (p: string) => ipcRenderer.invoke(IPC.SessionUserEntries, p),
   getOmpInfo: () => ipcRenderer.invoke(IPC.GetOmpInfo),
   openExternal: (url: string) => ipcRenderer.invoke(IPC.OpenExternal, url),
+  openPath: (dirPath: string) => ipcRenderer.invoke(IPC.OpenPath, dirPath),
   openInBrowser: (browser, url) => ipcRenderer.invoke(IPC.OpenInBrowser, browser, url),
   copyText: (text: string) => ipcRenderer.invoke(IPC.ClipboardWriteText, text),
   showItemInFolder: (fullPath: string) => ipcRenderer.invoke(IPC.ShowItemInFolder, fullPath),
@@ -52,6 +54,9 @@ const api: OmpApi = {
   writeOmpProvider: (id: string, cfg: OmpProviderConfig) =>
     ipcRenderer.invoke(IPC.OmpModelsWriteProvider, id, cfg),
   deleteOmpProvider: (id: string) => ipcRenderer.invoke(IPC.OmpModelsDeleteProvider, id),
+  loadModelsCache: () => ipcRenderer.invoke(IPC.OmpModelsCacheGet),
+  saveModelsCache: (models: ModelInfo[]) => ipcRenderer.invoke(IPC.OmpModelsCacheSet, models),
+  fetchProviderModels: (providerId?: string) => ipcRenderer.invoke(IPC.OmpFetchProviderModels, providerId),
 
   // 技能（Skills）管理
   skillsList: () => ipcRenderer.invoke(IPC.SkillsList),

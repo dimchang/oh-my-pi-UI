@@ -174,8 +174,13 @@ export const WorkspaceList: React.FC<{
 
   const handleOpenInExplorer = async (ws: Workspace) => {
     closeMenu();
-    // 复用 openExternal 打开本地路径（Windows 资源管理器 / macOS Finder）
-    await window.omp.openExternal(ws.cwd).catch(() => undefined);
+    // 本地路径必须走 openPath（shell.openPath）：openExternal 白名单只收 http/https，
+    // 传本地 cwd 会被主进程拒绝（issue：右键工作空间"打开目录"无反应）。
+    try {
+      await window.omp.openPath(ws.cwd);
+    } catch (e) {
+      useApp.getState().pushToast(`打开目录失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
   };
 
   const handleNewSession = (ws: Workspace) => {

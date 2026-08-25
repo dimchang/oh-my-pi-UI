@@ -914,7 +914,19 @@ body {
   user-select: none;
 }
 .tool-head:hover { background: hsl(var(--bg-300) / 0.4); }
-.tool-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text); }
+.tool-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; color: var(--text); white-space: nowrap; flex-shrink: 0; }
+.tool-summary {
+  flex: 1;
+  min-width: 0; /* 允许 flex 子项收缩到内容以下，省略号才能生效 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 12px;
+  direction: rtl; /* 长路径/URL 优先保留尾部（文件名），配合 unicode-bidi 避免标点错乱 */
+  text-align: left;
+  unicode-bidi: plaintext;
+}
 .tool-status {
   font-size: 10.5px;
   padding: 1px 8px;
@@ -1360,6 +1372,16 @@ body {
 .model-search-input:focus { border-color: hsl(var(--accent-main-000)); }
 .model-list { overflow-y: auto; flex: 1; padding-top: 4px; }
 .model-empty { padding: 16px 12px; text-align: center; font-size: 12.5px; color: hsl(var(--text-400)); }
+.model-fallback-note {
+  margin: 6px 10px 2px;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: hsl(var(--warn-000, 38 92% 50%));
+  background: hsl(var(--warn-bg-000, 38 90% 18%) / 0.55);
+  border: 1px solid hsl(var(--warn-border-000, 38 80% 35%) / 0.5);
+  border-radius: var(--radius-sm);
+}
 .model-group {
   padding: 8px 12px 4px;
   font-size: 10.5px;
@@ -2173,6 +2195,15 @@ body {
   padding: 8px 12px;
   font-size: 12.5px;
   font-family: var(--font-mono);
+}
+.model-config-fallback {
+  background: hsl(var(--warn-bg-000, 38 90% 18%) / 0.55);
+  border: 1px solid hsl(var(--warn-border-000, 38 80% 35%) / 0.5);
+  color: hsl(var(--warn-000, 38 92% 50%));
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.45;
 }
 .provider-list { display: flex; flex-direction: column; gap: 12px; }
 .provider-card {

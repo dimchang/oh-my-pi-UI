@@ -118,6 +118,13 @@ export interface ProcState {
   status: 'spawning' | 'online' | 'offline' | 'evicted';
   isStreaming: boolean;
   isAborting: boolean;
+  /** 流式看门狗：该会话最近一次收到 omp 帧的时间（ms epoch）。
+   *  背景（实证 session 01a02a7c）：omp 工具执行无超时，eval 挂死 9h38m 期间不发任何帧，
+   *  isStreaming 永远 true、UI 永远"生成中"。看门狗据此判定疑似卡死。 */
+  lastFrameAt?: number;
+  /** 流式看门狗：判定卡死的起始时间（=触发时距最后帧已超阈值的时刻标记）。
+   *  任意新帧到达即清除（applyAgentEvent 统一写 undefined）；仅提示，不自动中断。 */
+  stuckSince?: number;
 }
 
 interface AppState {
@@ -867,6 +874,8 @@ export const useApp = create<AppState>((set, get) => ({
 
   applyAgentEvent: (frame) => {
     const s = get();
+    // 流式看门狗：任何经此分发的帧都算"进程活跃"信号（高频帧如 message_update 足以覆盖正常生成期）
+    const now = Date.now();
     // 多进程：每帧带 __sessionPath 标记属于哪个会话，直接按此路由到对应缓冲槽。
     // 不再依赖 ompCurrentPath 猜测（那是单进程时代的 hack）。
     const rawTargetPath = (frame.__sessionPath as string | undefined) ?? '';
@@ -1062,6 +1071,9 @@ export const useApp = create<AppState>((set, get) => ({
           status: 'online' as const,
           isStreaming: procStreaming,
           isAborting: procAborting,
+          // 看门狗：刷新活跃时间；有新帧即解除卡死标记（恢复活跃 = 警报自动消除）
+          lastFrameAt: now,
+          stuckSince: undefined,
         } as ProcState,
       },
     };

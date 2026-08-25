@@ -2,7 +2,7 @@
  * ipc-channels.ts — 渲染进程 ↔ 主进程 IPC 通道名与载荷类型
  */
 
-import type { OmpFrame, RpcCommand, AgentMessage, ReplayMessage } from './rpc-types';
+import type { OmpFrame, RpcCommand, AgentMessage, ReplayMessage, ModelInfo } from './rpc-types';
 
 export const IPC = {
   // renderer → main (invoke/handle)
@@ -17,6 +17,7 @@ export const IPC = {
   SessionUserEntries: 'session:user-entries', // (path: string) => Promise<{id:string;text:string}[]> — 分叉用，取 user entry id + 文本
   GetOmpInfo: 'omp:info', // () => Promise<{path:string; version:string}>
   OpenExternal: 'shell:open-external', // (url: string) => Promise<void>
+  OpenPath: 'shell:open-path', // (dirPath: string) => Promise<void> — 用系统默认程序打开本地路径（目录→资源管理器）。本地路径禁走 openExternal（只收 http/https）
   OpenInBrowser: 'shell:open-in-browser', // (browser: 'chrome'|'edge', url: string) => Promise<void> — 用指定浏览器打开链接（找不到时回退系统默认）
   ClipboardWriteText: 'clipboard:write-text', // (text: string) => Promise<void> — 写系统剪贴板
   ShowItemInFolder: 'shell:show-item-in-folder', // (fullPath: string) => Promise<void> — 在文件管理器中定位文件
@@ -40,6 +41,13 @@ export const IPC = {
   OmpModelsRead: 'omp:models-read', // () => Promise<OmpModelsConfig>
   OmpModelsWriteProvider: 'omp:models-write-provider', // (id: string, cfg: OmpProviderConfig) => Promise<void>
   OmpModelsDeleteProvider: 'omp:models-delete-provider', // (id: string) => Promise<void>
+  /** get_available_models 的最后成功结果缓存（userData/available-models-cache.json）。
+   *  当 omp 的 get_available_models 因目录过大超出传输上限而失败时，UI 回退到该缓存，
+   *  避免模型选择器整片空白（见 available-models.ts）。 */
+  OmpModelsCacheGet: 'omp:models-cache-get', // () => Promise<ModelInfo[] | null>
+  OmpModelsCacheSet: 'omp:models-cache-set', // (models: ModelInfo[]) => Promise<void>
+  /** 绕过 omp 直接按 models.yml 的 discovery 配置拉各 provider 的模型列表（omp get_available_models 失败时的回退） */
+  OmpFetchProviderModels: 'omp:fetch-provider-models', // (providerId?: string) => Promise<ModelInfo[]>
 
   // 自定义标题栏窗口控制（Windows frameless 模式）
   WindowMinimize: 'window:minimize', // () => Promise<void>
@@ -359,6 +367,8 @@ export interface OmpApi {
   getSessionUserEntries(path: string): Promise<{ id: string; text: string }[]>;
   getOmpInfo(): Promise<{ path: string; version: string }>;
   openExternal(url: string): Promise<void>;
+  /** 用系统默认程序打开本地路径（目录→资源管理器，文件→关联应用）。本地路径必须走此通道而非 openExternal */
+  openPath(dirPath: string): Promise<void>;
   /** 用指定外部浏览器打开链接（chrome / edge）；该浏览器找不到时回退系统默认浏览器 */
   openInBrowser(browser: 'chrome' | 'edge', url: string): Promise<void>;
   /** 写系统剪贴板（用 electron clipboard，规避 renderer navigator.clipboard 的安全上下文限制） */
@@ -391,6 +401,11 @@ export interface OmpApi {
   readModelsConfig(): Promise<OmpModelsConfig>;
   writeOmpProvider(id: string, cfg: OmpProviderConfig): Promise<void>;
   deleteOmpProvider(id: string): Promise<void>;
+  /** get_available_models 最后成功结果的持久化缓存（跨重启恢复，避免目录过大失败时空白） */
+  loadModelsCache(): Promise<ModelInfo[] | null>;
+  saveModelsCache(models: ModelInfo[]): Promise<void>;
+  /** 绕过 omp 直接拉 discovery provider 的模型列表（omp RPC 失败回退用） */
+  fetchProviderModels(providerId?: string): Promise<ModelInfo[]>;
 
   // 技能（Skills）管理
   skillsList(): Promise<SkillInfo[]>;

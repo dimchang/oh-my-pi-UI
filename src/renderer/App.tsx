@@ -111,60 +111,127 @@ export default function App(): React.ReactElement {
 
   /** 迁移中的 temp key 集合（并发保护）：同一 __new_ 会话的多次 agent_end 只处理一次。 */
   const migratingTempKeys = useRef<Set<string>>(new Set());
+  /** 已被某个 temp key 认领的真实 path（防止同工作空间多个 temp 抢同一个最新落盘会话）。 */
+  const claimedRealPaths = useRef<Set<string>>(new Set());
   /** 新建会话前已知的真实 session path 快照。
    *  tempKey→realPath 迁移时不再靠 mtime 猜，而是找同 cwd 下"本次新建之后才出现"的真实 path。 */
   const knownSessionPathsBeforeNew = useRef<Set<string>>(new Set());
+  /** 落盘竞态重试：agent_end 帧可能先于 .jsonl 落盘可见到达，扫盘扫不到真实 path。
+   *  记录每个 temp 的重试次数与定时器，有限次延迟重试（实证：单轮对话时迁移失败后
+   *  再无下一次 agent_end，占位永久残留 → "新会话"与真实会话重复）。 */
+  const migrateRetryCount = useRef<Map<string, number>>(new Map());
+  const migrateRetryTimers = useRef<Map<string, number>>(new Map());
+  /** migrateTempSession 自引用（重试调度用），定义后回填。 */
+  const migrateRef = useRef<(tempPath?: string) => void>(() => undefined);
 
   /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
    *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
-   *  关键：omp 进程运行期间不写文件，只有首条消息完成后才落盘（probe 实测）。 */
-  const migrateTempSession = useCallback(() => {
+   *  关键：omp 进程运行期间不写文件，只有首条消息完成后才落盘（probe 实测）。
+   *
+   * issue（用户实测）：旧实现只迁移 currentSessionPath——若首条消息跑完前用户切走了
+   * 当前会话，agent_end 时 cur 已不是 __new_，迁移被跳过且永不重试 → 侧栏同时出现
+   * "新会话"占位 + 真实标题两条目（内容相同）。现改为：
+   *   1) 优先迁移事件指定的 tempPath（agent_end 帧自带 __sessionPath，与会话是否在显示无关）；
+   *   2) 兜底清扫所有残留的 __new_ 占位；
+   *   3) cwd 取占位条目自带的 x.cwd（不再依赖"当前工作空间"——切走后也不失准）；
+   *   4) claimedRealPaths 防止多个 temp 认领同一个真实 path。 */
+  const migrateTempSession = useCallback((tempPath?: string) => {
     const st = useApp.getState();
-    const cur = st.currentSessionPath;
-    if (!cur || !cur.startsWith('__new_')) return;
-    // 并发保护：已在迁移中则跳过，避免重复 setState / renameKey
-    if (migratingTempKeys.current.has(cur)) return;
-    migratingTempKeys.current.add(cur);
-    const done = () => migratingTempKeys.current.delete(cur);
-    const cwd = st.currentWorkspace()?.cwd;
-    if (!cwd) { done(); return; }
-    // 用"新建前快照"找真正刚落盘的新会话，而不是靠 mtime 猜（否则首条消息 agent_end 前可能命中旧会话）。
-    const candidates = st.sessions
-      .filter((x) => cwdKey(x.cwd) === cwdKey(cwd) && x.path !== cur && !knownSessionPathsBeforeNew.current.has(x.path))
-      .sort((a, b) => b.mtime - a.mtime);
-    const newest = candidates[0];
-    if (!newest || newest.path === cur) { done(); return; }
-    knownSessionPathsBeforeNew.current.add(newest.path);
-    const buf = st.sessionsMap[cur];
-    const ps = st.procStateMap[cur];
-    const sessionsMap = { ...st.sessionsMap };
-    delete sessionsMap[cur];
-    if (buf) sessionsMap[newest.path] = buf;
-    const procStateMap = { ...st.procStateMap };
-    delete procStateMap[cur];
-    if (ps) procStateMap[newest.path] = ps;
-    // 关键：pending UI 请求（如工具确认弹窗）也带着旧 __new_ temp key，
-    // 若不重定向会指向已离线的旧进程 → 用户点确认报 "omp process not online"。
-    // 这里把 uiQueue 里 sessionPath===cur 的请求一并改到真实 path（主进程 renameKey 已同步迁移 pin）。
-    const uiQueue = st.uiQueue.map((q) =>
-      q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
-    );
-    // 移除临时占位条目（真实 path 已由 refreshSessions 写入 sessions）；
-    // 同时把"落盘前就被重命名"的覆盖名从 tempKey 迁移到真实 path，避免改名丢失。
-    const sessionNames = { ...st.sessionNames };
-    const renamed = sessionNames[cur];
-    delete sessionNames[cur];
-    if (renamed && !sessionNames[newest.path]) sessionNames[newest.path] = renamed;
-    st.setState({
-      sessionsMap,
-      procStateMap,
-      currentSessionPath: newest.path,
-      uiQueue,
-      sessions: st.sessions.filter((x) => x.path !== cur),
-      sessionNames,
-    });
-    void rpc.renameKey(cur, newest.path).then(done, done);
+    // 组装待迁移目标：指定优先，兜底扫残留
+    const targets = new Set<string>();
+    if (tempPath && tempPath.startsWith('__new_')) targets.add(tempPath);
+    else if (st.currentSessionPath?.startsWith('__new_')) targets.add(st.currentSessionPath);
+    for (const p of Object.keys(st.procStateMap)) {
+      if (p.startsWith('__new_')) targets.add(p);
+    }
+    // sessions 里的残留占位仅在本运行周期有 procState 时才纳入（防止把上次崩溃遗留的
+    // 陈旧占位错误认领到当前工作空间最新的真实会话上）
+    for (const p of st.sessions) {
+      if (p.path.startsWith('__new_') && st.procStateMap[p.path]) targets.add(p.path);
+    }
+    for (const cur of targets) {
+      if (!cur || !cur.startsWith('__new_')) continue;
+      // 并发保护：已在迁移中则跳过，避免重复 setState / renameKey
+      if (migratingTempKeys.current.has(cur)) continue;
+      migratingTempKeys.current.add(cur);
+      const done = () => migratingTempKeys.current.delete(cur);
+      // cwd 优先取占位条目自带值（切走当前工作空间后仍准确），退回当前工作空间
+      const wsCwd = st.sessions.find((x) => x.path === cur)?.cwd;
+      const cwd = wsCwd ?? st.currentWorkspace()?.cwd;
+      if (!cwd) { done(); continue; }
+      // 用"新建前快照"找真正刚落盘的新会话，而不是靠 mtime 猜（否则首条消息 agent_end 前可能命中旧会话）。
+      const candidates = st.sessions
+        .filter((x) =>
+          cwdKey(x.cwd) === cwdKey(cwd)
+          && x.path !== cur
+          && !knownSessionPathsBeforeNew.current.has(x.path)
+          && !claimedRealPaths.current.has(x.path))
+        .sort((a, b) => b.mtime - a.mtime);
+      const newest = candidates[0];
+      if (!newest || newest.path === cur) {
+        // 落盘竞态：扫盘时真实 .jsonl 还不可见。安排有限次延迟重试（1.2s × 8 ≈ 10s），
+        // 成功或超限后停止；重试前确认目标仍存在（切走时可能已被 discard 清理）。
+        done();
+        const tries = (migrateRetryCount.current.get(cur) ?? 0) + 1;
+        if (tries <= 8) {
+          migrateRetryCount.current.set(cur, tries);
+          const prev = migrateRetryTimers.current.get(cur);
+          if (prev) window.clearTimeout(prev);
+          const timer = window.setTimeout(() => {
+            migrateRetryCount.current.delete(cur);
+            migrateRetryTimers.current.delete(cur);
+            const stNow = useApp.getState();
+            if (stNow.sessions.some((x) => x.path === cur) || stNow.procStateMap[cur]) {
+              // 先重新扫盘（落盘可能刚完成），再迁移
+              void refreshSessions()
+                .catch(() => undefined)
+                .then(() => migrateRef.current(cur));
+            }
+          }, 1200);
+          migrateRetryTimers.current.set(cur, timer);
+        }
+        continue;
+      }
+      // 找到了：清理该 temp 的重试状态
+      migrateRetryCount.current.delete(cur);
+      const pendingTimer = migrateRetryTimers.current.get(cur);
+      if (pendingTimer) { window.clearTimeout(pendingTimer); migrateRetryTimers.current.delete(cur); }
+      claimedRealPaths.current.add(newest.path);
+      knownSessionPathsBeforeNew.current.add(newest.path);
+      const buf = st.sessionsMap[cur];
+      const ps = st.procStateMap[cur];
+      const sessionsMap = { ...st.sessionsMap };
+      delete sessionsMap[cur];
+      if (buf) sessionsMap[newest.path] = buf;
+      const procStateMap = { ...st.procStateMap };
+      delete procStateMap[cur];
+      if (ps) procStateMap[newest.path] = ps;
+      // 关键：pending UI 请求（如工具确认弹窗）也带着旧 __new_ temp key，
+      // 若不重定向会指向已离线的旧进程 → 用户点确认报 "omp process not online"。
+      // 这里把 uiQueue 里 sessionPath===cur 的请求一并改到真实 path（主进程 renameKey 已同步迁移 pin）。
+      const uiQueue = st.uiQueue.map((q) =>
+        q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
+      );
+      // 移除临时占位条目（真实 path 已由 refreshSessions 写入 sessions）；
+      // 同时把"落盘前就被重命名"的覆盖名从 tempKey 迁移到真实 path，避免改名丢失。
+      const sessionNames = { ...st.sessionNames };
+      const renamed = sessionNames[cur];
+      delete sessionNames[cur];
+      if (renamed && !sessionNames[newest.path]) sessionNames[newest.path] = renamed;
+      st.setState({
+        sessionsMap,
+        procStateMap,
+        // 仅当迁移动的是当前会话才切换显示；后台 temp 的迁移不打扰用户正在看的会话
+        ...(st.currentSessionPath === cur ? { currentSessionPath: newest.path } : {}),
+        uiQueue,
+        sessions: st.sessions.filter((x) => x.path !== cur),
+        sessionNames,
+      });
+      void rpc.renameKey(cur, newest.path).then(done, done);
+    }
   }, []);
+  // 回填自引用，供落盘竞态重试调度
+  migrateRef.current = migrateTempSession;
 
   /** 新建会话后：设为 current + 清缓冲 + 刷新列表/状态。newSessionForCwd 已返回新 path。 */
   const resolveAndSelectNewSession = useCallback(async (newSessionPath: string, cwd?: string): Promise<void> => {
@@ -247,8 +314,9 @@ export default function App(): React.ReactElement {
       // 聊天流事件：按 __sessionPath 路由到对应会话缓冲
       st.applyAgentEvent(frame as Record<string, unknown>);
       if (f.type === 'agent_end') {
-        // omp 在 agent_end 时 flush 完整 JSONL，重新扫盘；新会话此时才落盘，迁移 tempKey→realPath
-        void refreshSessions().then(() => migrateTempSession());
+        // omp 在 agent_end 时 flush 完整 JSONL，重新扫盘；新会话此时才落盘，迁移 tempKey→realPath。
+        // 传入帧自带的 __sessionPath：即使该会话不是当前显示会话（用户已切走），也能正确迁移。
+        void refreshSessions().then(() => migrateTempSession(sp));
         // 仅当 agent_end 来自当前显示会话，才刷新状态栏
         if (sp && sp === useApp.getState().currentSessionPath) {
           void refreshState(sp);
@@ -290,20 +358,39 @@ export default function App(): React.ReactElement {
           const approvalMode = ws?.approvalMode ?? 'write';
           setTimeout(() => {
             // 仅当该会话仍处于 offline 状态时才恢复（避免用户已手动操作）
-            const ps = useApp.getState().procStateMap[sessionPath];
-            if (ps?.status === 'offline') {
-              void rpc.acquire(sessionPath, cwd, approvalMode)
+            const psNow = useApp.getState().procStateMap[sessionPath];
+            if (psNow?.status !== 'offline') return;
+            // temp key（未落盘的新会话）进程意外死亡：
+            // 1) 先尝试迁移——若 omp 死前其实已把 .jsonl 落盘，迁移到真实 path 后
+            //    由用户下次发消息懒 acquire(-r resume)，上下文完整保留；
+            // 2) 迁移成功则此处不再盲目 respawn（否则会对 tempKey 全新 spawn 出一个
+            //    孤儿 .jsonl，实证 session 01a0346c：切死 01a03457 后误开新会话）；
+            // 3) 迁移失败（确实没落盘）→ 上下文已随进程丢失，仍重新拉起让用户能继续，
+            //    但明确提示"上下文不可恢复"，不再静默换壳。
+            if (sessionPath.startsWith('__new_')) {
+              void refreshSessions()
                 .then(() => {
-                  useApp.getState().pushToast(`会话进程已自动恢复`, 'info');
-                  // 如果恢复的是当前显示会话，清除退出遮罩
-                  if (sessionPath === useApp.getState().currentSessionPath) {
-                    useApp.getState().setOmpExited(null);
-                  }
+                  migrateTempSession(sessionPath);
+                  return useApp.getState();
                 })
-                .catch(() => {
-                  // 恢复失败不弹错，用户可手动切换触发重试
+                .then((st2) => {
+                  if (!st2.procStateMap[sessionPath]) return; // 已迁移，走真实 path 懒恢复
+                  useApp.getState().pushToast('⚠️ 新会话尚未保存到磁盘，进程重启后本轮对话上下文无法恢复', 'warning');
+                  return rpc.acquire(sessionPath, cwd, approvalMode).catch(() => undefined);
                 });
+              return;
             }
+            void rpc.acquire(sessionPath, cwd, approvalMode)
+              .then(() => {
+                useApp.getState().pushToast(`会话进程已自动恢复`, 'info');
+                // 如果恢复的是当前显示会话，清除退出遮罩
+                if (sessionPath === useApp.getState().currentSessionPath) {
+                  useApp.getState().setOmpExited(null);
+                }
+              })
+              .catch(() => {
+                // 恢复失败不弹错，用户可手动切换触发重试
+              });
           }, 2000);
         }
       }
@@ -325,6 +412,12 @@ export default function App(): React.ReactElement {
     if (workspacesLoaded) {
       // issue 85: notifyReady 不再传 initialCwd（主进程 handler 为 no-op，pool 按需 lazy acquire）
       void window.omp.notifyReady();
+      // 启动即拉取磁盘技能清单：侧栏"技能"卡片计数与技能页同源。
+      // 此前卡片在 skills 未加载时回退到 slashCommands（omp 运行时挂载命令，含内置/插件技能），
+      // 导致卡片显示 13、点进技能页磁盘扫描只有 8 的不一致（issue 用户实测）。
+      void window.omp.skillsList()
+        .then((list) => useApp.getState().setSkills(list))
+        .catch(() => undefined); // 主进程不可用等静默，SkillsPanel 挂载时会再刷
     }
   }, [workspacesLoaded]);
 
@@ -454,7 +547,52 @@ export default function App(): React.ReactElement {
       });
   }, []);
 
+  // ---- 流式看门狗：检测"生成中但长时间无任何帧"的疑似卡死会话 ----
+  // 背景（实证 session 01a02a7c）：omp 工具执行无超时，eval 挂死 9h38m 期间不发任何帧，
+  // UI 的 isStreaming 只认 agent_end，于是永远显示"生成中"。这里每 30s 扫描 procStateMap：
+  //   - isStreaming 且距最后帧 >= STUCK_AFTER_MS → 标记 stuckSince + toast 警告（每轮只提示一次）
+  //   - 恢复收帧时 applyAgentEvent 会刷新 lastFrameAt 并清 stuckSince → 自动解除
+  // 阈值取 10 分钟：正常长工具调用（bash/网页抓取）可能合法静默数分钟；只提示不自动中断。
+  useEffect(() => {
+    const STUCK_AFTER_MS = 10 * 60 * 1000;
+    const timer = window.setInterval(() => {
+      const st = useApp.getState();
+      const now = Date.now();
+      for (const [path, ps] of Object.entries(st.procStateMap)) {
+        if (!ps.isStreaming || !ps.lastFrameAt) continue;
+        const silentMs = now - ps.lastFrameAt;
+        if (silentMs >= STUCK_AFTER_MS && !ps.stuckSince) {
+          st.setProcState(path, { stuckSince: ps.lastFrameAt });
+          const label = path.split(/[\\/]/).pop() ?? path;
+          st.pushToast(
+            `⚠️ 会话 ${label} 已 ${Math.round(silentMs / 60000)} 分钟无任何响应，疑似卡死（工具可能挂死）。可点输入框停止按钮强制中断。`,
+            'warning',
+          );
+        }
+      }
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  /** 新建会话防重入：StrictMode/双击/重复点击会让 acquireNew 并发拉起两个 omp 进程、
+   *  产生两个 temp key——其中一个永远等不到消息、无法落盘迁移，成为孤儿占位
+   *  （实证 2026-08-24 23:15:37/:47 双 spawn，后续引发切死进程后误开全新 .jsonl）。 */
+  const creatingSession = useRef(false);
+
   const onNewSession = useCallback(async (cwd?: string) => {
+    if (creatingSession.current) {
+      pushToast('已在新建会话中，请稍候', 'info');
+      return;
+    }
+    creatingSession.current = true;
+    try {
+      await doNewSession(cwd);
+    } finally {
+      creatingSession.current = false;
+    }
+  }, [pushToast]);
+
+  const doNewSession = useCallback(async (cwd?: string) => {
     useApp.getState().setMainView('chat');
     const st = useApp.getState();
     const targetCwd = cwd ?? st.currentWorkspace()?.cwd;
@@ -684,7 +822,10 @@ export default function App(): React.ReactElement {
   }, [pushToast]);
 
   const onOpenSessionDir = useCallback((s: SessionSummary) => {
-    void window.omp.showItemInFolder(s.path)
+    // temp 占位（__new_ 开头）在磁盘上没有真实文件：showItemInFolder 会退化成
+    // openPath(dirname('.')) → "Windows 找不到文件 ."。改为打开其所属工作空间目录。
+    const target = s.path.startsWith('__new_') ? s.cwd : s.path;
+    void window.omp.showItemInFolder(target)
       .catch((e) => pushToast(`打开目录失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
   }, [pushToast]);
 

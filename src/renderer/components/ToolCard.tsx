@@ -25,6 +25,12 @@ function stringify(v: unknown): string {
   return s;
 }
 
+/** 中间截断：保留首尾各 keep 字符，避免长 URL 把工具名挤换行 */
+function truncateMiddle(s: string, keep = 60): string {
+  if (s.length <= keep * 2 + 3) return s;
+  return s.slice(0, keep) + '…' + s.slice(-keep);
+}
+
 /** 针对不同工具做友好摘要 */
 function summaryOf(tool: ToolPart): string {
   const name = tool.toolName.toLowerCase();
@@ -48,7 +54,8 @@ export const ToolCard = React.memo(function ToolCard({ tool }: { tool: ToolPart 
   // 避免中间过程（如 gradle 构建日志）整段铺在主屏上。
   const [open, setOpen] = useState(false);
   const diff = extractDiff(tool.result);
-  const summary = summaryOf(tool);
+  // 头部摘要做中间截断 + CSS 单行省略号兜底，防止长路径/URL 挤压工具名
+  const summary = summaryOf(tool) ? truncateMiddle(summaryOf(tool)) : '';
 
   return (
     <div className="tool-card">
@@ -58,11 +65,7 @@ export const ToolCard = React.memo(function ToolCard({ tool }: { tool: ToolPart 
         <span className={`tool-status ${tool.status}`}>
           {tool.status === 'running' ? '运行中' : tool.status === 'done' ? '完成' : '失败'}
         </span>
-        {summary && (
-          <span style={{ color: 'var(--text-faint)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {summary}
-          </span>
-        )}
+        {summary && <span className="tool-summary">{summary}</span>}
       </div>
       {open && (
         <div className="tool-body">

@@ -14,10 +14,10 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useApp } from '../store';
-import { rpc } from '../rpc-client';
 import { AddModelModal } from './AddModelModal';
 import { modelKey } from '../utils/path-key';
 import { reloadCurrentSession } from '../utils/reload-session';
+import { fetchAvailableModels } from '../utils/available-models';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpModelsConfig } from '../../shared/ipc-channels';
 
@@ -33,6 +33,8 @@ export const SettingsModelConfig: React.FC = () => {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  /** get_available_models 因 omp 目录过大失败、已回退到本地缓存/配置时的提示 */
+  const [fallback, setFallback] = useState<{ reason?: string } | null>(null);
   /** 模型列表搜索（issue 156）：按 provider 名 / 模型名 / id 过滤 */
   const [search, setSearch] = useState('');
 
@@ -44,20 +46,20 @@ export const SettingsModelConfig: React.FC = () => {
     const mySeq = ++refreshSeq.current;
     setLoading(true);
     setError('');
+    setFallback(null);
     const sp = useApp.getState().currentSessionPath ?? '';
     void Promise.allSettled([
-      rpc.getAvailableModels(sp).then((r) => {
-        if (r.success && r.data) return r.data.models ?? [];
-        return [] as ModelInfo[];
-      }),
+      fetchAvailableModels(sp),
       window.omp.readModelsConfig(),
     ]).then(([modelsRes, ymlRes]) => {
       // 不是最新请求：丢弃结果，避免覆盖新数据
       if (mySeq !== refreshSeq.current) return;
-      const modelsList = modelsRes.status === 'fulfilled' ? (modelsRes.value as ModelInfo[]) : [];
+      const res = modelsRes.status === 'fulfilled' ? (modelsRes.value as { models: ModelInfo[]; fallback: boolean; reason?: string } | null) : null;
+      const modelsList = res?.models ?? [];
       const yml = ymlRes.status === 'fulfilled' ? (ymlRes.value as OmpModelsConfig) : { providers: {} };
       setModels(modelsList);
       setYmlConfig(yml);
+      setFallback(res?.fallback ? { reason: res.reason } : null);
       setLoading(false);
     }).catch(() => {
       if (mySeq === refreshSeq.current) setLoading(false);
@@ -207,6 +209,12 @@ export const SettingsModelConfig: React.FC = () => {
 
       {error && <div className="model-config-error">{error}</div>}
       {busy && <div className="model-config-busy">{busy}</div>}
+      {fallback && (
+        <div className="model-config-fallback" title={fallback.reason}>
+          模型列表为本地缓存/配置回退（omp 的 get_available_models 因目录过大超出传输上限失败），部分模型可能缺失。
+          建议在「添加模型」时用「手动模型 ID」而非自动发现，避免目录过大。
+        </div>
+      )}
       {loading && <div className="settings-placeholder">加载中…</div>}
 
       {!loading && Object.keys(filteredGroups).length === 0 && search && (
