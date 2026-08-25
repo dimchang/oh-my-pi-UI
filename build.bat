@@ -46,7 +46,9 @@ if errorlevel 1 (
 echo.
 echo ============================================
 echo  DONE. Output:
-for /f "delims=" %%v in ('node -p "require(\'./package.json\').version"') do set APPVER=%%v
+node -p "require('./package.json').version" > "%TEMP%\omp_ver.txt"
+set /p APPVER=<"%TEMP%\omp_ver.txt"
+del /q "%TEMP%\omp_ver.txt"
 echo  release\OMP Codex-%APPVER%-portable.exe
 echo ============================================
 pause

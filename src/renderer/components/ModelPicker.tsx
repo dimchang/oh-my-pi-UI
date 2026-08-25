@@ -26,7 +26,7 @@ export const ModelPicker: React.FC = () => {
   const cancelledRef = useRef(false);
   useEffect(() => { cancelledRef.current = false; return () => { cancelledRef.current = true; }; }, []);
 
-  const fetchModels = React.useCallback((showLoading = false) => {
+  const fetchModels = React.useCallback((showLoading = false, cacheOnly = false) => {
     const sp = useApp.getState().currentSessionPath;
     if (!sp) {
       if (showLoading) setFetchError(true);
@@ -51,7 +51,7 @@ export const ModelPicker: React.FC = () => {
         setFetchError(true);
         return;
       }
-      void fetchAvailableModels(sp).then((res) => {
+      void fetchAvailableModels(sp, { cacheOnly }).then((res) => {
         clearTimeout(timer);
         if (cancelledRef.current) return;
         setLoading(false);
@@ -68,9 +68,12 @@ export const ModelPicker: React.FC = () => {
     });
   }, []);
 
-  // 首次 ready 预热一次（让首次打开下拉不白屏）
+  // 首次 ready 预热一次（让首次打开下拉不白屏）。
+  // 只走本地缓存 + models.yml（cacheOnly），不打 get_available_models RPC——
+  // omp 目录过大时该调用必超 transport limit，启动时纯属浪费（还会触发主进程回退链）。
+  // 实时列表在用户点开下拉时再刷新。
   useEffect(() => {
-    if (ready) fetchModels();
+    if (ready) fetchModels(false, true);
   }, [ready, fetchModels]);
 
   useEffect(() => {

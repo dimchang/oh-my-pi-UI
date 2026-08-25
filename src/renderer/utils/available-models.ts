@@ -97,8 +97,26 @@ function persistCache(models: ModelInfo[]): void {
 /**
  * 获取可用模型列表。永不直接抛错——失败时回退到缓存 + 本地配置。
  * @param sp 会话路径（路由到对应 omp 进程）
+ * @param opts.cacheOnly 启动预热用：只读落盘缓存 + 本地 models.yml，不打 omp RPC、
+ *        不做 provider 网络直拉——避免每次启动都触发 get_available_models
+ *        （目录过大时必超 transport limit，纯浪费）。
  */
-export async function fetchAvailableModels(sp: string): Promise<AvailableModelsResult> {
+export async function fetchAvailableModels(
+  sp: string,
+  opts?: { cacheOnly?: boolean },
+): Promise<AvailableModelsResult> {
+  if (opts?.cacheOnly) {
+    const cached = await ensureDiskCache();
+    let ymlModels: ModelInfo[] = [];
+    try {
+      const yml: OmpModelsConfig = await window.omp.readModelsConfig();
+      ymlModels = modelsFromYml(yml);
+    } catch {
+      /* 忽略：本地配置读取失败不致命 */
+    }
+    const merged = mergeDedup(cached ?? [], ymlModels);
+    return { models: merged, fallback: merged.length === 0 };
+  }
   try {
     const r = await rpc.getAvailableModels(sp);
     if (r.success && (r.data as AvailableModelsData | undefined)?.models) {

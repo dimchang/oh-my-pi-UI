@@ -19,7 +19,12 @@ import type {
 import type { WorkspacesFile, ApprovalMode } from '../shared/ipc-channels';
 
 async function send<T>(sessionPath: string, cmd: RpcCommand): Promise<RpcResponse<T>> {
-  const resp = (await window.omp.send<T>(sessionPath, cmd)) as RpcResponse<T>;
+  // 主进程把 RPC 层错误（omp 错误帧 / not online 等）包成 { __rpcError } 信封返回，
+  // 避免 Electron 对 ipcMain.handle 的 rejection 打堆栈日志；这里拆包还原为 throw。
+  const resp = (await window.omp.send<T>(sessionPath, cmd)) as RpcResponse<T> & { __rpcError?: string };
+  if (resp && typeof resp === 'object' && typeof resp.__rpcError === 'string') {
+    throw new Error(resp.__rpcError);
+  }
   return resp;
 }
 

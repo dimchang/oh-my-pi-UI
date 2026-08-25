@@ -204,6 +204,15 @@ function looksLikeFileContent(text: string): boolean {
 }
 
 const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage }) {
+  const [copied, setCopied] = useState(false);
+  // 复制用户提示词：拼接全部 text part（思考/工具卡/附件不参与）
+  const copyUserText = () => {
+    const text = msg.parts.filter((p) => p.kind === 'text').map((p) => p.text).join('\n\n');
+    void window.omp.copyText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }).catch(() => undefined);
+  };
   return (
       <div
         className={`message ${msg.role}${msg.steered ? ' steered' : ''}${msg.queued ? ' queued' : ''}`}
@@ -256,6 +265,16 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
             <MsgAttachmentChip key={a.path} att={a} />
           ))}
         </div>
+      )}
+      {msg.role === 'user' && (
+        <button
+          type="button"
+          className={`msg-copy${copied ? ' copied' : ''}`}
+          title={copied ? '已复制' : '复制提示词'}
+          onClick={copyUserText}
+        >
+          <Icon name="copy" size={13} />
+        </button>
       )}
       {msg.usage?.totalTokens !== undefined && (
         <div className="msg-usage">

@@ -29,7 +29,8 @@ export type IconName =
   // 关闭 / 移除（附件芯片上的 ×）
   | 'close'
   // 时钟（生效时机提示）
-  | 'clock';
+  | 'clock'
+  | 'copy';
 
 const PATHS: Record<IconName, React.ReactNode> = {
   folder: <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />,
@@ -163,6 +164,12 @@ const PATHS: Record<IconName, React.ReactNode> = {
     <>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 6v6l4 2" />
+    </>
+  ),
+  copy: (
+    <>
+      <rect width="13" height="13" x="9" y="9" rx="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
     </>
   ),
 };

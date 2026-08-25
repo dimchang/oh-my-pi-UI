@@ -344,7 +344,14 @@ function registerIpc(): void {
       }
       return { type: 'response', command: 'extension_ui_response', success: true };
     }
-    return pool.send(sessionPath, cmd);
+    // RPC 层错误（omp 错误帧如 transport limit、not online 等）以信封返回，
+    // 避免 Electron 对 ipcMain.handle 的 rejection 打整段堆栈日志刷屏；
+    // 渲染层 rpc-client.send() 拆出 __rpcError 后照常 throw，调用方语义不变。
+    try {
+      return await pool.send(sessionPath, cmd);
+    } catch (e) {
+      return { __rpcError: e instanceof Error ? e.message : String(e) };
+    }
   });
 
   ipcMain.handle(IPC.OmpAcquire, async (_e, sessionPath: string, cwd: string, approvalMode?: ApprovalMode) => {

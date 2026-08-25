@@ -121,6 +121,7 @@
     --accent-main-100: 211 100% 72%;
     --accent-main-200: 211 100% 80%;
     --accent-secondary-100: 187 80% 60%;
+    --user-msg-color: 221 80% 68%;   /* 深色下提亮，保证气泡文字对比度 */
 
     --success-100: 142 60% 55%;
     --success-200: 142 50% 45%;
@@ -179,6 +180,7 @@
   --accent-main-100: 211 100% 72%;
   --accent-main-200: 211 100% 80%;
   --accent-secondary-100: 187 80% 60%;
+  --user-msg-color: 221 80% 68%;   /* 深色下提亮，保证气泡文字对比度 */
 
   --success-100: 142 60% 55%;
   --success-200: 142 50% 45%;
@@ -802,12 +804,38 @@ body {
   gap: 6px;
 }
 .msg-role.user { color: hsl(var(--user-msg-color)); }
-/* 用户消息：靠右对齐 + 深蓝高亮；与系统回复同字号 */
+/* 用户消息：靠右圆角气泡。气泡收缩到内容宽、上限 85%（左侧留空隙以显靠右）；
+   气泡内文字左对齐，长文不再参差。颜色全部由 --user-msg-color 主题变量派生，深浅主题自适应。 */
 .message.user { text-align: right; }
 .message.user .msg-role { justify-content: flex-end; }
-.message.user .msg-body { text-align: right; color: hsl(var(--user-msg-color)); }
-.message.user .msg-body pre,
-.message.user .msg-body :not(pre) > code { text-align: left; }
+.message.user .msg-body:not(:empty) {
+  display: inline-block;
+  max-width: 85%;
+  padding: 10px 14px;
+  border: 1px solid hsl(var(--user-msg-color) / 0.25);
+  border-radius: var(--radius-lg);
+  background: hsl(var(--user-msg-color) / 0.08);
+  text-align: left;
+  color: hsl(var(--user-msg-color));
+}
+.message.user .msg-body > :last-child { margin-bottom: 0; }
+.message.user .msg-attachments { justify-content: flex-end; }
+/* 用户消息下的复制按钮：默认淡色，悬停提亮，复制成功短暂变绿 */
+.msg-copy {
+  display: flex;
+  width: fit-content;
+  margin-left: auto;
+  align-items: center;
+  margin-top: 4px;
+  padding: 3px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: hsl(var(--text-400));
+  cursor: pointer;
+}
+.msg-copy:hover { color: hsl(var(--accent-main-000)); background: hsl(var(--bg-300) / 0.6); }
+.msg-copy.copied { color: hsl(var(--success-100)); }
 .msg-body { line-height: 1.65; font-size: calc(var(--msg-font-size) - 2px); color: var(--text); overflow-wrap: break-word; word-break: break-word; min-width: 0; }
 .msg-body p { margin: 0 0 10px; }
 /* 正文里的 markdown 标题：压到接近正文大小，避免浏览器默认 h1/h2 爆大加粗 */
