@@ -61,3 +61,6 @@ minimap-density-scrollbar.md
 .qoder/
 
 *.bat
+
+# large local binary, machine-specific, never commit
+resources/omp.exe

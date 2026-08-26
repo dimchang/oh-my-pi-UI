@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ec4899"/>
+      <stop offset="0.5" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="262" y1="196" x2="762" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="#0a0a0f"/>
+  <!-- 装饰细线：横梁上方的平行短线 -->
+  <path d="M 262 196 H 762" fill="none" stroke="url(#g2)" stroke-width="18" stroke-linecap="round"/>
+  <!-- π 字形：渐变描边，圆头线帽 -->
+  <path d="M 204 356 H 820
+           M 372 356 V 788
+           M 652 356 Q 686 572 654 788"
+        fill="none" stroke="url(#g)" stroke-width="74" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

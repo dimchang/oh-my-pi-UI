@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="gA" gradientUnits="userSpaceOnUse" x1="180" y1="260" x2="850" y2="800">
+      <stop offset="0" stop-color="#f472b6"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="gB" gradientUnits="userSpaceOnUse" x1="180" y1="260" x2="850" y2="800">
+      <stop offset="0" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14141e"/>
+      <stop offset="1" stop-color="#0b0b12"/>
+    </linearGradient>
+    <clipPath id="cA"><polygon points="0,0 1024,0 0,1024"/></clipPath>
+    <clipPath id="cB"><polygon points="1024,0 1024,1024 0,1024"/></clipPath>
+    <g id="pi">
+      <path d="M 218 318 H 806"/>
+      <path d="M 372 330 V 776"/>
+      <path d="M 652 330 V 776"/>
+    </g>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#0a0a0f"/>
+  <g clip-path="url(#cA)" stroke="url(#gA)" stroke-width="118" stroke-linecap="round" fill="none">
+    <use href="#pi"/>
+  </g>
+  <g clip-path="url(#cB)" stroke="url(#gB)" stroke-width="118" stroke-linecap="round" fill="none">
+    <use href="#pi"/>
+  </g>
+</svg>

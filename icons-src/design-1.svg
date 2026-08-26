@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="piGrad" gradientUnits="userSpaceOnUse" x1="180" y1="260" x2="850" y2="800">
+      <stop offset="0" stop-color="#f472b6"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#a78bfa" stop-opacity="0.22"/>
+      <stop offset="0.45" stop-color="#7c5cf0" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14141e"/>
+      <stop offset="1" stop-color="#0b0b12"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 近黑背景 -->
+  <rect width="1024" height="1024" fill="#0a0a0f"/>
+  <!-- 极轻微圆角方形底板感 -->
+  <rect x="44" y="44" width="936" height="936" rx="212" fill="url(#plate)"/>
+
+  <!-- 克制的径向光晕 -->
+  <circle cx="512" cy="470" r="470" fill="url(#glow)"/>
+
+  <!-- 粗壮几何 π，小圆角端点 -->
+  <g stroke="url(#piGrad)" stroke-width="118" stroke-linecap="round" fill="none">
+    <path d="M 218 318 H 806"/>
+    <path d="M 372 330 V 776"/>
+    <path d="M 652 330 V 776"/>
+  </g>
+</svg>

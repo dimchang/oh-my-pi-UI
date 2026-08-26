@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="frontGrad" gradientUnits="userSpaceOnUse" x1="200" y1="268" x2="824" y2="788">
+      <stop offset="0" stop-color="#ec4899"/>
+      <stop offset="0.5" stop-color="#d946ef"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="backGrad" gradientUnits="userSpaceOnUse" x1="144" y1="212" x2="768" y2="732">
+      <stop offset="0" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <g id="pi">
+      <rect x="200" y="268" width="624" height="112"/>
+      <rect x="258" y="268" width="122" height="520"/>
+      <rect x="644" y="268" width="122" height="520"/>
+    </g>
+  </defs>
+
+  <!-- background -->
+  <rect width="1024" height="1024" fill="#0a0a0f"/>
+
+  <!-- back layer: same pi, shifted up-left, translucent blue-violet, soft blur -->
+  <use xlink:href="#pi" href="#pi" fill="url(#backGrad)" opacity="0.45" filter="url(#soft)" transform="translate(-56,-56)"/>
+
+  <!-- front layer: solid pink->purple->blue pi -->
+  <use xlink:href="#pi" href="#pi" fill="url(#frontGrad)"/>
+</svg>

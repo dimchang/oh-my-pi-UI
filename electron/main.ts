@@ -415,26 +415,42 @@ function registerIpc(): void {
     if (res) throw new Error(res); // openPath 返回非空字符串 = 失败原因
   });
   ipcMain.handle(IPC.OpenInBrowser, async (_e, browser: 'chrome' | 'edge', url: string) => {
-    // 只允许 http/https，避免借 IPC 打开任意资源。
+    // 只允许 http/https，避免借 IPC 打开任意资源；再过一道 URL 解析，拒收畸形串。
     if (!/^https?:\/\//i.test(url)) throw new Error('仅允许打开 http/https 链接');
-    let child: ReturnType<typeof spawn> | null = null;
-    try {
-      if (process.platform === 'win32') {
-        // start 是 cmd 内建命令；空标题参数 "" 占位，避免路径含空格被误判为标题。
-        const exe = browser === 'edge' ? 'msedge' : 'chrome';
-        child = spawn('cmd', ['/c', 'start', '', exe, url], { detached: true, stdio: 'ignore' });
-      } else if (process.platform === 'darwin') {
-        const app = browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome';
-        child = spawn('open', ['-a', app, url], { detached: true, stdio: 'ignore' });
-      } else {
-        const cmd = browser === 'edge' ? 'microsoft-edge' : 'google-chrome';
-        child = spawn(cmd, [url], { detached: true, stdio: 'ignore' });
-      }
+    try { new URL(url); } catch { throw new Error('无效的 URL'); }
+
+    const launch = (exe: string, args: string[]) => {
+      const child = spawn(exe, args, { detached: true, stdio: 'ignore' });
+      child.on('error', () => { /* 异步启动失败：下方已由 openExternal 兜底或目标平台命令缺失 */ });
       child.unref();
-    } catch {
-      // 找不到该浏览器（命令不存在）时回退系统默认浏览器。
-      await shell.openExternal(url);
+    };
+
+    if (process.platform === 'win32') {
+      // 不经 cmd /c start 中转：cmd 会把 URL 所在命令行二次解释（& | 等元字符可被注入）。
+      // 改为解析浏览器 exe 绝对路径后直接 spawn——url 作为单个 argv 原样传递，注入面归零。
+      const exeDirs = browser === 'edge'
+        ? ['Microsoft', 'Edge', 'Application']
+        : ['Google', 'Chrome', 'Application'];
+      const exeName = browser === 'edge' ? 'msedge.exe' : 'chrome.exe';
+      const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA];
+      for (const root of roots) {
+        if (!root) continue;
+        const exe = path.join(root, ...exeDirs, exeName);
+        try { await fs.promises.access(exe); } catch { continue; } // 该安装位不存在，试下一个
+        launch(exe, [url]);
+        return;
+      }
+    } else if (process.platform === 'darwin') {
+      const app = browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome';
+      launch('open', ['-a', app, url]);
+      return;
+    } else {
+      const cmd = browser === 'edge' ? 'microsoft-edge' : 'google-chrome';
+      launch(cmd, [url]);
+      return;
     }
+    // Windows 下所有标准安装位都没找到该浏览器时回退系统默认浏览器。
+    await shell.openExternal(url);
   });
   ipcMain.handle(IPC.ClipboardWriteText, async (_e, text: string) => { clipboard.writeText(String(text ?? '')); });
   ipcMain.handle(IPC.ShowItemInFolder, async (_e, fullPath: string) => {
@@ -626,6 +642,8 @@ function registerIpc(): void {
   // ---- 上下文文件读写（AGENTS.md / SYSTEM.md / APPEND_SYSTEM.md / RULES.md）----
   ipcMain.handle(IPC.ContextFileRead, async (_e, filePath: string) => {
     if (typeof filePath !== 'string' || !filePath) return '';
+    // 白名单：仅允许全局 agent 目录与已注册工作空间内的路径，防渲染进程读取任意文件。
+    if (!(await isWithinContextAllowlist(filePath))) return ''; // 与"文件不存在返回空串"同契约
     try {
       return await fs.promises.readFile(filePath, 'utf8');
     } catch {
@@ -634,6 +652,8 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.ContextFileWrite, async (_e, filePath: string, content: string) => {
     if (typeof filePath !== 'string' || !filePath) throw new Error('无效路径');
+    // 白名单：删除（空内容）与写入同样受限，防渲染进程删/写任意文件。
+    if (!(await isWithinContextAllowlist(filePath))) throw new Error('路径不在允许的目录内（仅限 agent 配置目录与已注册工作空间）');
     // 空内容 = 删除文件（清理不需要的上下文）
     if (!content || !content.trim()) {
       try { await fs.promises.unlink(filePath); } catch { /* 不存在也无妨 */ }
@@ -842,6 +862,21 @@ async function listDir(dirPath: string): Promise<FileEntry[]> {
 }
 
 // ---- 钩子（Hooks）静态解析 + 参数解析 ----
+
+/** ContextFileRead/Write 白名单：仅允许全局 agent 配置目录（getAgentDir，如 ~/.omp/agent）
+ *  与已注册工作空间之内的路径。两边都 realpath + 小写归一化，防符号链接逃逸
+ *  （模式与 ReadImageAsDataUrl 一致）。文件尚不存在时 realpath 失败，回退 resolve 后比较。 */
+async function isWithinContextAllowlist(filePath: string): Promise<boolean> {
+  let target: string;
+  try { target = (await fs.promises.realpath(filePath)).toLowerCase(); }
+  catch { target = path.resolve(filePath).toLowerCase(); }
+  let agentBase: string;
+  try { agentBase = (await fs.promises.realpath(getAgentDir())).toLowerCase(); }
+  catch { agentBase = path.resolve(getAgentDir()).toLowerCase(); }
+  if (target === agentBase || target.startsWith(agentBase + path.sep)) return true;
+  return isWithinWorkspaces(filePath);
+}
+
 
 /** 判断 dirPath 是否位于已注册 workspace（workspaces.json 中的 cwd）目录之内。
  *  比较前把两边 realpath + 小写归一化，容忍大小写不敏感文件系统（如 Windows）。 */

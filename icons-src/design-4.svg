@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ec4899"/>
+      <stop offset="50%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="55%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#ec4899"/>
+    </linearGradient>
+    <mask id="front">
+      <!-- 白 = 可见；黑矩形遮住轨道与 π 重叠的中央带，使 π 前段浮于轨道之上 -->
+      <rect width="1024" height="1024" fill="#fff"/>
+      <rect x="120" y="330" width="784" height="364" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#0a0a0f"/>
+
+  <!-- 轨道环（后段）：倾斜椭圆，中央被 mask 遮住，形成从 π 后面穿过 -->
+  <g mask="url(#front)">
+    <ellipse cx="512" cy="512" rx="430" ry="150"
+             fill="none" stroke="url(#g2)" stroke-width="26"
+             transform="rotate(-20 512 512)"/>
+    <!-- 卫星圆点：位于轨道右上段 -->
+    <circle cx="806" cy="298" r="34" fill="#22d3ee"/>
+    <circle cx="806" cy="298" r="14" fill="#ffffff"/>
+  </g>
+
+  <!-- 实心渐变 π：粗壮几何字形 -->
+  <g fill="url(#g)">
+    <path d="M212 300 h600 a30 30 0 0 1 30 30 v70 a30 30 0 0 1 -30 30 H742 V724 a30 30 0 0 1 -30 30 h-90 a30 30 0 0 1 -30 -30 V430 H432 V724 a30 30 0 0 1 -30 30 h-90 a30 30 0 0 1 -30 -30 V430 H212 a30 30 0 0 1 -30 -30 v-70 a30 30 0 0 1 30 -30 z"/>
+  </g>
+</svg>
