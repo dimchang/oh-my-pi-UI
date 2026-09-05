@@ -426,6 +426,8 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === 't') {
+        // 模型不支持 thinking（get_state 无 thinking 信息）时不拦截、不循环切换
+        if (!useApp.getState().model?.thinking) return;
         e.preventDefault();
         const sp = useApp.getState().currentSessionPath;
         if (sp) void rpc.cycleThinkingLevel(sp).catch(() => undefined);

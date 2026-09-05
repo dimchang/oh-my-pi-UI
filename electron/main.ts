@@ -771,9 +771,6 @@ app.whenReady().then(() => {
   }
   ompVersion = resolveOmpVersion(ompPath);
 
-  // 启动时确保 vision 模式为 on（默认 auto 不会对已配置视觉模型的 provider 强制启用 inspect_image）
-  try { execSync(`"${ompPath}" config set inspect_image.mode on`, { encoding: 'utf8', timeout: 5000 }); } catch { /* best-effort */ }
-
   // 初始化进程池
   pool = new OmpProcessPool(ompPath, {
     onFrame: (sessionPath, frame) => {

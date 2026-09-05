@@ -64,3 +64,6 @@ minimap-density-scrollbar.md
 
 # large local binary, machine-specific, never commit
 resources/omp.exe
+
+# scratch fix notes, not project source
+gemini-balancer-fix.txt

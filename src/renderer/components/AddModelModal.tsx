@@ -49,7 +49,7 @@ const PRESET_GROUPS: { label: string; cat: ProviderPreset['cat']; items: Provide
       { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', api: 'openai-completions', authUrl: 'https://platform.deepseek.com/api_keys', hint: 'sk-...', cat: 'popular' },
       { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', api: 'openai-responses', authUrl: 'https://platform.openai.com/api-keys', hint: 'sk-...', cat: 'popular' },
       { id: 'anthropic', name: 'Anthropic (Claude)', baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages', authUrl: 'https://console.anthropic.com/settings/keys', hint: 'sk-ant-...', cat: 'popular' },
-      { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', api: 'openrouter', authUrl: 'https://openrouter.ai/keys', hint: 'sk-or-...', cat: 'popular' },
+      { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', api: 'openai-completions', authUrl: 'https://openrouter.ai/keys', hint: 'sk-or-...', cat: 'popular' },
       { id: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', api: 'openai-completions', authUrl: 'https://console.groq.com/keys', hint: 'gsk_...', cat: 'popular' },
       { id: 'xai', name: 'xAI (Grok)', baseUrl: 'https://api.x.ai/v1', api: 'openai-completions', authUrl: 'https://console.x.ai/', hint: 'xai-...', cat: 'popular' },
       { id: 'moonshot', name: 'Moonshot / Kimi', baseUrl: 'https://api.moonshot.ai/v1', api: 'openai-completions', authUrl: 'https://platform.moonshot.ai/console/api-keys', hint: 'sk-...', cat: 'popular' },
@@ -190,7 +190,10 @@ export const AddModelModal: React.FC<Props> = ({
     setPid(editingProviderId);
     setName(cfg.name ?? fallbackName);
     setBaseUrl(cfg.baseUrl ?? fallbackBaseUrl);
-    setApi(cfg.api ?? fallbackApi);
+    // omp 18 schema 校验：api 枚举里没有 'openrouter'，坏值会让整个 models.yml 的
+    // 自定义 provider 全部禁用（set_model 一律 Model not found）。存量坏值归一化。
+    const LEGACY_API: Record<string, string> = { openrouter: 'openai-completions' };
+    setApi(LEGACY_API[cfg.api ?? ''] ?? cfg.api ?? fallbackApi);
     setApiKey(''); // 安全：永远不预填明文 key（让用户主动输入新值覆盖或留空保留）
     setManualIds((cfg.models ?? []).map((m) => m.id).join(', '));
     setShowKey(false);
@@ -621,7 +624,6 @@ export const AddModelModal: React.FC<Props> = ({
                     <option value="openai-completions">OpenAI 兼容 (openai-completions)</option>
                     <option value="openai-responses">OpenAI Responses API (openai-responses)</option>
                     <option value="anthropic-messages">Anthropic Claude (anthropic-messages)</option>
-                    <option value="openrouter">OpenRouter (openrouter)</option>
                     <option value="google-generative-ai">Google Gemini (google-generative-ai)</option>
                     <option value="ollama-chat">Ollama (ollama-chat)</option>
                     <option value="azure-openai-responses">Azure OpenAI (azure-openai-responses)</option>

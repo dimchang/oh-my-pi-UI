@@ -28,8 +28,11 @@ export const ThinkingPicker: React.FC = () => {
   }, []);
 
   // 当前模型实际支持的 thinking 档位（实测 model.thinking.efforts）。
-  // 无此信息时不过滤（显示全部），有则只显示支持的，避免切到不支持档位被 clamp。
-  const supported = model?.thinking?.efforts;
+  // 模型无 thinking 信息（未加载或不支持，如未声明 thinking 的自定义模型）时整个隐藏，
+  // 避免显示假的默认档位（曾有 hardcoded '中' 兜底误导用户）。
+  const thinkingInfo = model?.thinking;
+  if (!thinkingInfo) return null;
+  const supported = thinkingInfo.efforts;
   const isSupported = (v: ThinkingLevel) => !supported || supported.includes(v);
 
   const pick = (l: ThinkingLevel) => {
@@ -62,7 +65,7 @@ export const ThinkingPicker: React.FC = () => {
   return (
     <div className="thinking-picker" ref={ref}>
       <button className="btn" onClick={() => setOpen((o) => !o)} title="思考等级（Ctrl+T 循环切换）">
-        {current?.label ?? level ?? '中'} ▾
+        {current?.label ?? level ?? '思考'} ▾
       </button>
       {open && (
         <div className="thinking-menu">

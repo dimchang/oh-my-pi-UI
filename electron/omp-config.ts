@@ -119,6 +119,13 @@ export async function writeProvider(id: string, cfg: OmpProviderConfig): Promise
   if (!(doc.contents instanceof YAMLMap) && doc.contents != null) {
     throw new ModelsConfigError('abort-write', 'models.yml 顶层不是 map，为避免破坏原文件已中止写入');
   }
+  // 编辑语义（issue 156）：渲染层编辑模式故意把 apiKey 留空表示「保留原值」。
+  // 整子树 setIn 替换时不回填，会把原有 apiKey 抹掉 → discovery/请求 401 → 该 provider 模型全部「消失」。
+  if (clean.apiKey === undefined && cfg.auth !== 'none') {
+    // yaml 的 getIn 默认对标量直接返回 JS 值（keepScalar=false），无需取 .value
+    const prev = doc.getIn(['providers', id, 'apiKey']);
+    if (typeof prev === 'string' && prev) clean.apiKey = prev;
+  }
   doc.setIn(['providers', id], doc.createNode(clean));
   await writeDoc(file, doc);
 }

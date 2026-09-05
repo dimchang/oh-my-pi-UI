@@ -117,39 +117,51 @@ export async function fetchAvailableModels(
     const merged = mergeDedup(cached ?? [], ymlModels);
     return { models: merged, fallback: merged.length === 0 };
   }
+
+  // 1) 先走 omp 实时 RPC；失败不致命（下面回退链兜底）
+  let rpcModels: ModelInfo[] = [];
+  let rpcOk = false;
+  let reason: string | undefined;
   try {
     const r = await rpc.getAvailableModels(sp);
     if (r.success && (r.data as AvailableModelsData | undefined)?.models) {
-      const models = (r.data as AvailableModelsData).models ?? [];
-      persistCache(models);
-      return { models, fallback: false };
+      rpcModels = (r.data as AvailableModelsData).models ?? [];
+      rpcOk = true;
+    } else {
+      throw new Error((r as { error?: string }).error ?? 'get_available_models 返回失败');
     }
-    throw new Error((r as { error?: string }).error ?? 'get_available_models 返回失败');
   } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    const cached = await ensureDiskCache();
-    let ymlModels: ModelInfo[] = [];
+    reason = e instanceof Error ? e.message : String(e);
+  }
+
+  // 2) 本地 models.yml 的显式 models 永远并入：omp 的目录可能不含自定义 provider
+  //    （issue：omp RPC 成功但目录里没有任何自定义 provider 的模型，UI 全部显示 0/0）
+  let ymlModels: ModelInfo[] = [];
+  let declared: string[] = [];
+  try {
+    const yml: OmpModelsConfig = await window.omp.readModelsConfig();
+    ymlModels = modelsFromYml(yml);
+    declared = Object.keys(yml.providers ?? {});
+  } catch {
+    /* 忽略：本地配置读取失败不致命 */
+  }
+
+  // 3) yml 里声明了、但当前结果里没有模型的 provider → 按其 discovery 配置直拉 /models 补齐
+  //    （RPC 失败时 rpcModels 为空 → 所有声明过的 provider 都会尝试直拉，与原回退行为一致）
+  let discoveredModels: ModelInfo[] = [];
+  const have = new Set(rpcModels.map((m) => m.provider));
+  const missing = declared.filter((pid) => !have.has(pid));
+  if (missing.length > 0 && typeof window.omp.fetchProviderModels === 'function') {
     try {
-      const yml: OmpModelsConfig = await window.omp.readModelsConfig();
-      ymlModels = modelsFromYml(yml);
-    } catch {
-      /* 忽略：本地配置读取失败不致命 */
-    }
-    // 绕过 omp：直接按 models.yml 的 discovery 配置拉各 provider 的模型列表，
-    // 这样「新添加但 omp 目录过大拉不到」的 provider 也能被显示与选择。
-    let discoveredModels: ModelInfo[] = [];
-    try {
-      if (typeof window.omp.fetchProviderModels === 'function') {
-        discoveredModels = await window.omp.fetchProviderModels();
-      }
+      discoveredModels = await window.omp.fetchProviderModels();
     } catch {
       /* 忽略：直拉失败不致命 */
     }
-    const base = cached ?? [];
-    const merged = mergeDedup(base, ymlModels, discoveredModels);
-    // 回退结果也落盘：下次刷新（或重启）直接从缓存取，避免每次都打网络直拉。
-    // 仅在有数据时缓存，空结果不覆盖已有缓存。
-    if (merged.length > 0) persistCache(merged);
-    return { models: merged, fallback: true, reason };
   }
+
+  const base = rpcOk ? rpcModels : (await ensureDiskCache()) ?? [];
+  const merged = mergeDedup(base, ymlModels, discoveredModels);
+  // 有数据才落盘，空结果不覆盖已有缓存
+  if (merged.length > 0) persistCache(merged);
+  return { models: merged, fallback: !rpcOk, reason };
 }
