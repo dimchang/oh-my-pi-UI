@@ -19,7 +19,7 @@ import { listSessions, deleteSession, readSessionMessages, readUserEntries } fro
 import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
 import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
 import { IPC } from '../src/shared/ipc-channels';
-import type { FileEntry, WorkspacesFile, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult } from '../src/shared/ipc-channels';
+import type { FileEntry, WorkspacesFile, WorkspacesLoadResult, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -477,7 +477,18 @@ function registerIpc(): void {
   ipcMain.handle(IPC.RendererReady, async () => { /* no-op: pool 按需 lazy acquire */ });
 
   // ---- 工作空间 ----
-  ipcMain.handle(IPC.WorkspacesGet, async () => await loadWorkspacesFile());
+  ipcMain.handle(IPC.WorkspacesGet, async (): Promise<WorkspacesLoadResult> => {
+    const file = await loadWorkspacesFile();
+    // 只 stat，不写盘、不删条目：外接盘临时离线时由渲染层「标记/提示」而非静默删除。
+    // 幽灵工作区事故修复（2026-09-12）：渲染层无 fs 访问权，cwd 有效性必须由主进程判定。
+    const uniq = [...new Set(file.workspaces.map((w) => w.cwd))]; // 只需任务区（归档不参与 currentId 回退）
+    const staleCwds: string[] = [];
+    await Promise.all(uniq.map(async (cwd) => {
+      try { if (!(await fs.promises.stat(cwd)).isDirectory()) staleCwds.push(cwd); }
+      catch { staleCwds.push(cwd); }
+    }));
+    return { file, staleCwds };
+  });
   ipcMain.handle(IPC.WorkspacesSave, async (_e, file: WorkspacesFile) => {
     if (!sensitiveLimiter.allow('workspaces-save')) throw new Error('操作过于频繁，请稍后再试');
     if (!file || file.version !== 1) throw new Error('invalid workspaces file');

@@ -31,10 +31,50 @@ export interface ToolPart {
   status: 'running' | 'done' | 'error';
   args?: unknown;
   result?: unknown;
+  /** 流式输出文本（omp 的 partialResult.content[] 里 type=text 的累积拼合）。 */
   partial?: string;
+  /** omp 对该次工具调用的一句话意图（tool_execution_start.intent），语言不固定。
+   *  task/hub/bash 都带；回答"在等什么"的直接信号。 */
+  intent?: string;
 }
 
-export interface TextPart { kind: 'text'; text: string; }
+/** 子智能体（omp `task` 工具派生的 agent 作业）在 UI 侧的状态快照。
+ *  数据源：tool_execution_update|task 的 partialResult.details.progress[]（运行中，约 150ms 一帧）、
+ *  async-result 消息的 details.jobs[] + content 内 <task-result> 标签（终态）。
+ *  实测 progress 项有两套字段组合，resolvedModel/contextTokens/contextWindow 可能缺失 → 全部可选。 */
+export interface SubagentJob {
+  id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  agent?: string;
+  agentSource?: string;
+  assignment?: string;
+  /** 派发这批子智能体时的意图（取自所属 tool_execution_start.intent）。 */
+  intent?: string;
+  /** 首次在 UI 见到的时间（omp 的 durationMs 只在终态才有值，运行中恒为 0）。 */
+  startedAt: number;
+  durationMs?: number;
+  resolvedModel?: string;
+  modelRole?: string;
+  toolCount?: number;
+  tokens?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  errorText?: string;
+  /** 由 args.tasks[].name 猜出的占位条目。omp 会给撞名的 job 自动改名（实测 `CrossName-2`），
+   *  故占位 id 未必是真 id —— 真实帧一到就转正，若真 id 是它的 `-N` 变体则淘汰。 */
+  provisional?: boolean;
+}
+
+export interface TextPart {
+  kind: 'text';
+  text: string;
+  /** 过程说明（中间叙述）：该文本块在 content[] 里排在首个 toolCall 之前。
+   *  实测 1554 条 assistant 消息：371 条"文本在工具前"（均为中间叙述）、0 条"文本在工具后"、
+   *  19 条"纯文本无工具"（最终回答）。故以 content[] 源顺序判定，渲染时默认折叠。
+   *  判定必须在解析源顺序时完成 —— mergeContentAndTools 会把全部 text 移到 tool 卡之后，
+   *  渲染顺序已丢失原始位置（详见 ChatView 折叠渲染）。 */
+  narration?: boolean;
+}
 export interface ThinkingPart { kind: 'thinking'; text: string; }
 
 export type MessagePart = TextPart | ThinkingPart | ToolPart;
@@ -160,6 +200,13 @@ interface AppState {
 
   // M4: 增强状态
   todoPhases: TodoPhase[];
+  /** 右栏"子智能体"面板数据：omp `task` 工具派生的后台 agent 作业。
+   *  只收 task 型（不含 bash 型后台 job）；由 tool_execution_update / async-result 累积，
+   *  单调合并（终态不被运行态覆盖）。切会话或新建会话时清空。 */
+  subagents: SubagentJob[];
+  /** subagents 最后一次被 omp 帧刷新的时间（Date.now()）。主 agent 空闲时 omp 不再推子智能体
+   *  进度，面板据此提示数据滞后，避免"运行中"数字被误读。 */
+  subagentsAt: number;
   isCompacting: boolean;
   isRetrying: boolean;
   retryInfo: string;
@@ -167,8 +214,8 @@ interface AppState {
   sessionStats?: { totalTokens?: number; totalCost?: number; messageCount?: number };
   /** 右栏 Diff 面板内容：从 tool_execution_end 结果中提取的 unified diff 列表。 */
   diffs: Array<{ toolName: string; diff: string }>;
-  /** 右栏标签：off|files|diff|todo */
-  rightPanel: 'off' | 'files' | 'todo' | 'diff';
+  /** 右栏标签：off|files|diff|todo|jobs */
+  rightPanel: 'off' | 'files' | 'todo' | 'diff' | 'jobs';
   /** 主工作区视图：chat=对话，skills=技能/插件面板 */
   mainView: 'chat' | 'skills';
   setMainView(v: 'chat' | 'skills'): void;
@@ -254,7 +301,9 @@ interface AppState {
   setOmpCwd(cwd: string | null): void;
   /** 记录用户选的 model（同时写 lastModel，触发持久化） */
   setLastModel(m: { provider: string; id: string; name?: string }): void;
-  /** 新增工作空间（同 cwd 已存在则返回已存在项并切换为 current） */
+  /** 新增/更新工作空间。**不改变当前选中** —— 「发现/更新一个工作区」与「聚焦它」是两件事
+   *  （2026-09-12 幽灵工作区事故：reconcile 自动补全会走到这里，隐式切换会劫持用户的当前焦点）。
+   *  需要聚焦请显式调 setCurrentWorkspaceId（用户主动入口 onAddWorkspace 已补）。 */
   upsertWorkspace(ws: Workspace): void;
   /** 归档：从任务区移到归档区（保留 cwd/displayName） */
   archiveWorkspace(id: string): void;
@@ -327,12 +376,19 @@ function cssId(path: string, mode: string): string {
  *  output_text 与 text 同义，toolCall 由 tool_execution_* 事件单独建卡，此处跳过。
  *  相邻 thinking 合并为一个 part，避免渲染出多个"思考过程"折叠块。 */
 function contentToParts(msg: AgentMessage): MessagePart[] {
+  const content = msg.content ?? [];
+  // 该消息是否含 toolCall：含 ⇒ 其中的文本块全是过程说明（中间叙述），渲染时默认折叠。
+  // 实测本项目全部会话 1554 条 assistant 消息：371 条"文本 + toolCall"（文本恒在 toolCall 之前）、
+  // 0 条"文本在 toolCall 之后"、19 条"纯文本无 toolCall"（=最终回答）。
+  // 判定必须在此处（源内容层）完成：mergeContentAndTools 会把全部 text 移到 tool 卡之后，
+  // 渲染顺序丢失原始位置；历史回放也只走 contentToParts，不经 merge。
+  const hasToolCall = content.some((c) => (c as { type?: string }).type === 'toolCall');
   const parts: MessagePart[] = [];
-  for (const c of msg.content ?? []) {
+  for (const c of content) {
     const cc = c as { type?: string; text?: string; thinking?: string };
     const t = cc.type;
     if (t === 'text' || t === 'output_text') {
-      if (cc.text) parts.push({ kind: 'text', text: cc.text });
+      if (cc.text) parts.push({ kind: 'text', text: cc.text, narration: hasToolCall || undefined });
     } else if (t === 'thinking') {
       if (cc.thinking) {
         const last = parts[parts.length - 1];
@@ -360,6 +416,91 @@ function mergeContentAndTools(contentParts: MessagePart[], toolParts: ToolPart[]
   return [...thinking, ...toolParts, ...text];
 }
 
+
+/** 连接状态三色：红=未连接/已退出，绿=就绪，黄=进行中。
+ *  输入框权限按钮旁的大号状态胶囊与底部状态栏共用同一份判定，避免两处逻辑漂移。 */
+export type ConnTone = 'red' | 'green' | 'yellow';
+
+/** 判定连接状态所需的最小状态切片。 */
+export type ConnSnapshot = Pick<
+  AppState,
+  | 'ready'
+  | 'ompExited'
+  | 'isStreaming'
+  | 'isCompacting'
+  | 'isRetrying'
+  | 'currentSessionPath'
+  | 'procStateMap'
+>;
+
+/** 当前会话绑定的 omp 进程状态（无会话/尚未拉起时为 undefined）。 */
+export function connProc(s: ConnSnapshot): ProcState | undefined {
+  return s.currentSessionPath ? s.procStateMap[s.currentSessionPath] : undefined;
+}
+
+/** omp 退出码：number=已退出（0 也是退出，不可用 truthy 判断）、null=未退出。 */
+export function connExitCode(s: ConnSnapshot): number | null {
+  return typeof s.ompExited === 'number' ? s.ompExited : null;
+}
+
+/** 疑似卡死分钟数，0=正常（stuckSince 由 App 定时扫描写入，任意新帧清除）。 */
+export function connStuckMinutes(s: ConnSnapshot): number {
+  const ps = connProc(s);
+  return s.currentSessionPath && ps?.isStreaming && ps.stuckSince
+    ? Math.max(1, Math.round((Date.now() - ps.stuckSince) / 60000))
+    : 0;
+}
+
+/** 连接状态三色（喂给输入框状态胶囊与状态栏圆点）。 */
+export function connTone(s: ConnSnapshot): ConnTone {
+  const ps = connProc(s);
+  if (!s.currentSessionPath) return 'red';
+  if (connExitCode(s) !== null) return 'red';
+  if (!ps || ps.status === 'offline' || ps.status === 'evicted') return 'red';
+  if (ps.status === 'spawning') return 'yellow';
+  const busy = s.isStreaming || s.isCompacting || s.isRetrying || connStuckMinutes(s) > 0;
+  return s.ready && !busy ? 'green' : 'yellow';
+}
+
+/** 状态一句话说明（状态胶囊文字与 title）。 */
+export function connDetail(s: ConnSnapshot): string {
+  const ps = connProc(s);
+  const exit = connExitCode(s);
+  if (!s.currentSessionPath) return '未连接（发送时自动连接）';
+  if (exit !== null) return `omp 已退出 (${exit})`;
+  if (!ps || ps.status === 'offline' || ps.status === 'evicted') return '未连接（输入时自动连接）';
+  if (ps.status === 'spawning') return '连接中';
+  if (s.isCompacting) return '压缩中';
+  if (s.isRetrying) return '重试中';
+  const stuck = connStuckMinutes(s);
+  if (stuck > 0) return `疑似卡死（${stuck} 分钟无响应）`;
+  if (s.isStreaming) return '运行中（生成中）';
+  return s.ready ? '就绪' : '连接中';
+}
+
+// ---- 帧诊断环形日志（2026-09-13「回复不显示」排查配套）----
+// 每帧记一条：type / sessionPath / isDisplay / 缓冲与显示长度；帧处理抛错时记 err。
+// 再次复现「agent 已回复但 UI 不显示」时，DevTools Console 读 window.__ompDiag：
+//   - display=false 连片出现 → 帧路由键与 currentSessionPath 失配（08-02 同类 bug）
+//   - 有 err → 帧处理抛异常，该帧丢失
+//   - buf 前进而 msgs 不变 → 显示数组失步（agent_end 自愈应已兜住，若仍现说明自愈失效）
+export interface FrameDiagEntry {
+  t: number;
+  type: string;
+  sp: string;
+  display: boolean;
+  buf?: number;
+  msgs?: number;
+  err?: string;
+}
+const FRAME_DIAG_CAP = 600;
+const frameDiag: FrameDiagEntry[] = [];
+(globalThis as { __ompDiag?: FrameDiagEntry[] }).__ompDiag = frameDiag;
+function pushFrameDiag(e: FrameDiagEntry): void {
+  frameDiag.push(e);
+  if (frameDiag.length > FRAME_DIAG_CAP) frameDiag.splice(0, frameDiag.length - FRAME_DIAG_CAP);
+}
+
 // issue 10：persistWorkspaces 去抖。多次高频触发时只在静默窗口后写一次，
 // 且 flush 时读取最新 store 状态，避免用旧数据覆盖新数据。
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -381,6 +522,8 @@ export const useApp = create<AppState>((set, get) => ({
   permAllow: {},
   stderrTail: [],
   todoPhases: [],
+  subagents: [],
+  subagentsAt: 0,
   isCompacting: false,
   isRetrying: false,
   retryInfo: '',
@@ -493,11 +636,12 @@ export const useApp = create<AppState>((set, get) => ({
         // 若用户在落盘前就已重命名过（sessionNames 里有该 tempKey 覆盖），沿用之
         title: s.sessionNames[path] ?? '新会话',
         mtime: Date.now(),
+        cwdExists: true, // 占位会话的 cwd 刚由用户选定/当前工作区给出，必然有效
       };
       return { sessions: [...s.sessions, placeholder] };
     }),
   setSkills: (list) => set({ skills: list }),
-  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [] }),
+  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [], subagents: [], subagentsAt: 0 }),
 
   // M5: 工作空间
   workspaces: [],
@@ -618,7 +762,9 @@ export const useApp = create<AppState>((set, get) => ({
       const next = idx >= 0
         ? s.workspaces.map((w, i) => (i === idx ? { ...w, ...ws } : w))
         : [...s.workspaces, ws];
-      return { workspaces: next, currentWorkspaceId: ws.id };
+      // 不再隐式改 currentWorkspaceId —— 「发现/更新一个工作区」与「聚焦它」是两件事。
+      // 需要聚焦的入口（onAddWorkspace）已显式调 setCurrentWorkspaceId。
+      return { workspaces: next };
     }),
 
   archiveWorkspace: (id) =>
@@ -744,7 +890,7 @@ export const useApp = create<AppState>((set, get) => ({
       ...st.procStateMap,
       [path]: { status: 'online' as const, isStreaming: false, isAborting: false },
     };
-    set({ sessionsMap, procStateMap, messages: [], isStreaming: false, isAborting: false });
+    set({ sessionsMap, procStateMap, messages: [], isStreaming: false, isAborting: false, subagents: [], subagentsAt: 0 });
   },
 
   ensureOnline: async (sessionPath) => {
@@ -790,9 +936,23 @@ export const useApp = create<AppState>((set, get) => ({
     // 每次调用递增 epoch；callback 拿到结果时若发现 epoch 已变（说明等待期间又有新加载），
     // 就丢弃，避免把旧结果覆盖到新的 sessionsMap 上（rapid switch 时尤其重要）。
     const epoch = ++loadEpoch;
+    // 竞态守卫（2026-09-13「回复不显示」排查配套）：记下读盘起始时刻的帧活跃时间。
+    // 读盘期间若该会话有新帧落地，磁盘快照必然过时（omp 在 agent_end 才 flush JSONL），
+    // 此时用快照覆盖 buffer 会把已流式显示的内容回滚/抹掉。配合下方 buffer 非空检查：
+    //   - buffer 已有内容（实时流已写入）且读盘期间有新帧 / 仍在流式 → 放弃覆盖，buffer 为准
+    //   - buffer 为空（首览/冷启动）→ 照常落盘快照（否则无历史可显示）
+    const readStartFrameAt = get().procStateMap[path]?.lastFrameAt ?? 0;
     void import('./rpc-client').then(({ rpc }) => {
       return rpc.readSessionMessages(path).then((msgs) => {
         if (epoch !== loadEpoch) return; // 已被更新的加载取代，丢弃旧结果
+        const stNow = get();
+        const psNow = stNow.procStateMap[path];
+        const existing = stNow.sessionsMap[path];
+        const framesArrivedDuringRead = (psNow?.lastFrameAt ?? 0) > readStartFrameAt || Boolean(psNow?.isStreaming);
+        if (existing && existing.length > 0 && framesArrivedDuringRead) {
+          pushFrameDiag({ t: Date.now(), type: 'loadSessionMessages.skipStale', sp: path, display: path === stNow.currentSessionPath, buf: existing.length });
+          return; // 快照已过时：实时 buffer 更新，覆盖会丢 in-flight 消息
+        }
         // 重建消息列表：toolResult 不再混入正文（会被 ReactMarkdown 当成大标题），
         // 而是重建为 ToolPart 走 ToolCard（自带折叠）。其余走 contentToParts。
         const chat: ChatMessage[] = [];
@@ -875,8 +1035,7 @@ export const useApp = create<AppState>((set, get) => ({
   applyAgentEvent: (frame) => {
     const s = get();
     // 流式看门狗：任何经此分发的帧都算"进程活跃"信号（高频帧如 message_update 足以覆盖正常生成期）
-    const now = Date.now();
-    // 多进程：每帧带 __sessionPath 标记属于哪个会话，直接按此路由到对应缓冲槽。
+    const now = Date.now();    // 多进程：每帧带 __sessionPath 标记属于哪个会话，直接按此路由到对应缓冲槽。
     // 不再依赖 ompCurrentPath 猜测（那是单进程时代的 hack）。
     const rawTargetPath = (frame.__sessionPath as string | undefined) ?? '';
     if (!rawTargetPath) return; // 无会话标记的帧丢弃（不应发生）
@@ -894,6 +1053,7 @@ export const useApp = create<AppState>((set, get) => ({
       (buffer ??= s.sessionsMap[rawTargetPath] ? [...s.sessionsMap[rawTargetPath]] : []);
     let bufferTouched = false;
 
+    try {
     switch (type) {
       case 'agent_start': {
         procStreaming = true;
@@ -911,6 +1071,15 @@ export const useApp = create<AppState>((set, get) => ({
         if (!msg) break;
         if (msg.role === 'user') break; // user 消息由本地输入 push
         if (msg.role === 'toolResult') break; // 工具输出由 tool_execution_* 建折叠 ToolCard，这里跳过避免整段文本刷屏
+        // omp 的系统通知（async-result 等）以 role='custom' 落地：不进气泡，
+        // 只把后台 task job 的终态同步到子智能体面板（message_end 同样跳过）
+        if (msg.role === 'custom') {
+          if (isDisplay && msg.customType === 'async-result') {
+            const merged = syncSubagentsFromAsyncResult(msg, get().subagents);
+            if (merged) set({ subagents: merged, subagentsAt: now });
+          }
+          break;
+        }
         getBuf().push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true });
         bufferTouched = true;
         break;
@@ -932,12 +1101,13 @@ export const useApp = create<AppState>((set, get) => ({
       }
       case 'message_end': {
         const msg = frame.message as AgentMessage;
-        if (!msg || msg.role === 'toolResult') break; // 同 message_start：工具输出不落成文本消息
+        if (!msg || msg.role === 'toolResult' || msg.role === 'custom') break; // 同上：系统通知/工具输出都不落文本消息
         const isError = msg.stopReason === 'error';
         const errorText = isError
           ? (msg.errorMessage ?? `请求失败${msg.errorStatus ? ` (${msg.errorStatus})` : ''}`)
           : undefined;
         const buf = getBuf();
+        let matched = false;
         for (let i = buf.length - 1; i >= 0; i--) {
           const m = buf[i];
           if (m && m.role === msg.role && (m.streaming || msg.role === 'user')) {
@@ -953,8 +1123,29 @@ export const useApp = create<AppState>((set, get) => ({
               usage: msg.usage ? { totalTokens: msg.usage.totalTokens, duration: msg.duration } : undefined,
               error: errorText,
             };
+            matched = true;
             bufferTouched = true;
             break;
+          }
+        }
+        // 兜底（2026-09-13）：正常流中 assistant 消息必有 message_start 建卡（streaming=true）。
+        // 若 message_start 丢失/被跳过，这里原本会静默丢弃整条回复（最终回答直接消失）。
+        // 改为按 finalized 消息直接追加 —— 宁可罕见场景多一条消息，也不丢最终回答。
+        // 只对 assistant 兜底：user 消息由本地输入先建，omp 的回显帧再追加会重复。
+        if (!matched && msg.role === 'assistant') {
+          const parts = mergeContentAndTools(contentToParts(msg), []);
+          if (parts.length > 0 || errorText) {
+            buf.push({
+              id: nid(),
+              role: msg.role,
+              parts: parts.length > 0
+                ? parts
+                : [{ kind: 'text', text: `⚠️ **模型请求失败**\n\n${errorText}` }],
+              streaming: false,
+              usage: msg.usage ? { totalTokens: msg.usage.totalTokens, duration: msg.duration } : undefined,
+              error: errorText,
+            });
+            bufferTouched = true;
           }
         }
         break;
@@ -963,7 +1154,8 @@ export const useApp = create<AppState>((set, get) => ({
         const toolCallId = (frame.toolCallId as string) ?? nid();
         const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
         const args = frame.args;
-        const part = { kind: 'tool', toolCallId, toolName, status: 'running', args } as ToolPart;
+        const intent = asStr(frame.intent);
+        const part = { kind: 'tool', toolCallId, toolName, status: 'running', args, intent } as ToolPart;
         const buf = getBuf();
         let appended = false;
         for (let i = buf.length - 1; i >= 0; i--) {
@@ -976,17 +1168,35 @@ export const useApp = create<AppState>((set, get) => ({
         }
         if (!appended) buf.push({ id: nid(), role: 'assistant', parts: [part] });
         bufferTouched = true;
+        // 新一批 task 派发：用 agent 指定的 name 预建条目（含 intent），让面板在首个 progress
+        // 帧之前就有内容。只补空缺、绝不改既有条目 —— omp 的 job id 全局唯一且永不重用
+        // （实测重派同名 job 会被改名为 `X-2`），故撞名即意味这里的 name 是错的，
+        // 真正的条目稍后由 progress 帧带来；覆盖只会毁掉既有条目的 startedAt/intent。
+        if (isDisplay && toolName === 'task') {
+          const known = new Set(get().subagents.map((j) => j.id));
+          const fresh = primeSubagentsFromTaskArgs(args, intent).filter((j) => !known.has(j.id));
+          if (fresh.length) set({ subagents: [...get().subagents, ...fresh], subagentsAt: now });
+        }
         break;
       }
       case 'tool_execution_update': {
         const toolCallId = frame.toolCallId as string;
-        const partial = frame.partialResult;
+        const toolName = (frame.toolName as string) ?? (frame.name as string) ?? 'tool';
+        const partialResult = frame.partialResult;
         const buf = getBuf();
         buffer = updateToolInBuffer(buf, toolCallId, (p) => ({
           ...p,
-          partial: typeof partial === 'string' ? (p.partial ?? '') + partial : p.partial,
+          // partialResult 实测恒为 object（文本在 content[] 里），旧代码按 string 拼接 → partial 恒为空
+          partial: partialTextOf(partialResult) || p.partial,
         }));
         bufferTouched = true;
+        // 子智能体进度：task 推 details.progress[]，hub 推 details.jobs[]（后者带真实 status）
+        if (isDisplay) {
+          const incoming = toolName === 'task'
+            ? subagentsFromProgress(partialResult)
+            : toolName === 'hub' ? subagentsFromJobs(asObj(partialResult)?.details) : [];
+          if (incoming.length) set({ subagents: mergeSubagents(get().subagents, incoming), subagentsAt: now });
+        }
         break;
       }
       case 'tool_execution_end': {
@@ -1022,6 +1232,12 @@ export const useApp = create<AppState>((set, get) => ({
         if (isDisplay && (frame.toolName === 'todo' || frame.name === 'todo')) {
           const phases = normalizeTodoPhases(result);
           if (phases) set({ todoPhases: phases });
+        }
+        // 子智能体终态：只采信 hub 的 result.details.jobs[]（带 status/durationMs/resolvedModel）。
+        // task 自身的 end 帧是派发瞬间的启动快照（progress 全 pending、results 为空）→ 必须忽略。
+        if (isDisplay && (frame.toolName === 'hub' || frame.name === 'hub')) {
+          const jobs = subagentsFromJobs(asObj(result)?.details);
+          if (jobs.length) set({ subagents: mergeSubagents(get().subagents, jobs), subagentsAt: now });
         }
         break;
       }
@@ -1086,7 +1302,34 @@ export const useApp = create<AppState>((set, get) => ({
       updates.isStreaming = procStreaming;
       updates.isAborting = procAborting;
     }
+    // 自愈（2026-09-13「agent 已回复但 UI 不显示」bug）：回合终点强制把显示数组对齐到会话缓冲。
+    // 无论中间哪个环节（路由失配 / 异步读盘覆盖 / 丢失更新）导致 messages 落后于 sessionsMap，
+    // agent_end 时 omp 已 flush JSONL、buffer 必含完整回合 —— 以 buffer 为准同步显示，
+    // 用户不再需要"再发一条消息才能看到上一条回复"。
+    if (type === 'agent_end' && isDisplay) {
+      const finalBuf = updates.sessionsMap?.[rawTargetPath] ?? s.sessionsMap[rawTargetPath];
+      if (finalBuf) updates.messages = finalBuf;
+    }
     set(updates);
+    pushFrameDiag({
+      t: now,
+      type,
+      sp: rawTargetPath,
+      display: isDisplay,
+      buf: (updates.sessionsMap?.[rawTargetPath] ?? s.sessionsMap[rawTargetPath])?.length,
+      msgs: isDisplay ? get().messages.length : undefined,
+    });
+    } catch (err) {
+      // 帧处理抛异常：记入诊断日志（该帧丢失可见化），不中断后续帧处理。
+      pushFrameDiag({
+        t: now,
+        type,
+        sp: rawTargetPath,
+        display: isDisplay,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      console.error('[omp-frame-error]', type, err);
+    }
   },
 }));
 
@@ -1101,6 +1344,203 @@ function updateToolInBuffer(
       p.kind === 'tool' && p.toolCallId === toolCallId ? fn(p) : p,
     ),
   }));
+}
+
+// ---- 子智能体（omp `task` 工具派生的 agent 作业）归一化 ----
+// 三个数据源形状各异，全部逐字段 typeof 守卫（strict + noUncheckedIndexedAccess）：
+//  1) tool_execution_update|task 的 partialResult.details.progress[]：约 150ms 一帧，运行中主力
+//  2) hub 的 details.jobs[]（update / end 都有）：带真实 status/durationMs
+//  3) async-result（custom 消息）的 details.jobs[]（键名是 jobId）+ content 里的 <task-result status>
+// 注：task 自己的 tool_execution_end 在派发瞬间就到达，progress 全是启动快照，终态不能从那里取。
+
+function asObj(v: unknown): Record<string, unknown> | null {
+  return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+}
+function asStr(v: unknown): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+function asNum(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/** omp 的 partialResult 恒为 object（实测 150/150 帧），进度文本在 content[] 里。
+ *  content 是**累积**语义（非增量）→ 调用方直接整体替换，不要字符串拼接。 */
+function partialTextOf(partialResult: unknown): string {
+  const content = asObj(partialResult)?.content;
+  if (!Array.isArray(content)) return '';
+  let out = '';
+  for (const c of content) {
+    const cc = asObj(c);
+    if (cc && cc.type === 'text') out += asStr(cc.text) ?? '';
+  }
+  return out;
+}
+
+/** omp 的真实状态词表 —— `<task-result status>` 只取 4 值：completed / `failed (exit N)` /
+ *  cancelled / merge failed（omp 源码 `#X` 实测），progress 另见 aborted。全部覆盖，
+ *  未知值才退 pending（hub 的 jobs 项有实测无 status 的情况）。 */
+function subagentStatus(v: unknown): SubagentJob['status'] {
+  if (v === 'pending' || v === 'running' || v === 'completed' || v === 'failed' || v === 'cancelled') return v;
+  if (v === 'done') return 'completed';
+  if (typeof v === 'string') {
+    if (/^(failed|error|merge failed)/i.test(v)) return 'failed';
+    if (/^(aborted|cancel)/i.test(v)) return 'cancelled';
+  }
+  return 'pending';
+}
+
+/** 状态单调推进用：终态不可被回退（hub 快照可能仍是 running，而本地已知 completed）。 */
+const SUBAGENT_RANK: Record<SubagentJob['status'], number> = {
+  pending: 0, running: 1, completed: 2, failed: 2, cancelled: 2,
+};
+
+/** 归一化单条 job/progress 记录。id 取 `id`（progress/hub）或 `jobId`（async-result）；无 id 的直接丢弃。 */
+function toSubagentJob(raw: unknown): SubagentJob | null {
+  const o = asObj(raw);
+  if (!o) return null;
+  const id = asStr(o.id) ?? asStr(o.jobId);
+  if (!id) return null;
+  return {
+    id,
+    status: subagentStatus(o.status),
+    agent: asStr(o.agent),
+    agentSource: asStr(o.agentSource),
+    assignment: asStr(o.assignment),
+    startedAt: Date.now(),
+    durationMs: asNum(o.durationMs),
+    resolvedModel: asStr(o.resolvedModel),
+    modelRole: asStr(o.modelRole),
+    toolCount: asNum(o.toolCount),
+    tokens: asNum(o.tokens),
+    contextTokens: asNum(o.contextTokens),
+    contextWindow: asNum(o.contextWindow),
+    errorText: asStr(o.errorText),
+  };
+}
+
+/** tool_execution_update|task：progress[] 本身就是 task 专用（项里没有 type 字段）。 */
+function subagentsFromProgress(partialResult: unknown): SubagentJob[] {
+  const progress = asObj(asObj(partialResult)?.details)?.progress;
+  if (!Array.isArray(progress)) return [];
+  const out: SubagentJob[] = [];
+  for (const p of progress) {
+    const job = toSubagentJob(p);
+    if (job) out.push(job);
+  }
+  return out;
+}
+
+/** hub / async-result 的 details.jobs[]：混有 bash 型后台 job → 必须筛 type==='task'（用户决策：只报子智能体）。 */
+function subagentsFromJobs(details: unknown): SubagentJob[] {
+  const jobs = asObj(details)?.jobs;
+  if (!Array.isArray(jobs)) return [];
+  const out: SubagentJob[] = [];
+  for (const j of jobs) {
+    if (asObj(j)?.type !== 'task') continue;
+    const job = toSubagentJob(j);
+    if (job) out.push(job);
+  }
+  return out;
+}
+
+/** `task` 工具的 args.tasks[]（{agent,name,task}）→ 预建 pending 条目。
+ *  顺带把本次派发的 intent 写进条目（回答用户"在等什么"的直接信号，语言不固定，原样展示）。 */
+function primeSubagentsFromTaskArgs(args: unknown, intent?: string): SubagentJob[] {
+  const tasks = asObj(args)?.tasks;
+  if (!Array.isArray(tasks)) return [];
+  const out: SubagentJob[] = [];
+  for (const t of tasks) {
+    const o = asObj(t);
+    const id = asStr(o?.name);
+    if (!id) continue;
+    out.push({
+      id,
+      status: 'pending',
+      agent: asStr(o?.agent),
+      assignment: asStr(o?.task),
+      intent,
+      startedAt: Date.now(),
+      provisional: true,
+    });
+  }
+  return out;
+}
+
+/** async-result 的 content 里每个 job 一段 `<task-result id="X" agent="Y" status="Z">`。
+ *  jobs[] 项不带 status（实测），真实终态只能从这里取。 */
+const TASK_RESULT_RE = /<task-result\s+id="([^"]+)"\s+agent="([^"]*)"\s+status="([^"]*)"/g;
+
+function taskResultStatuses(msg: AgentMessage): Map<string, { agent?: string; raw: string }> {
+  const out = new Map<string, { agent?: string; raw: string }>();
+  const raw: unknown = msg.content;
+  const text = typeof raw === 'string'
+    ? raw
+    : Array.isArray(raw)
+      ? raw.map((c) => asStr(asObj(c)?.text) ?? '').join('\n')
+      : '';
+  if (!text) return out;
+  for (const m of text.matchAll(TASK_RESULT_RE)) {
+    const id = m[1];
+    if (!id) continue;
+    out.set(id, { agent: m[2] || undefined, raw: m[3] ?? '' });
+  }
+  return out;
+}
+
+/** async-result：后台 task job 真正完成时才推的一条 custom 消息（落在下一个 agent_start 之后）。
+ *  返回合并后的完整列表；无可用内容时返回 null（调用方据此跳过 set）。 */
+function syncSubagentsFromAsyncResult(msg: AgentMessage, prev: SubagentJob[]): SubagentJob[] | null {
+  const incoming = subagentsFromJobs(msg.details);
+  if (!incoming.length) return null;
+  const statuses = taskResultStatuses(msg);
+  for (const j of incoming) {
+    const st = statuses.get(j.id);
+    if (!st) continue;
+    j.agent ??= st.agent;
+    j.status = subagentStatus(st.raw);
+    // 非完成态都留原文："failed (exit 1)" / "cancelled" / "merge failed"，比裸状态有信息量
+    if (j.status !== 'completed') j.errorText = st.raw;
+  }
+  return mergeSubagents(prev, incoming);
+}
+
+/** 按 id 合并：状态单调推进（终态不被回退），缺失字段保留旧值，已有条目保留原 startedAt。
+ *  入参恒为帧数据（真实 id），据此淘汰被改名的占位条目。 */
+function mergeSubagents(prev: SubagentJob[], incoming: SubagentJob[]): SubagentJob[] {
+  const byId = new Map(prev.map((j) => [j.id, j]));
+  const superseded = new Set<string>();
+  for (const inc of incoming) {
+    for (const old of prev) {
+      if (old.provisional && old.status === 'pending' && inc.id.startsWith(`${old.id}-`)) superseded.add(old.id);
+    }
+  }
+  for (const inc of incoming) {
+    const old = byId.get(inc.id);
+    if (!old) {
+      byId.set(inc.id, inc);
+      continue;
+    }
+    byId.set(inc.id, {
+      id: inc.id,
+      status: SUBAGENT_RANK[inc.status] >= SUBAGENT_RANK[old.status] ? inc.status : old.status,
+      agent: inc.agent ?? old.agent,
+      agentSource: inc.agentSource ?? old.agentSource,
+      assignment: inc.assignment ?? old.assignment,
+      intent: inc.intent ?? old.intent,
+      startedAt: old.startedAt,
+      durationMs: inc.durationMs || old.durationMs, // 运行中恒为 0，取有值的一侧
+      resolvedModel: inc.resolvedModel ?? old.resolvedModel,
+      modelRole: inc.modelRole ?? old.modelRole,
+      toolCount: inc.toolCount ?? old.toolCount,
+      tokens: inc.tokens ?? old.tokens,
+      contextTokens: inc.contextTokens ?? old.contextTokens,
+      contextWindow: inc.contextWindow ?? old.contextWindow,
+      errorText: inc.errorText ?? old.errorText,
+      provisional: undefined,
+    });
+  }
+  for (const id of superseded) byId.delete(id);
+  return [...byId.values()];
 }
 
 /**

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useApp, isImageFile, type Attachment } from '../store';
+import { useApp, isImageFile, connTone, connDetail, type Attachment, type ConnTone } from '../store';
 import { rpc } from '../rpc-client';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
@@ -50,6 +50,21 @@ const AttachmentChip: React.FC<{
       <button type="button" className="attachment-remove" title="移除附件" onClick={() => onRemove(att.path)}>
         <Icon name="close" size={12} />
       </button>
+    </span>
+  );
+};
+
+/** 输入框工具栏里的醒目连接状态胶囊：红=未连接/已退出、绿=就绪、黄=运行中。
+ *  判定与文案复用 store 的 connTone/connDetail（与底部状态栏同源），此处只负责渲染。 */
+const TONE_LABEL: Record<ConnTone, string> = { red: '未连接', green: '就绪', yellow: '运行中' };
+
+const ConnStatusPill: React.FC = () => {
+  const tone = useApp(connTone);
+  const detail = useApp(connDetail);
+  return (
+    <span className={`conn-pill ${tone}`} role="status" title={detail}>
+      <span className="conn-dot" />
+      {TONE_LABEL[tone]}
     </span>
   );
 };
@@ -375,6 +390,9 @@ export const InputBox: React.FC<{
               <button className="input-tool-btn icon-only" type="button" title="添加附件（项目内或任意外部文件）" onClick={onPickFiles}>
                 <Icon name="attach" size={16} />
               </button>
+              {/* 醒目连接状态：红=未连接/已退出、绿=就绪、黄=运行中。
+                  与底部状态栏共用 store 的 connTone/connDetail，避免两处判定漂移。 */}
+              <ConnStatusPill />
               <PermissionPicker onChange={onChangeApprovalMode} />
             </div>
             <div className="input-toolbar-right">

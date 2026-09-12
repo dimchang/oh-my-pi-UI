@@ -67,3 +67,6 @@ resources/omp.exe
 
 # scratch fix notes, not project source
 gemini-balancer-fix.txt
+
+# ===== Local electron-builder output (hundreds of MB, never commit) =====
+build-out/

@@ -28,11 +28,12 @@ export const ThinkingPicker: React.FC = () => {
   }, []);
 
   // 当前模型实际支持的 thinking 档位（实测 model.thinking.efforts）。
-  // 模型无 thinking 信息（未加载或不支持，如未声明 thinking 的自定义模型）时整个隐藏，
-  // 避免显示假的默认档位（曾有 hardcoded '中' 兜底误导用户）。
-  const thinkingInfo = model?.thinking;
-  if (!thinkingInfo) return null;
-  const supported = thinkingInfo.efforts;
+  // - 模型对象还没拿到（切会话瞬间 / get_state 未返回）：整个隐藏，避免闪出"思考"占位按钮。
+  // - 有模型但没有 thinking 元数据（provider 未声明，如 models.yml 里只写了 id/name 的自定义
+  //   provider）：**不隐藏**，照常列出全部档位。omp 对这类模型依然接受 reasoning_effort
+  //   （openai-completions 透传），藏起来等于直接剥夺用户设置思考强度的能力。
+  if (!model) return null;
+  const supported = model.thinking?.efforts;
   const isSupported = (v: ThinkingLevel) => !supported || supported.includes(v);
 
   const pick = (l: ThinkingLevel) => {
@@ -65,7 +66,7 @@ export const ThinkingPicker: React.FC = () => {
   return (
     <div className="thinking-picker" ref={ref}>
       <button className="btn" onClick={() => setOpen((o) => !o)} title="思考等级（Ctrl+T 循环切换）">
-        {current?.label ?? level ?? '思考'} ▾
+        {current?.label ?? level ?? '中'} ▾
       </button>
       {open && (
         <div className="thinking-menu">

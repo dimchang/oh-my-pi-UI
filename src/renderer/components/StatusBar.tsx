@@ -1,45 +1,24 @@
 import React from 'react';
-import { useApp } from '../store';
+import { useApp, connTone, connDetail, connStuckMinutes } from '../store';
 import { Icon } from './Icon';
 
 export const StatusBar: React.FC = () => {
-  const ready = useApp((s) => s.ready);
-  const exited = useApp((s) => s.ompExited);
-  const isStreaming = useApp((s) => s.isStreaming);
   const usage = useApp((s) => s.contextUsage);
   const stats = useApp((s) => s.sessionStats);
-  const isCompacting = useApp((s) => s.isCompacting);
-  const isRetrying = useApp((s) => s.isRetrying);
   // 当前会话的模型 / 思考档位（refreshState 已填充，这里仅展示）
   const model = useApp((s) => s.model);
   const thinking = useApp((s) => s.thinkingLevel);
   // 直接从 selector 参数 s 中 find，避免在 selector 内调用 get() 破坏响应式订阅
   const currentWorkspace = useApp((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId) ?? null);
-  // 当前会话的进程状态：仅浏览未拉起的会话显示"未连接"（输入时自动连接）
-  const currentSessionPath = useApp((s) => s.currentSessionPath);
-  const ps = useApp((s) => (s.currentSessionPath ? s.procStateMap[s.currentSessionPath] : undefined));
-  const browsing = !!currentSessionPath && (!ps || ps.status === 'offline' || ps.status === 'evicted');
-  const spawning = !!currentSessionPath && ps?.status === 'spawning';
-  // 流式看门狗：当前会话"生成中但长时间无任何帧" → 疑似卡死（stuckSince 由 App 的定时扫描写入）
-  const stuckMinutes =
-    currentSessionPath && ps?.isStreaming && ps?.stuckSince
-      ? Math.max(1, Math.round((Date.now() - ps.stuckSince) / 60000))
-      : 0;
+  // 连接三色与文案统一由 store 派生（与输入框旁的 conn-pill 同源，避免判定漂移）
+  const tone = useApp(connTone);
+  const statusText = useApp(connDetail);
+  const stuckMinutes = useApp(connStuckMinutes);
 
   // sessionStats 不再在这里一次性拉取：改由 App.refreshState 统一驱动
   // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
 
-  const dot = browsing ? 'off' : spawning ? 'busy' : typeof exited === 'number' ? 'off' : isStreaming ? 'busy' : ready ? 'on' : 'busy';
-  const statusText =
-    browsing ? '未连接（输入时自动连接）'
-      : spawning ? '连接中'
-      : typeof exited === 'number' ? `omp 已退出 (${exited})`
-      : isCompacting ? '压缩中'
-      : isRetrying ? '重试中'
-      : stuckMinutes > 0 ? `疑似卡死（${stuckMinutes} 分钟无响应）`
-      : isStreaming ? '生成中'
-      : ready ? '就绪'
-      : '连接中';
+  const dot = tone === 'red' ? 'off' : tone === 'green' ? 'on' : 'busy';
 
   return (
     <div className="statusbar">

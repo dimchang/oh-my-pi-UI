@@ -69,6 +69,12 @@ export const ToolCard = React.memo(function ToolCard({ tool }: { tool: ToolPart 
       </div>
       {open && (
         <div className="tool-body">
+          {tool.intent && (
+            <div className="tool-section">
+              <div className="tool-label">意图</div>
+              <div className="tool-intent">{tool.intent}</div>
+            </div>
+          )}
           {tool.args !== undefined && (
             <div className="tool-section">
               <div className="tool-label">参数</div>

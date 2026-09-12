@@ -152,9 +152,16 @@ export async function listSessions(cwdFilter?: string): Promise<SessionSummary[]
     16,
   );
 
-  const out = summaries.filter((x): x is SessionSummary => x !== null);
-  out.sort((a, b) => b.mtime - a.mtime);
-  return out;
+  const valid = summaries.filter((x): x is SessionSummary => x !== null);
+  valid.sort((a, b) => b.mtime - a.mtime);
+  // cwd 有效性（存在且为目录）：渲染层 reconcile 用它挡掉「为已消失目录自动造工作区」
+  // （2026-09-12 幽灵工作区事故）。只 stat unique cwd，量级 = 工作区数，可忽略。
+  const cwdExists = new Map<string, boolean>();
+  await Promise.all([...new Set(valid.map((s) => s.cwd))].map(async (cwd) => {
+    try { cwdExists.set(cwd, (await fs.promises.stat(cwd)).isDirectory()); }
+    catch { cwdExists.set(cwd, false); }
+  }));
+  return valid.map((s) => ({ ...s, cwdExists: cwdExists.get(s.cwd) ?? false }));
 }
 
 /** issue 36: Windows 路径比较大小写不敏感，统一 normalize 后小写归一。 */

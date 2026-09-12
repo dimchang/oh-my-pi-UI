@@ -224,6 +224,20 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
       </div>
       <div className="msg-body">
         {msg.parts.map((p, i) => {
+          if (p.kind === 'text' && p.narration) {
+            // 过程说明（中间叙述）：默认折叠，只留一行摘要；用户需要时点开看全文。
+            // 最终回答由 omp 作为独立消息（不含 toolCall）送达 → 不折叠，始终可见。
+            return (
+              <details key={`narration-${i}`} className="thinking narration">
+                <summary>过程说明</summary>
+                <div className="thinking-body markdown">
+                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+                    {p.text}
+                  </ReactMarkdown>
+                </div>
+              </details>
+            );
+          }
           if (p.kind === 'text') {
             // 若文本像是直接贴出的文件/代码内容，按代码块渲染并默认折叠，
             // 避免 JSDoc `*`、路径列表等被 markdown 错误解析。
@@ -311,7 +325,14 @@ export const ChatView: React.FC = () => {
   const isRetrying = useApp((s) => s.isRetrying);
   const retryInfo = useApp((s) => s.retryInfo);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
+  /** 是否停在真实底部（stickBottom 的 state 镜像，仅用于渲染「跳到最新」按钮）。 */
+  const [atBottom, setAtBottom] = useState(true);
+  /** 用户滚动意图：程序化钉底（rAF）与 Chromium scroll anchoring 也会触发 scroll 事件，
+   *  必须与真实用户滚动区分，否则"仍在底部"会被误判成"用户已上滚"→ 失去跟随。 */
+  const userScrollActive = useRef(false);
+  const lastUserScrollAt = useRef(0);
   const prevSessionRef = useRef(currentSessionPath);
   const prevLenRef = useRef(messages.length);
 
@@ -340,6 +361,7 @@ export const ChatView: React.FC = () => {
       prevSessionRef.current = currentSessionPath;
       prevLenRef.current = total;
       stickBottom.current = true;
+      setAtBottom(true);
       setWindowStart(Math.max(0, total - WINDOW_SIZE));
       requestAnimationFrame(() => {
         const el = scrollRef.current;
@@ -350,10 +372,31 @@ export const ChatView: React.FC = () => {
     }
   }, [currentSessionPath, total]);
 
+  // 用户滚动意图标记：滚轮 / 触摸 / 键盘 / 指针按下（含拖拽原生滚动条）。
+  // pointerdown→up 覆盖"按住拖动滚动条"期间的所有 scroll 事件。
+  useEffect(() => {
+    const mark = () => { lastUserScrollAt.current = Date.now(); };
+    const down = () => { userScrollActive.current = true; mark(); };
+    const up = () => { userScrollActive.current = false; mark(); };
+    window.addEventListener('pointerdown', down, true);
+    window.addEventListener('pointerup', up, true);
+    window.addEventListener('wheel', mark, { passive: true });
+    window.addEventListener('touchmove', mark, { passive: true });
+    window.addEventListener('keydown', mark);
+    return () => {
+      window.removeEventListener('pointerdown', down, true);
+      window.removeEventListener('pointerup', up, true);
+      window.removeEventListener('wheel', mark);
+      window.removeEventListener('touchmove', mark);
+      window.removeEventListener('keydown', mark);
+    };
+  }, []);
+
   // 消息追加/更新（流式）：若在底部则跟随（窗口保持最后 + 滚到底）；用户上滚后不拉回
   useEffect(() => {
     if (stickBottom.current && total > 0) {
       setWindowStart(Math.max(0, total - WINDOW_SIZE));
+      setAtBottom(true);
       requestAnimationFrame(() => {
         const el = scrollRef.current;
         if (el) el.scrollTop = el.scrollHeight;
@@ -361,10 +404,46 @@ export const ChatView: React.FC = () => {
     }
   }, [messages, total]);
 
+  // 吸底跟随（ResizeObserver）：内容尺寸任何变化（图片 onload、代码高亮、markdown
+  // 二次布局、分批上屏）都把视口钉回底部。修「打开会话没跳到最后」：定位只在消息
+  // 数组变化时滚一次，之后图片等晚成型内容撑高正文 → 视口被顶离底部且无人再跟随。
+  // 用户上滚（stickBottom=false）时不打扰；依赖 loading/empty 态变化重连（loading
+  // 分支不渲染 .chat-inner，ref 为 null 时跳过）。
+  useEffect(() => {
+    const inner = innerRef.current;
+    const el = scrollRef.current;
+    if (!inner || !el) return;
+    const ro = new ResizeObserver(() => {
+      if (stickBottom.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [isLoading, showEmpty]);
+
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    // 只认「用户意图驱动」的滚动：程序化钉底（rAF 设 scrollTop）与 Chromium 的
+    // scroll anchoring（窗口跳变后自动调 scrollTop）同样触发 scroll 事件。若一并纳入
+    // 判定，会把"仍在底部"误判为"用户已上滚" → 失去跟随 → 最新回复只显示一半且不再
+    // 补滚（2026-09-13 用户截图复现）。
+    const userDriven = userScrollActive.current || Date.now() - lastUserScrollAt.current < 400;
+    if (!userDriven) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    stickBottom.current = nearBottom;
+    // 滚到底部且窗口落后于会话末尾（startIdx + WINDOW < total）→ 窗口直接推进到最新。
+    // 修「停在中间切片滚不到最后」：用户上滚阅读期间 agent 继续跑，窗口停住（设计如此，
+    // 不拉回）；之后用户滚回 DOM 底部时，DOM 底 ≠ 会话底 —— 最新消息不在窗口里，
+    // 渲染出来的只有旧切片末尾 + 空白，永远滚不到最后。这里补上"到底边 → 向前推进"。
+    const windowBehind = startIdx < maxStart;
+    if (nearBottom && windowBehind) {
+      setWindowStart(maxStart);
+      requestAnimationFrame(() => {
+        const el2 = scrollRef.current;
+        if (el2) el2.scrollTop = el2.scrollHeight;
+      });
+    }
+    setAtBottom(nearBottom && !windowBehind);
     // 滚动到顶部时加载更多历史（窗口前移 LOAD_MORE 条，DOM 恒定）
     if (el.scrollTop < 100 && hasMore) {
       const prevScrollHeight = el.scrollHeight;
@@ -380,6 +459,18 @@ export const ChatView: React.FC = () => {
       });
     }
   };
+
+  // 跳到最新：无视当前状态，窗口归位到最后 + 吸底（浮层按钮出口，保证任何
+  // 异常定位状态下用户都能一键回到最新消息）。
+  const jumpToLatest = useCallback(() => {
+    stickBottom.current = true;
+    setAtBottom(true);
+    setWindowStart(Math.max(0, total - WINDOW_SIZE));
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+  }, [total]);
 
   // Minimap 跳转：目标消息在当前窗口 → scrollIntoView；否则先移动窗口再定位
   const scrollToMessage = useCallback((index: number) => {
@@ -429,7 +520,7 @@ export const ChatView: React.FC = () => {
     <LinkMenuContext.Provider value={openLinkMenu}>
       <div className="chat-area">
         <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
-          <div className="chat-inner">
+          <div className="chat-inner" ref={innerRef}>
             {showEmpty ? (
               <EmptyHeader />
             ) : (
@@ -454,6 +545,18 @@ export const ChatView: React.FC = () => {
             )}
           </div>
         </div>
+        {/* 未停在真实底部（用户上滚 or 窗口落后）→ 提供一键回到最新的出口。
+            不依赖 stickBottom 的自动判定，任何异常定位状态都能手动兜回。 */}
+        {!atBottom && !showEmpty && (
+          <button
+            type="button"
+            className="chat-jump-latest"
+            title="跳到最新消息"
+            onClick={jumpToLatest}
+          >
+            <Icon name="chevron" size={16} />
+          </button>
+        )}
         <Minimap scrollRef={scrollRef} messages={messages} onJump={scrollToMessage} />
       </div>
       {ctxMenu}

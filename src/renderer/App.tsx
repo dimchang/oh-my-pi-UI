@@ -11,9 +11,11 @@ import { PermissionModal } from './components/PermissionModal';
 import { FileTree } from './components/FileTree';
 import { TitleBar } from './components/TitleBar';
 import { TodoPanel } from './components/TodoPanel';
+import { JobPanel } from './components/JobPanel';
 import { DiffView } from './components/DiffView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
+import { planWorkspaceReconcile } from './utils/workspace-reconcile';
 import { stripDataUrlPrefix } from './utils/image-data-url';
 import { applyAppearance } from './store';
 import type { OmpFrame, RpcExtensionUIRequest, RpcImage, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
@@ -32,7 +34,7 @@ export default function App(): React.ReactElement {
     useApp.getState().pushToast(text, level);
   }, []);
 
-  const togglePanel = useCallback((panel: 'files' | 'todo' | 'diff') => {
+  const togglePanel = useCallback((panel: 'files' | 'todo' | 'diff' | 'jobs') => {
     const st = useApp.getState();
     st.setState({ rightPanel: st.rightPanel === panel ? 'off' : panel });
   }, []);
@@ -249,33 +251,43 @@ export default function App(): React.ReactElement {
 
   /** 加载 workspaces 文件并补全"扫盘发现的但 store 里没有"的工作空间。 */
   const loadAndReconcileWorkspaces = useCallback((): void => {
-    void window.omp.getWorkspaces().then((file) => {
+    void window.omp.getWorkspaces().then(({ file, staleCwds }) => {
       useApp.getState().setWorkspacesFile(file);
       // 恢复上次的外观配置（主题预设 / 背景色 / 字体 / 字号 / 配色模式）
       applyAppearance(useApp.getState().appearance);
       const st = useApp.getState();
-      const sessions = st.sessions;
-      const existingCwds = new Set(st.workspaces.map((w) => cwdKey(w.cwd)));
-      const archivedCwds = new Set(st.archived.map((w) => cwdKey(w.cwd)));
-      const removed = new Set(st.removedCwds.map(cwdKey));
-      let dirty = false;
-      for (const s of sessions) {
-        const key = cwdKey(s.cwd);
-        if (existingCwds.has(key)) continue;
-        if (archivedCwds.has(key) || removed.has(key)) continue;
-        useApp.getState().upsertWorkspace({
-          id: key,
-          cwd: s.cwd,
-          displayName: basename(s.cwd),
-          collapsed: false,
-          createdAt: Date.now(),
-        });
-        existingCwds.add(key);
-        dirty = true;
+      // 判定全部收敛到纯函数 planWorkspaceReconcile（可单测）：
+      //  - 幽灵防护：会话 cwd 已消失（cwdExists=false）→ 绝不自动造工作区；
+      //  - currentId 失效回退：指向已消失目录 → 切到第一个可用工作区并明确提示。
+      // 时序（两次调用分工不同，结构不可挪动，详见 plan-ghost-workspace-fix.md）：
+      //  - mount 时（workspacesLoaded 置真前）跑第一次：sessions 为空 → 只做 currentId 回退；
+      //  - refreshSessions 之后跑第二次：sessions 已带 cwdExists → 幽灵防护在这里生效。
+      const plan = planWorkspaceReconcile({
+        sessions: st.sessions,
+        workspaces: st.workspaces,
+        archived: st.archived,
+        removedCwds: st.removedCwds,
+        staleCwds,
+        currentId: st.currentWorkspaceId,
+      });
+      for (const ws of plan.toAdd) {
+        useApp.getState().upsertWorkspace(ws);
       }
-      if (dirty) useApp.getState().persistWorkspaces();
+      if (plan.nextCurrentId !== st.currentWorkspaceId) {
+        useApp.getState().setCurrentWorkspaceId(plan.nextCurrentId);
+        const fb = plan.nextCurrentId
+          ? useApp.getState().workspaces.find((w) => w.id === plan.nextCurrentId)
+          : null;
+        pushToast(
+          fb
+            ? `上次的工作区目录不存在，已切换到「${fb.displayName}」`
+            : '上次的工作区目录不存在，请重新打开一个文件夹',
+          'error',
+        );
+      }
+      if (plan.changed) useApp.getState().persistWorkspaces();
     }).catch(() => undefined);
-  }, []);
+  }, [pushToast]);
 
   // ---- omp 帧订阅（多进程：每帧带 __sessionPath 路由）----
   useEffect(() => {
@@ -426,8 +438,9 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === 't') {
-        // 模型不支持 thinking（get_state 无 thinking 信息）时不拦截、不循环切换
-        if (!useApp.getState().model?.thinking) return;
+        // 模型未知（会话未拉起 / get_state 未返回）时不拦截：
+        // 与 ThinkingPicker 一致——有模型就允许循环（哪怕 omp 没给 thinking 元数据）。
+        if (!useApp.getState().model) return;
         e.preventDefault();
         const sp = useApp.getState().currentSessionPath;
         if (sp) void rpc.cycleThinkingLevel(sp).catch(() => undefined);
@@ -581,26 +594,28 @@ export default function App(): React.ReactElement {
    *  （实证 2026-08-24 23:15:37/:47 双 spawn，后续引发切死进程后误开全新 .jsonl）。 */
   const creatingSession = useRef(false);
 
-  const onNewSession = useCallback(async (cwd?: string) => {
+  const onNewSession = useCallback(async (cwd?: string): Promise<boolean> => {
     if (creatingSession.current) {
       pushToast('已在新建会话中，请稍候', 'info');
-      return;
+      return false;
     }
     creatingSession.current = true;
     try {
-      await doNewSession(cwd);
+      // doNewSession 声明在本函数之后（const TDZ），不能进依赖数组；
+      // 它是稳定 useCallback（依赖 pushToast / resolveAndSelectNewSession 均稳定），闭包不会过期。
+      return await doNewSession(cwd);
     } finally {
       creatingSession.current = false;
     }
   }, [pushToast]);
 
-  const doNewSession = useCallback(async (cwd?: string) => {
+  const doNewSession = useCallback(async (cwd?: string): Promise<boolean> => {
     useApp.getState().setMainView('chat');
     const st = useApp.getState();
     const targetCwd = cwd ?? st.currentWorkspace()?.cwd;
     if (!targetCwd) {
       pushToast('请先选择或新建一个工作空间', 'error');
-      return;
+      return false;
     }
     const targetMode = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(targetCwd))?.approvalMode ?? 'write';
     const target = st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(targetCwd));
@@ -617,8 +632,10 @@ export default function App(): React.ReactElement {
       );
       const { sessionPath } = await rpc.newSessionForCwd(targetCwd, targetMode);
       await resolveAndSelectNewSession(sessionPath, targetCwd);
+      return true;
     } catch (e) {
       pushToast(`新建会话失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+      return false;
     }
   }, [pushToast, resolveAndSelectNewSession]);
 
@@ -629,23 +646,29 @@ export default function App(): React.ReactElement {
       loadAndReconcileWorkspaces();
       const st = useApp.getState();
       const cwd = st.currentWorkspace()?.cwd;
-      if (cwd) {
-        const newest = st.sessions
-          .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
-          .sort((a, b) => b.mtime - a.mtime)[0];
-        if (newest) {
-          st.setCurrentSessionPath(newest.path);
-          st.loadSessionMessages(newest.path);
-          // 懒拉起该会话的进程（带 -c 续接历史）
-          const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
-          void rpc.acquire(newest.path, cwd, approvalMode).catch((e) =>
-            pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
-          );
-        } else {
-          // 当前工作空间没有任何会话（例如用户手动清空了 .omp/agent/sessions）：
-          // 必须新建一个会话并拉起进程，否则 ready 永远不会变 true，UI 会卡死。
-          void onNewSession(cwd);
-        }
+      if (!cwd) {
+        // 无可用工作区（首次启动 / 全部目录失效 / 被清空）：明确引导，绝不静默卡死。
+        // 目录失效的 currentId 已由 loadAndReconcileWorkspaces 预切回退；这里只兜"一个可用都没有"。
+        pushToast('还没有可用的工作区，请点击侧栏「打开文件夹」选择一个目录', 'info');
+        return;
+      }
+      const newest = st.sessions
+        .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
+        .sort((a, b) => b.mtime - a.mtime)[0];
+      if (newest) {
+        st.setCurrentSessionPath(newest.path);
+        st.loadSessionMessages(newest.path);
+        // 懒拉起该会话的进程（带 -c 续接历史）。
+        // 失败只 toast，不级联换工作区重试 —— 对有效 cwd 的失败大概率是 omp 瞬时问题
+        // （二进制缺失/端口占用），盲目换工作区会在错误目录偷偷新建会话。
+        const approvalMode = st.currentWorkspace()?.approvalMode ?? 'write';
+        void rpc.acquire(newest.path, cwd, approvalMode).catch((e) =>
+          pushToast(`拉起会话失败：${e instanceof Error ? e.message : String(e)}`, 'error')
+        );
+      } else {
+        // 当前工作空间没有任何会话（例如用户手动清空了 .omp/agent/sessions）：
+        // 必须新建一个会话并拉起进程，否则 ready 永远不会变 true，UI 会卡死。
+        void onNewSession(cwd);
       }
     });
   }, [workspacesLoaded, refreshSessions, pushToast, onNewSession]);
@@ -902,6 +925,8 @@ export default function App(): React.ReactElement {
         createdAt: Date.now(),
         approvalMode: 'write',
       });
+      // upsertWorkspace 不再隐式聚焦（幽灵工作区事故修复）—— 用户主动添加必须显式聚焦
+      st.setCurrentWorkspaceId(id);
     }
     st.persistWorkspaces();
     void onNewSession(cwd);
@@ -1011,6 +1036,13 @@ export default function App(): React.ReactElement {
             >
               <Icon name="diff" size={16} />
             </button>
+            <button
+              className={`icon-btn ${rightPanel === 'jobs' ? 'active' : ''}`}
+              onClick={() => togglePanel('jobs')}
+              title="子智能体"
+            >
+              <Icon name="robot" size={16} />
+            </button>
           </div>
         </div>
         {mainView === 'skills' ? (
@@ -1034,6 +1066,7 @@ export default function App(): React.ReactElement {
           })()}
           {rightPanel === 'todo' && <TodoPanel />}
           {rightPanel === 'diff' && <DiffPanel />}
+          {rightPanel === 'jobs' && <JobPanel />}
         </div>
       )}
       </div>

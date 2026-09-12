@@ -166,6 +166,10 @@ export interface SessionSummary {
   title: string;
   /** 文件 mtime（ms） */
   mtime: number;
+  /** cwd 在磁盘上**存在且为目录**（注意不是 existsSync 语义：文件也算无效）。
+   *  由主进程 listSessions 算出；渲染层 reconcile 用它挡掉「为已消失目录自动造工作区」
+   *  （2026-09-12 幽灵工作区事故）。可选：占位会话/老数据缺省按存在处理。 */
+  cwdExists?: boolean;
 }
 
 /** omp 权限模式（对应启动参数 `--approval-mode`，spawn 时生效）。
@@ -305,6 +309,14 @@ export interface WorkspacesFile {
   sessionNames?: Record<string, string>;
 }
 
+/** WorkspacesGet 的返回：文件内容 + 主进程算出的「cwd 已失效」信号。
+ *  主进程只 stat 不写盘 —— 外接盘临时离线时由渲染层「标记/提示」，绝不静默删除用户条目。 */
+export interface WorkspacesLoadResult {
+  file: WorkspacesFile;
+  /** **任务区**工作区中 cwd 已失效（不存在或非目录）的 cwd 列表（原始大小写，渲染层自行 cwdKey 归一） */
+  staleCwds: string[];
+}
+
 // ---- 模型配置：omp 原生 ~/.omp/agent/models.yml ----
 
 /** models.yml 里 provider 下单个模型的定义（自定义 provider 手填模型时用，字段与 omp ModelDefinition 对齐，只保留 GUI 需要的） */
@@ -391,7 +403,7 @@ export interface OmpApi {
   notifyReady(): Promise<void>;
 
   // M5: 工作空间
-  getWorkspaces(): Promise<WorkspacesFile>;
+  getWorkspaces(): Promise<WorkspacesLoadResult>;
   saveWorkspaces(file: WorkspacesFile): Promise<void>;
   openDirDialog(defaultPath?: string): Promise<string | null>;
   /** 弹出文件选择框（多选），返回选中文件的绝对路径 + 名称 + 大小；取消返回 null */

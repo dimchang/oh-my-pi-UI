@@ -91,6 +91,10 @@ export interface AgentMessage {
   errorStatus?: number;
   errorId?: number | string;
   errorMessage?: string;
+  /** omp 把系统通知（async-result 等）以 role='custom' 的消息下发，
+   *  类型放在 customType，结构化数据放在 details。UI 据此跳过气泡渲染并同步子智能体面板。 */
+  customType?: string;
+  details?: unknown;
   // issue 91: 未知字段收进显式 extra，替代宽松索引签名（避免所有属性访问退化为 unknown）
   extra?: Record<string, unknown>;
   /** 由 steer 命令产生的用户消息会带此标记（message_start / agent_end.messages 均可见）。
@@ -271,11 +275,15 @@ export interface ToolExecutionStartEvent {
   toolName?: string;
   name?: string;
   args?: unknown;
+  /** omp 对该次工具调用的一句话意图（实测 start 帧恒带，中英文都有），UI 原样展示。 */
+  intent?: string;
   [k: string]: unknown;
 }
 export interface ToolExecutionUpdateEvent {
   type: 'tool_execution_update';
   toolCallId: string;
+  toolName?: string;
+  name?: string;
   partialResult?: unknown;
   [k: string]: unknown;
 }
