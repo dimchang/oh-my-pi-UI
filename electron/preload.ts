@@ -19,8 +19,8 @@ const api: OmpApi = {
     ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
     ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode),
-  newSessionForCwd: (cwd: string, approvalMode?: ApprovalMode) =>
-    ipcRenderer.invoke(IPC.OmpNewSession, cwd, approvalMode),
+  newSessionForCwd: (tempKey: string, cwd: string, approvalMode?: ApprovalMode) =>
+    ipcRenderer.invoke(IPC.OmpNewSession, tempKey, cwd, approvalMode),
   release: (sessionPath: string) => ipcRenderer.invoke(IPC.OmpRelease, sessionPath),
   renameKey: (oldKey: string, newKey: string) => ipcRenderer.invoke(IPC.OmpRenameKey, oldKey, newKey),
   listSessions: (cwd?: string) => ipcRenderer.invoke(IPC.SessionList, cwd),

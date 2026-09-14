@@ -362,12 +362,16 @@ function registerIpc(): void {
     await pool.acquire(sessionPath, cwd, approvalMode ?? 'write', hooks);
   });
 
-  ipcMain.handle(IPC.OmpNewSession, async (_e, cwd: string, approvalMode?: ApprovalMode) => {
+  ipcMain.handle(IPC.OmpNewSession, async (_e, tempKeyFromRenderer: string, cwd: string, approvalMode?: ApprovalMode) => {
     if (!pool) throw new Error('pool not initialized');
     // 新建会话：spawn 不带 -r/-c（新 .jsonl），用 tempKey 绑定。
     // 真实 path 在首条消息 agent_end 后落盘，renderer refreshSessions 时迁移 tempKey→realPath。
-    // 用 crypto.randomUUID 作 key，杜绝 Date.now + 4 位随机的碰撞可能（issue 79）。
-    const tempKey = '__new_' + randomUUID();
+    // tempKey 由渲染层生成并传入（2026-09-14 串台修复）：渲染层在 spawn 前
+    // 就 setCurrentSessionPath(tempKey)，消除"await spawn 完成才切指针"的 ~2.8s 空窗期
+    // （空窗期内回车会把 prompt 真实发给旧会话）。为兼容旧调用，非法/缺失时兜底自生成。
+    const tempKey = typeof tempKeyFromRenderer === 'string' && tempKeyFromRenderer.startsWith('__new_')
+      ? tempKeyFromRenderer
+      : '__new_' + randomUUID();
     // 读取持久化的系统提示词 + 钩子，注入到新会话。
     const wf = await loadWorkspacesFile();
     const systemPrompt = wf.systemPrompt;

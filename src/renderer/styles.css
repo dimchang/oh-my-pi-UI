@@ -922,12 +922,13 @@ body {
   background: hsl(var(--bg-200) / 0.4);
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
+/* 摘要含单位（tokens / s），不用 uppercase —— 否则会渲染成 "5.6K TOKENS · 403.1S" */
 .thinking > summary {
   cursor: pointer;
   list-style: none;
   font-size: 11px;
   font-weight: 600;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.4px;
   color: hsl(var(--text-400));
   padding: 5px 12px;

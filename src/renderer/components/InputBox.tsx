@@ -257,6 +257,12 @@ export const InputBox: React.FC<{
   const submit = (modeOverride?: 'send' | 'guide' | 'queue') => {
     const text = draft.trim();
     if (!text || !ready || isAborting || submittingRef.current) return;
+    // P0-2 双保险（2026-09-14）：新建会话 spawn 在途期间冻结输入，防止消息在指针
+    // 切换的任何遗漏时序分支里被投给旧会话。草稿保留在输入框，稍后可直接重发。
+    if (useApp.getState().creatingSession) {
+      useApp.getState().pushToast('正在新建会话，请稍候…', 'info');
+      return;
+    }
     let mode: 'send' | 'guide' | 'queue' | null = null;
     if (modeOverride) {
       mode = modeOverride;

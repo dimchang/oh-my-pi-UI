@@ -77,8 +77,8 @@ export const rpc = {
   // ---- 进程池 ----
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
     window.omp.acquire(sessionPath, cwd, approvalMode),
-  newSessionForCwd: (cwd: string, approvalMode?: ApprovalMode) =>
-    window.omp.newSessionForCwd(cwd, approvalMode),
+  newSessionForCwd: (tempKey: string, cwd: string, approvalMode?: ApprovalMode) =>
+    window.omp.newSessionForCwd(tempKey, cwd, approvalMode),
   release: (sessionPath: string) => window.omp.release(sessionPath),
   renameKey: (oldKey: string, newKey: string) => window.omp.renameKey(oldKey, newKey),
 

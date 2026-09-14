@@ -124,7 +124,12 @@ export default function App(): React.ReactElement {
   const migrateRetryCount = useRef<Map<string, number>>(new Map());
   const migrateRetryTimers = useRef<Map<string, number>>(new Map());
   /** migrateTempSession 自引用（重试调度用），定义后回填。 */
-  const migrateRef = useRef<(tempPath?: string) => void>(() => undefined);
+  const migrateRef = useRef<(tempPath?: string) => void | Promise<void>>(() => undefined);
+  /** 已提交过消息的 temp 会话（2026-09-14 修复 P0-4：收窄空 temp 静默丢弃判据）。
+   *  旧判据只看「渲染层缓冲为空」，但错投场景（消息发去了别的会话）下缓冲也为空，
+   *  会让用户实际用过的 temp 会话被 onSelectSession 静默清掉。
+   *  onSend/onGuide/onQueue 成功 append 后记入；discardTempSession / 迁移成功后清除。 */
+  const tempSubmittedKeys = useRef<Set<string>>(new Set());
 
   /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
    *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
@@ -137,7 +142,7 @@ export default function App(): React.ReactElement {
    *   2) 兜底清扫所有残留的 __new_ 占位；
    *   3) cwd 取占位条目自带的 x.cwd（不再依赖"当前工作空间"——切走后也不失准）；
    *   4) claimedRealPaths 防止多个 temp 认领同一个真实 path。 */
-  const migrateTempSession = useCallback((tempPath?: string) => {
+  const migrateTempSession = useCallback(async (tempPath?: string) => {
     const st = useApp.getState();
     // 组装待迁移目标：指定优先，兜底扫残留
     const targets = new Set<string>();
@@ -161,16 +166,32 @@ export default function App(): React.ReactElement {
       const wsCwd = st.sessions.find((x) => x.path === cur)?.cwd;
       const cwd = wsCwd ?? st.currentWorkspace()?.cwd;
       if (!cwd) { done(); continue; }
-      // 用"新建前快照"找真正刚落盘的新会话，而不是靠 mtime 猜（否则首条消息 agent_end 前可能命中旧会话）。
-      const candidates = st.sessions
-        .filter((x) =>
-          cwdKey(x.cwd) === cwdKey(cwd)
-          && x.path !== cur
-          && !knownSessionPathsBeforeNew.current.has(x.path)
-          && !claimedRealPaths.current.has(x.path))
-        .sort((a, b) => b.mtime - a.mtime);
-      const newest = candidates[0];
-      if (!newest || newest.path === cur) {
+      // 真实 path 解析（2026-09-14 修复）：优先用 omp 自报的 sessionFile —— rpc get_state
+      // 返回该字段，探针 E3 验证其准确（omp spawn 时即分配好落盘路径）。
+      // 旧实现纯靠「新建前快照 + mtime 最新」扫盘猜测，存在误迁到旧会话的风险；
+      // 扫盘匹配仅在进程离线 / 取不到 sessionFile 时兜底。
+      let realPath: string | undefined;
+      try {
+        const r = await rpc.getState(cur);
+        if (r.success && r.data) {
+          const sf = (r.data as { sessionFile?: unknown }).sessionFile;
+          if (typeof sf === 'string' && sf.length > 0 && !sf.startsWith('__new_')) {
+            realPath = sf;
+          }
+        }
+      } catch { /* 进程离线 → 走扫盘兜底 */ }
+      if (realPath && claimedRealPaths.current.has(realPath)) realPath = undefined;
+      if (!realPath) {
+        const candidates = st.sessions
+          .filter((x) =>
+            cwdKey(x.cwd) === cwdKey(cwd)
+            && x.path !== cur
+            && !knownSessionPathsBeforeNew.current.has(x.path)
+            && !claimedRealPaths.current.has(x.path))
+          .sort((a, b) => b.mtime - a.mtime);
+        realPath = candidates[0]?.path;
+      }
+      if (!realPath) {
         // 落盘竞态：扫盘时真实 .jsonl 还不可见。安排有限次延迟重试（1.2s × 8 ≈ 10s），
         // 成功或超限后停止；重试前确认目标仍存在（切走时可能已被 discard 清理）。
         done();
@@ -198,56 +219,57 @@ export default function App(): React.ReactElement {
       migrateRetryCount.current.delete(cur);
       const pendingTimer = migrateRetryTimers.current.get(cur);
       if (pendingTimer) { window.clearTimeout(pendingTimer); migrateRetryTimers.current.delete(cur); }
-      claimedRealPaths.current.add(newest.path);
-      knownSessionPathsBeforeNew.current.add(newest.path);
+      claimedRealPaths.current.add(realPath);
+      knownSessionPathsBeforeNew.current.add(realPath);
+      tempSubmittedKeys.current.delete(cur);
       const buf = st.sessionsMap[cur];
       const ps = st.procStateMap[cur];
       const sessionsMap = { ...st.sessionsMap };
       delete sessionsMap[cur];
-      if (buf) sessionsMap[newest.path] = buf;
+      if (buf) sessionsMap[realPath] = buf;
       const procStateMap = { ...st.procStateMap };
       delete procStateMap[cur];
-      if (ps) procStateMap[newest.path] = ps;
+      if (ps) procStateMap[realPath] = ps;
       // 关键：pending UI 请求（如工具确认弹窗）也带着旧 __new_ temp key，
       // 若不重定向会指向已离线的旧进程 → 用户点确认报 "omp process not online"。
       // 这里把 uiQueue 里 sessionPath===cur 的请求一并改到真实 path（主进程 renameKey 已同步迁移 pin）。
       const uiQueue = st.uiQueue.map((q) =>
-        q.sessionPath === cur ? { ...q, sessionPath: newest.path } : q,
+        q.sessionPath === cur ? { ...q, sessionPath: realPath } : q,
       );
       // 移除临时占位条目（真实 path 已由 refreshSessions 写入 sessions）；
       // 同时把"落盘前就被重命名"的覆盖名从 tempKey 迁移到真实 path，避免改名丢失。
       const sessionNames = { ...st.sessionNames };
       const renamed = sessionNames[cur];
       delete sessionNames[cur];
-      if (renamed && !sessionNames[newest.path]) sessionNames[newest.path] = renamed;
+      if (renamed && !sessionNames[realPath]) sessionNames[realPath] = renamed;
       st.setState({
         sessionsMap,
         procStateMap,
         // 仅当迁移动的是当前会话才切换显示；后台 temp 的迁移不打扰用户正在看的会话
-        ...(st.currentSessionPath === cur ? { currentSessionPath: newest.path } : {}),
+        ...(st.currentSessionPath === cur ? { currentSessionPath: realPath } : {}),
         uiQueue,
         sessions: st.sessions.filter((x) => x.path !== cur),
         sessionNames,
       });
-      void rpc.renameKey(cur, newest.path).then(done, done);
+      void rpc.renameKey(cur, realPath).then(done, done);
     }
   }, []);
   // 回填自引用，供落盘竞态重试调度
   migrateRef.current = migrateTempSession;
 
-  /** 新建会话后：设为 current + 清缓冲 + 刷新列表/状态。newSessionForCwd 已返回新 path。 */
-  const resolveAndSelectNewSession = useCallback(async (newSessionPath: string, cwd?: string): Promise<void> => {
+  /** 新建会话的「乐观选中」（同步，spawn 前调用）：
+   *  切指针 + 清缓冲 + 侧栏占位。2026-09-14 串台修复：旧实现 await spawn 完成后才切
+   *  currentSessionPath，存在 ~2.8s 空窗期（实测 2524~2951ms），期间输入框可用而指针仍指
+   *  旧会话 → 回车把 prompt 真实发给旧会话进程。现在指针在 spawn 前就切走，空窗期不存在。 */
+  const resolveAndSelectNewSession = useCallback((newSessionPath: string, cwd?: string): void => {
     useApp.getState().setCurrentSessionPath(newSessionPath);
-    useApp.getState().setProcState(newSessionPath, { status: 'online' });
     useApp.getState().resetChat();
     // 新会话统计从零开始，先清掉旧会话残留（refreshState 会重新拉取）
     useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined });
     // 乐观插入占位：新会话首条消息 agent_end 才落盘 .jsonl，在此之前先在侧栏显示，
     // 否则用户要等 LLM 回完才能看到刚开的会话（setSessions 会保留 __new_ 占位不被扫盘冲掉）。
     if (cwd) useApp.getState().upsertSessionPlaceholder(newSessionPath, cwd);
-    await refreshSessions();
-    await refreshState(newSessionPath);
-  }, [refreshSessions, refreshState]);
+  }, []);
 
   /** 加载 workspaces 文件并补全"扫盘发现的但 store 里没有"的工作空间。 */
   const loadAndReconcileWorkspaces = useCallback((): void => {
@@ -381,10 +403,8 @@ export default function App(): React.ReactElement {
             //    但明确提示"上下文不可恢复"，不再静默换壳。
             if (sessionPath.startsWith('__new_')) {
               void refreshSessions()
-                .then(() => {
-                  migrateTempSession(sessionPath);
-                  return useApp.getState();
-                })
+                .then(() => migrateTempSession(sessionPath)) // await 迁移完成再快照（migrate 现为 async）
+                .then(() => useApp.getState())
                 .then((st2) => {
                   if (!st2.procStateMap[sessionPath]) return; // 已迁移，走真实 path 懒恢复
                   useApp.getState().pushToast('⚠️ 新会话尚未保存到磁盘，进程重启后本轮对话上下文无法恢复', 'warning');
@@ -472,7 +492,10 @@ export default function App(): React.ReactElement {
       // temp key 会话直接发给它绑定的进程即可；agent_end 时 migrateTempSession 会正确迁移到真实 path。
       // 不在发送前做 mtime 猜测式迁移——那会在真实 .jsonl 落盘前误迁到旧会话（issue: 新会话输入串到旧会话）。
       await rpc.acquire(sp!, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text, { attachments });
+      // 显式传 sp（2026-09-14 修复 P0-3）：appendUserMessage 内部不再重读 currentSessionPath，
+      // 杜绝两次 await 之间指针切换导致「气泡进 X、prompt 进 Y」。
+      useApp.getState().appendUserMessage(text, { attachments }, sp);
+      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
       await rpc.prompt(sp!, promptText, imageRefs);
       refreshSessions();
     };
@@ -503,7 +526,9 @@ export default function App(): React.ReactElement {
       const imageRefs = await collectImageRefs(attachments);
       // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
       await rpc.acquire(sp!, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text, { steered: true, attachments });
+      // 显式传 sp（同 onSend，P0-3）：气泡与 steer 目标必须同一会话
+      useApp.getState().appendUserMessage(text, { steered: true, attachments }, sp);
+      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
       await rpc.steer(sp!, promptText, imageRefs);
       refreshSessions();
     };
@@ -527,7 +552,9 @@ export default function App(): React.ReactElement {
       const imageRefs = await collectImageRefs(attachments);
       // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
       await rpc.acquire(sp!, cwd, approvalMode);
-      useApp.getState().appendUserMessage(text, { queued: true, attachments });
+      // 显式传 sp（同 onSend，P0-3）：气泡与 follow_up 目标必须同一会话
+      useApp.getState().appendUserMessage(text, { queued: true, attachments }, sp);
+      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
       await rpc.followUp(sp!, promptText, imageRefs);
       refreshSessions();
     };
@@ -600,12 +627,16 @@ export default function App(): React.ReactElement {
       return false;
     }
     creatingSession.current = true;
+    // 同步到 store（P0-2 双保险）：InputBox 在此期间冻结输入，即使还有别的时序分支，
+    // 也不会把消息投给旧会话。
+    useApp.getState().setState({ creatingSession: true });
     try {
       // doNewSession 声明在本函数之后（const TDZ），不能进依赖数组；
       // 它是稳定 useCallback（依赖 pushToast / resolveAndSelectNewSession 均稳定），闭包不会过期。
       return await doNewSession(cwd);
     } finally {
       creatingSession.current = false;
+      useApp.getState().setState({ creatingSession: false });
     }
   }, [pushToast]);
 
@@ -623,21 +654,37 @@ export default function App(): React.ReactElement {
       st.setCurrentWorkspaceId(target.id);
       st.persistWorkspaces();
     }
+    // tempKey 渲染层生成（替代旧实现"主进程 spawn 完才返回 path 再切指针"）：
+    // 先切指针 + 占位，再 await spawn —— 空窗期不存在，期间发送的消息会正确路由到
+    // tempKey 进程（pool.acquire 对在途 spawning 的同 key 会复用同一个 pending promise）。
+    const tempKey = '__new_' + randomUUID();
+    const prevSessionPath = st.currentSessionPath;
+    // 先快照当前已知真实 path，tempKey→realPath 迁移时用它识别真正的新会话（兜底路径），避免误迁到旧会话。
+    knownSessionPathsBeforeNew.current = new Set(
+      st.sessions.map((s) => s.path).filter((p) => !p.startsWith('__new_')),
+    );
+    resolveAndSelectNewSession(tempKey, targetCwd);
     try {
       pushToast('正在新建会话…', 'info');
-      // 多进程：spawn 不带 -c（新 .jsonl），主进程 listSessions 解析新 path 返回
-      // 先快照当前已知真实 path，tempKey→realPath 迁移时用它识别真正的新会话，避免误迁到旧会话。
-      knownSessionPathsBeforeNew.current = new Set(
-        st.sessions.map((s) => s.path).filter((p) => !p.startsWith('__new_')),
-      );
-      const { sessionPath } = await rpc.newSessionForCwd(targetCwd, targetMode);
-      await resolveAndSelectNewSession(sessionPath, targetCwd);
+      // 多进程：spawn 不带 -c（新 .jsonl），tempKey 已在上方先行选中
+      await rpc.newSessionForCwd(tempKey, targetCwd, targetMode);
+      useApp.getState().setProcState(tempKey, { status: 'online' });
+      await refreshSessions();
+      await refreshState(tempKey);
       return true;
     } catch (e) {
+      // spawn 失败：清占位 + 回滚指针，避免留下一个没有进程的 __new_ 僵尸占位。
+      // discardTempSession 声明在本函数之后（const TDZ），不能进依赖数组；其依赖
+      // 稳定（refs + rpc），闭包捕获首个 render 的实例，行为一致。
+      discardTempSession(tempKey);
+      if (!useApp.getState().currentSessionPath && prevSessionPath && !prevSessionPath.startsWith('__new_')) {
+        useApp.getState().setCurrentSessionPath(prevSessionPath);
+        useApp.getState().loadSessionMessages(prevSessionPath);
+      }
       pushToast(`新建会话失败：${e instanceof Error ? e.message : String(e)}`, 'error');
       return false;
     }
-  }, [pushToast, resolveAndSelectNewSession]);
+  }, [pushToast, resolveAndSelectNewSession, refreshSessions, refreshState]);
 
   // 启动时加载会话列表，初始化首个显示会话（取 currentWorkspace 下 mtime 最大者，懒 acquire）
   useEffect(() => {
@@ -652,6 +699,9 @@ export default function App(): React.ReactElement {
         pushToast('还没有可用的工作区，请点击侧栏「打开文件夹」选择一个目录', 'info');
         return;
       }
+      // P1 护栏（2026-09-14 修复）：仅当当前没有任何选中会话时才自动选 mtime 最新会话。
+      // 旧实现无条件抢指针——用户已进入某个（新）会话时会被强行切回旧会话。
+      if (st.currentSessionPath) return;
       const newest = st.sessions
         .filter((x) => cwdKey(x.cwd) === cwdKey(cwd))
         .sort((a, b) => b.mtime - a.mtime)[0];
@@ -692,6 +742,7 @@ export default function App(): React.ReactElement {
     // 清理并发保护 / 快照集合里残留的 key，避免污染后续新建会话
     migratingTempKeys.current.delete(path);
     knownSessionPathsBeforeNew.current.delete(path);
+    tempSubmittedKeys.current.delete(path);
     const wasCurrent = st.currentSessionPath === path;
     useApp.getState().setState({
       sessionsMap,
@@ -709,8 +760,11 @@ export default function App(): React.ReactElement {
     const st = useApp.getState();
     const cur = st.currentSessionPath;
     // 切走时：若当前是"用户还没发过消息的空 temp 占位会话"，自动丢弃，避免留下删不掉的僵尸会话。
+    // 判据（2026-09-14 收窄）：缓冲为空 **且** 从未提交过消息（tempSubmittedKeys）——
+    // 只看缓冲为空会在错投场景下把用户实际用过的 temp 会话误清。
     // （正在生成中的 temp 会话缓冲非空，不会命中此分支，等 agent_end 由 migrateTempSession 正常迁移。）
-    if (cur && cur.startsWith('__new_') && cur !== s.path && !(st.sessionsMap[cur]?.length)) {
+    if (cur && cur.startsWith('__new_') && cur !== s.path
+        && !(st.sessionsMap[cur]?.length) && !tempSubmittedKeys.current.has(cur)) {
       discardTempSession(cur);
     }
     const targetKey = cwdKey(s.cwd);
@@ -1133,6 +1187,12 @@ export default function App(): React.ReactElement {
 
 /** 是否 Windows（模块级常量，避免每次 render 都访问 window.omp.platform）。 */
 const IS_WIN32 = window.omp?.platform === 'win32';
+
+/** 渲染层生成 tempKey（新建会话先切指针再 spawn 用）。crypto.randomUUID 在非安全上下文
+ *  可能缺失，兜底一个足够防碰撞的组合（同毫秒 + 两段随机）。 */
+const randomUUID = (): string =>
+  globalThis.crypto?.randomUUID?.()
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${Math.random().toString(36).slice(2, 10)}`;
 
 /** Diff 右栏面板：展示从 tool_execution_end 提取的 unified diff 列表。 */
 const DiffPanel: React.FC = () => {

@@ -123,7 +123,15 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'tool' | string;
   parts: MessagePart[];
   streaming?: boolean;
-  usage?: { totalTokens?: number; duration?: number };
+  /** 用量：totalTokens 是**该次请求的上下文总量**（input+cacheRead+output，不可跨请求累加）；
+   *  outputTokens/reasoningTokens 是本次生成量（可跨请求求和，回合摘要行用）；duration 为该请求耗时。 */
+  usage?: {
+    totalTokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    reasoningTokens?: number;
+    duration?: number;
+  };
   /** stopReason==='error' 时的错误信息（模型 404/限流等） */
   error?: string;
   /** true=该用户消息来自 steer（引导），UI 用 distinct 样式 + 标记渲染 */
@@ -173,6 +181,9 @@ interface AppState {
   isStreaming: boolean;
   /** 用户已点停止、正在等 omp 响应 abort（防止重复点击） */
   isAborting: boolean;
+  /** 正在新建会话（spawn 在途）。InputBox 据此冻结输入——2026-09-14 修复 P0-2 双保险：
+   *  即使指针切换存在遗漏的时序分支，也不会在新建期间把消息投给旧会话。 */
+  creatingSession: boolean;
   messages: ChatMessage[];
   /** per-session 消息缓冲：sessionPath -> ChatMessage[]。
    *  每会话一进程，帧带 __sessionPath 路由到对应缓冲槽，UI 显示 currentSessionPath 的槽。 */
@@ -326,7 +337,9 @@ interface AppState {
   /** 从磁盘读某会话历史并缓冲 */
   loadSessionMessages(path: string): void;
   /** 往当前显示会话追加一条 user 消息（onSend 用）。opts.steered=true 标记为 steer（改写方向）。 */
-  appendUserMessage(text: string, opts?: { steered?: boolean; queued?: boolean; attachments?: Attachment[] }): void;
+  /** 追加用户消息气泡。sessionPath 显式传入（2026-09-14 修复：内部重读 currentSessionPath
+   *  会与 onSend 持有的快照失配——两次 await 之间指针切换会让气泡与 prompt 进不同会话）。 */
+  appendUserMessage(text: string, opts?: { steered?: boolean; queued?: boolean; attachments?: Attachment[] }, sessionPath?: string): void;
   resetChat(): void;
   // 进程池状态
   /** 部分更新某会话的进程状态（合并写入） */
@@ -370,6 +383,20 @@ function cssId(path: string, mode: string): string {
   return `css-${(h >>> 0).toString(16)}`;
 }
 
+
+/** AgentMessage.usage → UI usage。原始 Usage 里 totalTokens 是「上下文总量」（逐请求重复计数），
+ *  output/reasoningTokens 才是可累加的生成量 —— 回合摘要按后者求和（见 utils/turn-view.ts）。 */
+function toUsage(msg: AgentMessage): ChatMessage['usage'] {
+  const u = msg.usage;
+  if (!u) return undefined;
+  return {
+    totalTokens: u.totalTokens,
+    inputTokens: u.input,
+    outputTokens: u.output,
+    reasoningTokens: u.reasoningTokens,
+    duration: msg.duration,
+  };
+}
 
 /** 把 omp 的全量 content[] 映射为 UI parts（text/thinking）。
  *  实测 content type 有：text / output_text（assistant 正文）/ thinking / toolCall。
@@ -510,6 +537,7 @@ export const useApp = create<AppState>((set, get) => ({
   ompExited: false,
   isStreaming: false,
   isAborting: false,
+  creatingSession: false,
   messages: [],
   sessionsMap: {},
   procStateMap: {},
@@ -988,7 +1016,7 @@ export const useApp = create<AppState>((set, get) => ({
             role: m.role,
             parts,
             streaming: false,
-            usage: m.usage ? { totalTokens: m.usage.totalTokens, duration: m.duration } : undefined,
+            usage: toUsage(m),
             error: errorText,
             // 历史回放标记重建（2026-07-27 probe-followup.mjs v3 实测确认）：
             //   - steer（引导）：omp 在 JSONL 内层 message 持久化 "steering":true → 可重建 steered。
@@ -1011,9 +1039,11 @@ export const useApp = create<AppState>((set, get) => ({
     );
   },
 
-  appendUserMessage: (text, opts) => {
+  appendUserMessage: (text, opts, sessionPath) => {
     const st = get();
-    const path = st.currentSessionPath ?? '';
+    // 优先用调用方显式传入的 sessionPath（onSend/onGuide/onQueue 的快照）；
+    // 未传时才退回 currentSessionPath（兼容旧调用点）。
+    const path = sessionPath ?? st.currentSessionPath ?? '';
     const userMsg: ChatMessage = {
       id: `u${Date.now()}_${userSeq++}`,
       role: 'user',
@@ -1120,7 +1150,7 @@ export const useApp = create<AppState>((set, get) => ({
               ...m,
               parts,
               streaming: false,
-              usage: msg.usage ? { totalTokens: msg.usage.totalTokens, duration: msg.duration } : undefined,
+              usage: toUsage(msg),
               error: errorText,
             };
             matched = true;
@@ -1142,7 +1172,7 @@ export const useApp = create<AppState>((set, get) => ({
                 ? parts
                 : [{ kind: 'text', text: `⚠️ **模型请求失败**\n\n${errorText}` }],
               streaming: false,
-              usage: msg.usage ? { totalTokens: msg.usage.totalTokens, duration: msg.duration } : undefined,
+              usage: toUsage(msg),
               error: errorText,
             });
             bufferTouched = true;

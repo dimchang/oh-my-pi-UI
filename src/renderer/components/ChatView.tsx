@@ -1,11 +1,17 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useApp, isImageFile, type ChatMessage } from '../store';
+import { useApp, isImageFile, type ChatMessage, type MessagePart, type TextPart } from '../store';
 import { ToolCard } from './ToolCard';
 import { Icon } from './Icon';
 import { Minimap } from './Minimap';
+import {
+  computeTurnStats,
+  formatTurnSummary,
+  groupTurns,
+  splitTurnParts,
+} from '../utils/turn-view';
 
 /** 单条消息附件芯片：图片懒加载缩略图（进入视口才请求 data URL），文件走原芯片。
  *  缩略图加载失败（文件被清理/无权限）自动回退为文件芯片，绝不让整条消息渲染崩溃或白屏。 */
@@ -202,7 +208,29 @@ function looksLikeFileContent(text: string): boolean {
   }
   return false;
 }
+/** 渲染一组文本 part（最终回答 / 用户提示词）：markdown，或「看起来像源码/文件内容」时
+ *  按代码块渲染并默认折叠（避免 JSDoc `*`、路径列表被 markdown 错误解析成列表）。 */
+const TextParts: React.FC<{ parts: TextPart[] }> = ({ parts }) => (
+  <>
+    {parts.map((p, i) => {
+      const text = p.text;
+      if (looksLikeFileContent(text)) {
+        return (
+          <CollapsibleCodeBlock key={`text-${i}`} codeText={text}>
+            <code>{text}</code>
+          </CollapsibleCodeBlock>
+        );
+      }
+      return (
+        <ReactMarkdown key={`text-${i}`} remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+          {text}
+        </ReactMarkdown>
+      );
+    })}
+  </>
+);
 
+/** 用户消息（及其它非 assistant 角色）气泡。assistant 的回合由 AssistantTurn 渲染。 */
 const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage }) {
   const [copied, setCopied] = useState(false);
   // 复制用户提示词：拼接全部 text part（思考/工具卡/附件不参与）
@@ -223,54 +251,7 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
         {msg.steered ? (<><Icon name="guide" size={12} /> 引导 (mid-run)</>) : msg.queued ? (<><Icon name="queue" size={12} /> 排队</>) : (msg.role === 'user' ? '你' : 'MyPi')}{msg.error ? ' · 出错' : ''}
       </div>
       <div className="msg-body">
-        {msg.parts.map((p, i) => {
-          if (p.kind === 'text' && p.narration) {
-            // 过程说明（中间叙述）：默认折叠，只留一行摘要；用户需要时点开看全文。
-            // 最终回答由 omp 作为独立消息（不含 toolCall）送达 → 不折叠，始终可见。
-            return (
-              <details key={`narration-${i}`} className="thinking narration">
-                <summary>过程说明</summary>
-                <div className="thinking-body markdown">
-                  <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
-                    {p.text}
-                  </ReactMarkdown>
-                </div>
-              </details>
-            );
-          }
-          if (p.kind === 'text') {
-            // 若文本像是直接贴出的文件/代码内容，按代码块渲染并默认折叠，
-            // 避免 JSDoc `*`、路径列表等被 markdown 错误解析。
-            if (looksLikeFileContent(p.text)) {
-              return (
-                <CollapsibleCodeBlock key={`text-${i}`} codeText={p.text}>
-                  <code>{p.text}</code>
-                </CollapsibleCodeBlock>
-              );
-            }
-            return (
-              <ReactMarkdown
-                key={`text-${i}`}
-                remarkPlugins={REMARK_PLUGINS}
-                components={MARKDOWN_COMPONENTS}
-              >
-                {p.text}
-              </ReactMarkdown>
-            );
-          }
-          if (p.kind === 'thinking') {
-            return (
-              <details key={`thinking-${i}`} className="thinking">
-                <summary>思考过程</summary>
-                <div className="thinking-body">{p.text}</div>
-              </details>
-            );
-          }
-          if (p.kind === 'tool') {
-            return <ToolCard key={`tool-${p.toolCallId}`} tool={p} />;
-          }
-          return null;
-        })}
+        <TextParts parts={msg.parts.filter((p): p is TextPart => p.kind === 'text' && !p.narration)} />
         {msg.streaming && <span style={{ color: 'var(--text-faint)' }}>▍</span>}
       </div>
       {msg.role === 'user' && msg.attachments && msg.attachments.length > 0 && (
@@ -290,11 +271,63 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
           <Icon name="copy" size={13} />
         </button>
       )}
-      {msg.usage?.totalTokens !== undefined && (
+      {msg.role !== 'assistant' && msg.usage?.totalTokens !== undefined && (
         <div className="msg-usage">
           {msg.usage.totalTokens} tokens{msg.usage.duration ? ` · ${(msg.usage.duration / 1000).toFixed(1)}s` : ''}
         </div>
       )}
+    </div>
+  );
+});
+
+/** 一个回合的 assistant 部分 —— 用户视角的「一个回答」。
+ *
+ *  渲染结构严格为：**一行**「思考过程」折叠条 → 详细最终回复。
+ *  omp 一次 run 会产生成百条 assistant 消息（每次模型响应一条），全部折叠进这**同一条**折叠条
+ *  （thinking / 工具卡 / 过程说明按原序展开可见），摘要行给出回合级汇总；最终回复留在折叠条外。 */
+const AssistantTurn = React.memo(function AssistantTurn({ msgs }: { msgs: ChatMessage[] }) {
+  const first = msgs[0]!;
+  const streaming = msgs.some((m) => m.streaming);
+  const { folded, reply } = splitTurnParts(msgs, streaming);
+  const summary = formatTurnSummary(computeTurnStats(msgs));
+  const error = msgs.find((m) => m.error)?.error;
+  // 折叠体内大回合可达数百个 ToolCard —— 折叠状态下不挂载（`<details>` 的 children 仍会进 DOM），
+  // 展开才渲染，避免「打开会话把几百张工具卡全建出来」的卡顿。
+  const [open, setOpen] = useState(false);
+  return (
+    <div
+      className="message assistant"
+      data-msg-id={first.id}
+      style={error ? { borderLeft: '2px solid var(--red)', paddingLeft: 10 } : undefined}
+    >
+      <div className="msg-role assistant" style={error ? { color: 'var(--red)' } : undefined}>
+        MyPi{error ? ' · 出错' : ''}
+      </div>
+      <div className="msg-body">
+        {folded.length > 0 && (
+          <details
+            className="thinking narration"
+            onToggle={(e) => setOpen(e.currentTarget.open)}
+          >
+            <summary>{summary}</summary>
+            {open && (
+              <div className="thinking-body markdown">
+                {folded.map((p, i) => {
+                  if (p.kind === 'thinking') return <div key={`think-${i}`} style={{ whiteSpace: 'pre-wrap' }}>{p.text}</div>;
+                  if (p.kind === 'tool') return <ToolCard key={`tool-${p.toolCallId}`} tool={p} />;
+                  return (
+                    <ReactMarkdown key={`nar-${i}`} remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+                      {(p as TextPart).text}
+                    </ReactMarkdown>
+                  );
+                })}
+              </div>
+            )}
+          </details>
+        )}
+        <TextParts parts={reply} />
+        {streaming && <span style={{ color: 'var(--text-faint)' }}>▍</span>}
+      </div>
     </div>
   );
 });
@@ -341,6 +374,9 @@ export const ChatView: React.FC = () => {
   const maxStart = Math.max(0, total - WINDOW_SIZE);
   const startIdx = Math.max(0, Math.min(windowStart, maxStart));
   const visible = messages.slice(startIdx, startIdx + WINDOW_SIZE);
+  // 按回合分组（useMemo：messages/窗口无关的 re-render 不重建数组，AssistantTurn 的
+  // React.memo 才真正生效 —— 每次 render 新建数组会让 memo 全量失效）。
+  const turns = useMemo(() => groupTurns(visible), [messages, startIdx]);
   const hasMore = startIdx > 0;
   const showEmpty = total === 0 && !isCompacting && !isRetrying;
   // 有会话路径但消息为空 = 正在异步加载（首览历史会话）
@@ -530,7 +566,15 @@ export const ChatView: React.FC = () => {
                     ↑ 滚动加载更多（剩余 {startIdx} 条）
                   </div>
                 )}
-                {visible.map((m) => <MessageItem key={m.id} msg={m} />)}
+                {/* 一个回合渲染为：用户消息 → assistant 回合（一行折叠条 + 最终回复）。
+                    注意两者必须**都**渲染 —— 回合的 assistant 消息挂在同一条用户消息的 Turn 上，
+                    只渲染其中一个就会把整个回答吞掉（2026-09-13 用户截图：只剩用户气泡、回复全消失）。 */}
+                {turns.map((t, i) => (
+                  <React.Fragment key={t.user ? t.user.id : `t${i}-${t.asst[0]?.id ?? 'x'}`}>
+                    {t.user && <MessageItem msg={t.user} />}
+                    {t.asst.length > 0 && <AssistantTurn msgs={t.asst} />}
+                  </React.Fragment>
+                ))}
               </>
             )}
             {isCompacting && (

@@ -365,8 +365,9 @@ export interface OmpApi {
   send<T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T>;
   /** 懒拉起某会话的进程（带 -c 续接历史）。已在线则 no-op。 */
   acquire(sessionPath: string, cwd: string, approvalMode?: ApprovalMode): Promise<void>;
-  /** 新建会话：spawn 不带 -c，返回新 sessionPath（主进程 listSessions 解析最新）。 */
-  newSessionForCwd(cwd: string, approvalMode?: ApprovalMode): Promise<{ sessionPath: string }>;
+  /** 新建会话：spawn 不带 -c，返回新 sessionPath。
+   *  tempKey 由渲染层生成并传入（先切指针再 spawn，消除新建空窗期），非法时主进程兜底自生成。 */
+  newSessionForCwd(tempKey: string, cwd: string, approvalMode?: ApprovalMode): Promise<{ sessionPath: string }>;
   /** 主动淘汰某会话的进程（释放资源，会话历史保留在磁盘）。 */
   release(sessionPath: string): Promise<void>;
   /** 新进程落盘后把临时 key 换成真实 sessionPath（listSessions 解析出的）。 */
