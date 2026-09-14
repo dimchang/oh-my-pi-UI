@@ -382,6 +382,23 @@ export default function App(): React.ReactElement {
       if (sessionPath === useApp.getState().currentSessionPath) {
         useApp.getState().setOmpExited(code);
       }
+      // temp 会话进程退出（含 evict 的 code=null，如权限切换/池淘汰）：先迁移再考虑恢复。
+      // 旧实现只在 code!==0 时走迁移 → evict 路径下 tempKey 永不迁移，指针滞留死 key，
+      // 之后 ensureOnline/acquire(tempKey) 对一个磁盘上不存在的 key 全新 spawn →
+      // 一个用户会话裂成两个 .jsonl（实证 2026-09-14 bet_zp：01a0a046 被杀后 spawn 出 01a0a048）。
+      if (sessionPath.startsWith('__new_')) {
+        void refreshSessions()
+          .then(() => migrateTempSession(sessionPath))
+          .then(() => {
+            const st2 = useApp.getState();
+            // 已迁移：指针/缓冲已切到真实 path，后续 acquire(-r) 完整续接，无需更多动作
+            if (!st2.procStateMap[sessionPath]) return;
+            // 确实没落盘（用户从未发消息）：上下文本就不存在，仅清占位。
+            // 不再对 tempKey respawn —— 那会凭空造出一个孤儿 .jsonl。
+            discardTempSession(sessionPath);
+          });
+        return;
+      }
       // 自动恢复：非正常退出（code !== 0）且非用户主动 release，延迟后尝试重新拉起。
       // 避免崩溃后用户必须手动切换再切回才能继续。
       if (code !== 0 && code !== null) {
@@ -394,24 +411,6 @@ export default function App(): React.ReactElement {
             // 仅当该会话仍处于 offline 状态时才恢复（避免用户已手动操作）
             const psNow = useApp.getState().procStateMap[sessionPath];
             if (psNow?.status !== 'offline') return;
-            // temp key（未落盘的新会话）进程意外死亡：
-            // 1) 先尝试迁移——若 omp 死前其实已把 .jsonl 落盘，迁移到真实 path 后
-            //    由用户下次发消息懒 acquire(-r resume)，上下文完整保留；
-            // 2) 迁移成功则此处不再盲目 respawn（否则会对 tempKey 全新 spawn 出一个
-            //    孤儿 .jsonl，实证 session 01a0346c：切死 01a03457 后误开新会话）；
-            // 3) 迁移失败（确实没落盘）→ 上下文已随进程丢失，仍重新拉起让用户能继续，
-            //    但明确提示"上下文不可恢复"，不再静默换壳。
-            if (sessionPath.startsWith('__new_')) {
-              void refreshSessions()
-                .then(() => migrateTempSession(sessionPath)) // await 迁移完成再快照（migrate 现为 async）
-                .then(() => useApp.getState())
-                .then((st2) => {
-                  if (!st2.procStateMap[sessionPath]) return; // 已迁移，走真实 path 懒恢复
-                  useApp.getState().pushToast('⚠️ 新会话尚未保存到磁盘，进程重启后本轮对话上下文无法恢复', 'warning');
-                  return rpc.acquire(sessionPath, cwd, approvalMode).catch(() => undefined);
-                });
-              return;
-            }
             void rpc.acquire(sessionPath, cwd, approvalMode)
               .then(() => {
                 useApp.getState().pushToast(`会话进程已自动恢复`, 'info');
@@ -471,6 +470,23 @@ export default function App(): React.ReactElement {
   }, []);
 
   // ---- 用户操作 ----
+  /** 发送/引导/排队前的会话 key 解析：temp 会话若进程已离线（被杀/淘汰/退出），
+   *  先尝试迁移到已落盘的真实 .jsonl——否则 acquire(tempKey) 会因 tempKey 在磁盘上
+   *  不存在而全新 spawn，一个用户会话裂成两个（实证 2026-09-14 bet_zp）。
+   *  进程在线或确实未落盘时原样返回。 */
+  const resolveSessionKey = useCallback(async (sp: string): Promise<string> => {
+    if (!sp.startsWith('__new_')) return sp;
+    if (useApp.getState().procStateMap[sp]?.status === 'online') return sp;
+    // 进程离线：落盘过的 temp 会话（首条消息后 omp 即流式写盘，无需等 agent_end）
+    // 一定已能被扫盘看到。migrateTempSession 会把指针/缓冲/pool key 全部迁到真实 path。
+    await refreshSessions();
+    await migrateTempSession(sp);
+    const now = useApp.getState();
+    // 迁移成功：返回真实 path（acquire 会带 -r 续接，上下文完整）
+    if (!now.procStateMap[sp] && now.currentSessionPath) return now.currentSessionPath;
+    return sp;
+  }, [refreshSessions, migrateTempSession]);
+
   const onSend = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
     let sp = st.currentSessionPath;
@@ -489,20 +505,21 @@ export default function App(): React.ReactElement {
     const promptText = buildPromptWithAttachments(text, attachments);
     const doSend = async () => {
       const imageRefs = await collectImageRefs(attachments);
-      // temp key 会话直接发给它绑定的进程即可；agent_end 时 migrateTempSession 会正确迁移到真实 path。
-      // 不在发送前做 mtime 猜测式迁移——那会在真实 .jsonl 落盘前误迁到旧会话（issue: 新会话输入串到旧会话）。
-      await rpc.acquire(sp!, cwd, approvalMode);
-      // 显式传 sp（2026-09-14 修复 P0-3）：appendUserMessage 内部不再重读 currentSessionPath，
+      // temp key 进程若已离线：先迁移到落盘的 realPath，避免 acquire(tempKey) 全新
+      // spawn 裂出第二个会话（2026-09-14 bet_zp 事故根因）。
+      const key = await resolveSessionKey(sp!);
+      await rpc.acquire(key, cwd, approvalMode);
+      // 显式传 key（2026-09-14 修复 P0-3）：appendUserMessage 内部不再重读 currentSessionPath，
       // 杜绝两次 await 之间指针切换导致「气泡进 X、prompt 进 Y」。
-      useApp.getState().appendUserMessage(text, { attachments }, sp);
-      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
-      await rpc.prompt(sp!, promptText, imageRefs);
+      useApp.getState().appendUserMessage(text, { attachments }, key);
+      if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      await rpc.prompt(key, promptText, imageRefs);
       refreshSessions();
     };
     void doSend().catch((err) =>
       pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, resolveSessionKey]);
 
   /** Help 菜单 "Stats" 子项：等同于在当前会话输入 /stats 并提交。 */
   useEffect(() => {
@@ -524,18 +541,19 @@ export default function App(): React.ReactElement {
     const promptText = buildPromptWithAttachments(text, attachments);
     const doGuide = async () => {
       const imageRefs = await collectImageRefs(attachments);
-      // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
-      await rpc.acquire(sp!, cwd, approvalMode);
-      // 显式传 sp（同 onSend，P0-3）：气泡与 steer 目标必须同一会话
-      useApp.getState().appendUserMessage(text, { steered: true, attachments }, sp);
-      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
-      await rpc.steer(sp!, promptText, imageRefs);
+      // 同 onSend：temp key 进程离线时先迁移到落盘 realPath，避免分裂
+      const key = await resolveSessionKey(sp!);
+      await rpc.acquire(key, cwd, approvalMode);
+      // 显式传 key（同 onSend，P0-3）：气泡与 steer 目标必须同一会话
+      useApp.getState().appendUserMessage(text, { steered: true, attachments }, key);
+      if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      await rpc.steer(key, promptText, imageRefs);
       refreshSessions();
     };
     void doGuide().catch((err) =>
       pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, resolveSessionKey]);
 
   /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
   const onQueue = useCallback((text: string, attachments?: Attachment[]) => {
@@ -550,18 +568,19 @@ export default function App(): React.ReactElement {
     const promptText = buildPromptWithAttachments(text, attachments);
     const doQueue = async () => {
       const imageRefs = await collectImageRefs(attachments);
-      // 同 onSend：temp key 不提前迁移，避免误迁到旧会话
-      await rpc.acquire(sp!, cwd, approvalMode);
-      // 显式传 sp（同 onSend，P0-3）：气泡与 follow_up 目标必须同一会话
-      useApp.getState().appendUserMessage(text, { queued: true, attachments }, sp);
-      if (sp!.startsWith('__new_')) tempSubmittedKeys.current.add(sp!);
-      await rpc.followUp(sp!, promptText, imageRefs);
+      // 同 onSend：temp key 进程离线时先迁移到落盘 realPath，避免分裂
+      const key = await resolveSessionKey(sp!);
+      await rpc.acquire(key, cwd, approvalMode);
+      // 显式传 key（同 onSend，P0-3）：气泡与 follow_up 目标必须同一会话
+      useApp.getState().appendUserMessage(text, { queued: true, attachments }, key);
+      if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      await rpc.followUp(key, promptText, imageRefs);
       refreshSessions();
     };
     void doQueue().catch((err) =>
       pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, resolveSessionKey]);
 
   // 中止当前 agent 轮
   const onAbort = useCallback(() => {
@@ -937,27 +956,20 @@ export default function App(): React.ReactElement {
     refreshSessions();
   }, [refreshSessions]);
 
-  // 切换当前工作空间的权限模式：持久化 + release 该工作空间所有在线进程（下次 acquire 用新 mode spawn）。
+  // 切换当前工作空间的权限模式：只持久化，不杀任何在线进程。
+  // 旧实现 release 该工作空间所有在线进程——会把正在生成的回合拦腰杀断（agent 无
+  // agent_end、UI 永远"生成中"），更会把尚未迁移的 temp 会话杀成孤儿指针，之后
+  // ensureOnline(tempKey) 全新 spawn → 一个用户会话裂成两个 .jsonl（实证 2026-09-14
+  // bet_zp：切权限后 01a0a046 被杀、spawn 出 01a0a048，侧栏多出"？"会话）。
+  // 新语义：当前进程继续用旧 mode 跑完；已发出去的确认弹窗照常应答；空闲会话在
+  // 下一次 acquire（切走再切回 / LRU 淘汰后）时自然以新 mode 重生。
   const onChangeApprovalMode = useCallback((mode: ApprovalMode) => {
     const st = useApp.getState();
     const ws = st.currentWorkspace();
     if (!ws) return;
     st.setWorkspaceApprovalMode(ws.id, mode);
     const label = mode === 'yolo' ? 'YOLO · 全自动' : mode === 'always-ask' ? 'Always Ask · 每次询问' : 'Write · 默认';
-    pushToast(`权限模式已切换为「${label}」，新会话生效`, 'info');
-    // release 该工作空间下所有在线进程，下次 acquire 用新 mode spawn
-    for (const s of st.sessions) {
-      if (cwdKey(s.cwd) === cwdKey(ws.cwd)) {
-        const ps = st.procStateMap[s.path];
-        if (ps && ps.status === 'online') {
-          // 先等待 release 成功，再置 offline；release 失败则保持 online，
-          // 避免「状态已是 offline 但进程实际仍在线」的不同步（issue 11）
-          void rpc.release(s.path)
-            .then(() => st.setProcState(s.path, { status: 'offline' }))
-            .catch(() => undefined);
-        }
-      }
-    }
+    pushToast(`权限模式已切换为「${label}」，对之后新拉起/重启的会话进程生效`, 'info');
   }, [pushToast]);
 
   const onAddWorkspace = useCallback((cwd: string) => {

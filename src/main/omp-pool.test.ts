@@ -17,13 +17,16 @@ import * as fs from 'node:fs';
 vi.mock('../../electron/omp-process', () => {
   class MockOmpProcess {
     static instances: MockOmpProcess[] = [];
+    /** 每个实例的构造 opts（resumeSession 等），供断言 spawn 参数 */
+    static optsLog: Array<Record<string, unknown>> = [];
     events: {
       onReady(): void;
       onExit(code: number | null): void;
       onFrame(frame: unknown): void;
       onStderr(line: string): void;
     };
-    constructor(_opts: unknown, events: MockOmpProcess['events']) {
+    constructor(opts: Record<string, unknown>, events: MockOmpProcess['events']) {
+      MockOmpProcess.optsLog.push(opts);
       this.events = events;
       MockOmpProcess.instances.push(this);
     }
@@ -94,6 +97,37 @@ describe('OmpProcessPool tempKey→realPath frame routing', () => {
       { sessionPath: realPath, kind: 'exit', code: 0 },
       { sessionPath: realPath, kind: 'stderr', line: 'hello' },
     ]);
+    pool.killAll();
+  });
+});
+
+describe('OmpProcessPool temp 会话防分裂（2026-09-14 bet_zp 事故回归）', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'omp-pool-split-'));
+  const tempKey = '__new_split-test';
+  const realFile = path.join(cwd, 'fake-real.jsonl');
+
+  it('temp 进程被杀后 acquire(tempKey) 用记忆的 sessionFile -r 续接，不全新 spawn', async () => {
+    const { pool } = makePool();
+    await pool.acquireNew(tempKey, cwd, 'write');
+    pool.evict(tempKey); // 模拟权限切换旧实现 release / 池淘汰杀进程
+    // 注入记忆（模拟 ready 后 get_state.sessionFile 已返回）
+    pool['tempSessionFiles'].set(tempKey, realFile);
+    await pool.acquire(tempKey, cwd, 'write');
+    // 第二个 OmpProcess 构造必须带 resumeSession=realFile（-r 续接，而非全新会话）
+    const { OmpProcess } = await import('../../electron/omp-process');
+    const optsLog = (OmpProcess as unknown as { optsLog: Array<{ resumeSession?: string }> }).optsLog;
+    const second = optsLog[optsLog.length - 1];
+    expect(second?.resumeSession).toBe(realFile);
+    expect(pool.has(tempKey)).toBe(true);
+    pool.killAll();
+  });
+
+  it('无记忆的 tempKey acquire 仍全新 spawn（用户从未发消息的正常路径）', async () => {
+    const { pool } = makePool();
+    await pool.acquireNew('__new_fresh-1', cwd, 'write');
+    const { OmpProcess } = await import('../../electron/omp-process');
+    const optsLog = (OmpProcess as unknown as { optsLog: Array<{ resumeSession?: string }> }).optsLog;
+    expect(optsLog[optsLog.length - 1]?.resumeSession).toBeUndefined();
     pool.killAll();
   });
 });

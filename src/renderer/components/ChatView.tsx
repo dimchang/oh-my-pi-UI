@@ -333,14 +333,18 @@ const AssistantTurn = React.memo(function AssistantTurn({ msgs }: { msgs: ChatMe
 });
 
 /**
- * 固定窗口虚拟化（方案 A，替代 react-virtuoso，v0.4.29）：
- * - 只渲染 messages 的固定窗口（最近 80 条），向上滚动时窗口前移（替换而非增长）。
- * - DOM 恒定为 WINDOW_SIZE 条消息 → 长会话（数千条）翻到最前面也不会 DOM 爆炸（旧版卡顿根源）。
+ * 固定窗口虚拟化（方案 A，替代 react-virtuoso，v0.4.29；v0.5.5 窗口单位改为「回合」）：
+ * - 只渲染 allTurns 的固定窗口（最近 30 个回合），向上滚动时窗口前移（替换而非增长）。
+ * - 窗口单位必须是回合而不是消息条数：一个 80 步的巨型 agent run 折叠后只渲染 ~2 行，
+ *   若窗口整段落入这种 run（80 条全是 assistant 消息、无用户消息），内容高度 < 视口
+ *   → scrollHeight ≈ clientHeight → 产生不了 scroll 事件 → 「滚动加载更多」永远无法
+ *   触发 → 视图死锁，只有跳底按钮能逃出（2026-09-15 用户截图复现，session 01a0a074）。
+ *   按回合切窗保证任何切片至少渲染 30 个回合（≥30 条折叠摘要行），永远可滚。
  * - 打开会话 / 首次异步加载完成：窗口定位到最后 + 滚动到底（看到最近消息）。
  * - 流式时若在底部则跟随；用户上滚后不强行拉回。
  */
-const WINDOW_SIZE = 80;
-const LOAD_MORE = 40;
+const WINDOW_TURNS = 30;
+const LOAD_MORE_TURNS = 15;
 
 /** 空会话占位。 */
 const EmptyHeader: React.FC = () => (
@@ -368,16 +372,43 @@ export const ChatView: React.FC = () => {
   const lastUserScrollAt = useRef(0);
   const prevSessionRef = useRef(currentSessionPath);
   const prevLenRef = useRef(messages.length);
-
+  /** 最近一次 scroll 事件的 scrollTop（所有事件都记，含程序化钉底产生的），
+   *  用于方向判定：用户向上滚哪怕 1px 也立即解除吸底。 */
+  const lastScrollTopRef = useRef(0);
+  /** load-more 进行中标记：窗口前移到 rAF 补偿完成前不再重复触发，
+   *  防止一次快速滚动爆发内多个 scroll 事件把窗口连跳多格（跳过的历史直接看不到）。 */
+  const loadMoreLockRef = useRef(false);
   const total = messages.length;
-  const [windowStart, setWindowStart] = useState(() => Math.max(0, total - WINDOW_SIZE));
-  const maxStart = Math.max(0, total - WINDOW_SIZE);
-  const startIdx = Math.max(0, Math.min(windowStart, maxStart));
-  const visible = messages.slice(startIdx, startIdx + WINDOW_SIZE);
-  // 按回合分组（useMemo：messages/窗口无关的 re-render 不重建数组，AssistantTurn 的
-  // React.memo 才真正生效 —— 每次 render 新建数组会让 memo 全量失效）。
-  const turns = useMemo(() => groupTurns(visible), [messages, startIdx]);
-  const hasMore = startIdx > 0;
+  // 全量回合（消息 → 一问一答回合视图）。窗口在「回合空间」滑动，渲染时切片。
+  const allTurns = useMemo(() => groupTurns(messages), [messages]);
+  const turnCount = allTurns.length;
+  /** 消息下标 → 回合下标映射（Minimap / scrollToMessage 按消息索引跳转时换算窗口位置）。 */
+  const turnIndexOfMsg = useMemo(() => {
+    const map: number[] = [];
+    for (let ti = 0; ti < allTurns.length; ti++) {
+      const t = allTurns[ti]!;
+      if (t.user) map.push(ti);
+      for (let k = 0; k < t.asst.length; k++) map.push(ti);
+    }
+    return map;
+  }, [allTurns]);
+  const [windowStartTurn, setWindowStartTurn] = useState(() => Math.max(0, turnCount - WINDOW_TURNS));
+  const maxStartTurn = Math.max(0, turnCount - WINDOW_TURNS);
+  const startTurn = Math.max(0, Math.min(windowStartTurn, maxStartTurn));
+  const visibleTurns = useMemo(
+    () => allTurns.slice(startTurn, startTurn + WINDOW_TURNS),
+    [allTurns, startTurn],
+  );
+  const hasMore = startTurn > 0;
+  // 「剩余 N 条」仍按消息计数（与用户熟悉的口径一致）：窗口首回合之前的消息总数
+  const remainingMsgs = useMemo(() => {
+    let n = 0;
+    for (let i = 0; i < startTurn; i++) {
+      const t = allTurns[i]!;
+      n += (t.user ? 1 : 0) + t.asst.length;
+    }
+    return n;
+  }, [allTurns, startTurn]);
   const showEmpty = total === 0 && !isCompacting && !isRetrying;
   // 有会话路径但消息为空 = 正在异步加载（首览历史会话）
   const isLoading = total === 0 && !!currentSessionPath;
@@ -398,7 +429,7 @@ export const ChatView: React.FC = () => {
       prevLenRef.current = total;
       stickBottom.current = true;
       setAtBottom(true);
-      setWindowStart(Math.max(0, total - WINDOW_SIZE));
+      setWindowStartTurn(Math.max(0, turnCount - WINDOW_TURNS));
       requestAnimationFrame(() => {
         const el = scrollRef.current;
         if (el) el.scrollTop = el.scrollHeight;
@@ -406,7 +437,7 @@ export const ChatView: React.FC = () => {
     } else {
       prevLenRef.current = total;
     }
-  }, [currentSessionPath, total]);
+  }, [currentSessionPath, total, turnCount]);
 
   // 用户滚动意图标记：滚轮 / 触摸 / 键盘 / 指针按下（含拖拽原生滚动条）。
   // pointerdown→up 覆盖"按住拖动滚动条"期间的所有 scroll 事件。
@@ -430,15 +461,15 @@ export const ChatView: React.FC = () => {
 
   // 消息追加/更新（流式）：若在底部则跟随（窗口保持最后 + 滚到底）；用户上滚后不拉回
   useEffect(() => {
-    if (stickBottom.current && total > 0) {
-      setWindowStart(Math.max(0, total - WINDOW_SIZE));
+    if (stickBottom.current && turnCount > 0) {
+      setWindowStartTurn(Math.max(0, turnCount - WINDOW_TURNS));
       setAtBottom(true);
       requestAnimationFrame(() => {
         const el = scrollRef.current;
         if (el) el.scrollTop = el.scrollHeight;
       });
     }
-  }, [messages, total]);
+  }, [messages, turnCount]);
 
   // 吸底跟随（ResizeObserver）：内容尺寸任何变化（图片 onload、代码高亮、markdown
   // 二次布局、分批上屏）都把视口钉回底部。修「打开会话没跳到最后」：定位只在消息
@@ -459,32 +490,43 @@ export const ChatView: React.FC = () => {
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    // 只认「用户意图驱动」的滚动：程序化钉底（rAF 设 scrollTop）与 Chromium 的
+    // ① 方向判定（所有事件都比对，含非 userDriven 的）：scrollTop 减小 = 用户在向上
+    // 滚 → 立即解除吸底。不能只靠 nearBottom<60px 阈值：平滑滚轮/触控板单步增量常
+    // <60px，且流式期间 ResizeObserver/跟随 effect 每帧钉底，用户在累积出 60px 前
+    // 就被拽回 → 「拉不上去，只看得到最后的信息」（2026-09-14 用户报告）。
+    if (el.scrollTop < lastScrollTopRef.current - 0.5) {
+      stickBottom.current = false;
+      setAtBottom(false);
+    }
+    lastScrollTopRef.current = el.scrollTop;
+    // ② 只认「用户意图驱动」的滚动：程序化钉底（rAF 设 scrollTop）与 Chromium 的
     // scroll anchoring（窗口跳变后自动调 scrollTop）同样触发 scroll 事件。若一并纳入
     // 判定，会把"仍在底部"误判为"用户已上滚" → 失去跟随 → 最新回复只显示一半且不再
     // 补滚（2026-09-13 用户截图复现）。
     const userDriven = userScrollActive.current || Date.now() - lastUserScrollAt.current < 400;
     if (!userDriven) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    // ③ 恢复吸底只看 nearBottom（在底部附近 = 回到底部）；向上方向的解除已在 ① 完成。
     stickBottom.current = nearBottom;
-    // 滚到底部且窗口落后于会话末尾（startIdx + WINDOW < total）→ 窗口直接推进到最新。
+    // 滚到底部且窗口落后于会话末尾（startTurn + WINDOW < turnCount）→ 窗口直接推进到最新。
     // 修「停在中间切片滚不到最后」：用户上滚阅读期间 agent 继续跑，窗口停住（设计如此，
     // 不拉回）；之后用户滚回 DOM 底部时，DOM 底 ≠ 会话底 —— 最新消息不在窗口里，
     // 渲染出来的只有旧切片末尾 + 空白，永远滚不到最后。这里补上"到底边 → 向前推进"。
-    const windowBehind = startIdx < maxStart;
+    const windowBehind = startTurn < maxStartTurn;
     if (nearBottom && windowBehind) {
-      setWindowStart(maxStart);
+      setWindowStartTurn(maxStartTurn);
       requestAnimationFrame(() => {
         const el2 = scrollRef.current;
         if (el2) el2.scrollTop = el2.scrollHeight;
       });
     }
     setAtBottom(nearBottom && !windowBehind);
-    // 滚动到顶部时加载更多历史（窗口前移 LOAD_MORE 条，DOM 恒定）
-    if (el.scrollTop < 100 && hasMore) {
+    // 滚动到顶部时加载更多历史（窗口前移 LOAD_MORE_TURNS 个回合，DOM 恒定）
+    if (el.scrollTop < 100 && hasMore && !loadMoreLockRef.current) {
+      loadMoreLockRef.current = true;
       const prevScrollHeight = el.scrollHeight;
       const prevScrollTop = el.scrollTop;
-      setWindowStart((w) => Math.max(0, w - LOAD_MORE));
+      setWindowStartTurn((w) => Math.max(0, w - LOAD_MORE_TURNS));
       // 保持滚动位置（新增内容在顶部 → scrollTop 下移差值）
       requestAnimationFrame(() => {
         const newEl = scrollRef.current;
@@ -492,6 +534,7 @@ export const ChatView: React.FC = () => {
           const delta = newEl.scrollHeight - prevScrollHeight;
           newEl.scrollTop = prevScrollTop + delta;
         }
+        loadMoreLockRef.current = false;
       });
     }
   };
@@ -501,12 +544,12 @@ export const ChatView: React.FC = () => {
   const jumpToLatest = useCallback(() => {
     stickBottom.current = true;
     setAtBottom(true);
-    setWindowStart(Math.max(0, total - WINDOW_SIZE));
+    setWindowStartTurn(maxStartTurn);
     requestAnimationFrame(() => {
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     });
-  }, [total]);
+  }, [maxStartTurn]);
 
   // Minimap 跳转：目标消息在当前窗口 → scrollIntoView；否则先移动窗口再定位
   const scrollToMessage = useCallback((index: number) => {
@@ -518,9 +561,10 @@ export const ChatView: React.FC = () => {
       node.scrollIntoView({ behavior: 'auto', block: 'center' });
       return;
     }
-    // 目标不在窗口：移动窗口让目标位于中部，渲染后定位
-    const targetStart = Math.max(0, Math.min(index - Math.floor(WINDOW_SIZE / 2), maxStart));
-    setWindowStart(targetStart);
+    // 目标不在窗口：移动窗口让目标所在回合位于中部，渲染后定位
+    const ti = turnIndexOfMsg[index] ?? 0;
+    const targetStart = Math.max(0, Math.min(ti - Math.floor(WINDOW_TURNS / 2), maxStartTurn));
+    setWindowStartTurn(targetStart);
     setTimeout(() => {
       const el2 = scrollRef.current;
       const msg2 = messages[index];
@@ -528,7 +572,7 @@ export const ChatView: React.FC = () => {
       const node2 = el2.querySelector(`[data-msg-id="${CSS.escape(msg2.id)}"]`);
       if (node2) node2.scrollIntoView({ behavior: 'auto', block: 'center' });
     }, 80);
-  }, [messages, maxStart]);
+  }, [messages, turnIndexOfMsg, maxStartTurn]);
 
   const ctxMenu = linkMenu && createPortal(
     <LinkContextMenu url={linkMenu.url} x={linkMenu.x} y={linkMenu.y} onClose={() => setLinkMenu(null)} />,
@@ -563,14 +607,15 @@ export const ChatView: React.FC = () => {
               <>
                 {hasMore && (
                   <div className="chat-load-more" style={{ textAlign: 'center', padding: '8px 0', color: 'var(--text-faint)', fontSize: 12 }}>
-                    ↑ 滚动加载更多（剩余 {startIdx} 条）
+                    ↑ 滚动加载更多（剩余 {remainingMsgs} 条）
                   </div>
                 )}
                 {/* 一个回合渲染为：用户消息 → assistant 回合（一行折叠条 + 最终回复）。
                     注意两者必须**都**渲染 —— 回合的 assistant 消息挂在同一条用户消息的 Turn 上，
-                    只渲染其中一个就会把整个回答吞掉（2026-09-13 用户截图：只剩用户气泡、回复全消失）。 */}
-                {turns.map((t, i) => (
-                  <React.Fragment key={t.user ? t.user.id : `t${i}-${t.asst[0]?.id ?? 'x'}`}>
+                    只渲染其中一个就会把整个回答吞掉（2026-09-13 用户截图：只剩用户气泡、回复全消失）。
+                    key 用回合内首条消息 id（user 优先），与窗口位置无关，避免窗口前移时整列表重建。 */}
+                {visibleTurns.map((t, i) => (
+                  <React.Fragment key={t.user ? t.user.id : `t${startTurn + i}-${t.asst[0]?.id ?? 'x'}`}>
                     {t.user && <MessageItem msg={t.user} />}
                     {t.asst.length > 0 && <AssistantTurn msgs={t.asst} />}
                   </React.Fragment>

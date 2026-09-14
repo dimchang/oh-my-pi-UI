@@ -83,12 +83,18 @@ async function titleFallback(header: SessionHeader, filePath: string): Promise<s
         const entry = JSON.parse(ln) as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
         if (entry.message?.role === 'user') {
           const textPart = entry.message.content?.find((c) => c.type === 'text');
-          if (textPart?.text) return textPart.text.slice(0, 40);
+          if (textPart?.text) {
+            const t = textPart.text.trim();
+            // 过短/纯符号文本（如误发的"？"）不配当标题——侧栏一排"？""！！"毫无信息量。
+            // 回退"未命名会话"，等 omp 空闲时总结出正式标题（title 行/session_titles.db）。
+            if (t.length >= 2 && !/^[？！?!.。,，、\s]+$/.test(t)) return t.slice(0, 40);
+            return '(未命名会话)';
+          }
         }
       } catch { /* skip */ }
     }
   } catch { /* noop */ }
-  return '(untitled)';
+  return '(未命名会话)';
 }
 
 /** 并发控制器：限制同时进行的异步任务数，避免数百个 session 文件同时打开耗尽 fd。 */

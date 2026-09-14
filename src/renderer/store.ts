@@ -926,6 +926,11 @@ export const useApp = create<AppState>((set, get) => ({
     if (!sessionPath) return false;
     const ps = s.procStateMap[sessionPath];
     if (ps?.status === 'online') return true;
+    // temp 会话进程离线（被杀/淘汰/退出）时绝不直接 acquire：
+    // tempKey 在磁盘上不存在，acquire 会全新 spawn 出第二个 .jsonl
+    // （实证 2026-09-14 bet_zp：输入框聚焦 ensureOnline(tempKey) 裂出 01a0a048）。
+    // 留给 onSend 的 resolveSessionKey 先迁移到落盘 realPath 再 acquire。
+    if (sessionPath.startsWith('__new_')) return false;
     const session = s.sessions.find((x) => x.path === sessionPath);
     const ws = session && s.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(session.cwd));
     const cwd = ws?.cwd ?? session?.cwd;

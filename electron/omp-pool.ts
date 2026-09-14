@@ -56,6 +56,11 @@ export class OmpProcessPool {
    *  LRU 淘汰时跳过 pinned 会话，避免杀掉"正在等用户确认"的进程
    *  （那种进程不输出帧，lastActiveAt 很旧，会被误判为最闲而被淘汰）。 */
   private pinned = new Map<string, number>();
+  /** tempKey → 该会话已落盘的真实 .jsonl 路径（omp get_state.sessionFile）。
+   *  acquire(tempKey) 在进程死掉后重拉时用它带 -r 续接，杜绝对 tempKey 全新
+  spawn 裂出第二个会话（2026-09-14 bet_zp 事故：进程被杀后 ensureOnline(tempKey)
+  spawn 出 01a0a048，与 01a0a046 内容分裂）。renameKey 时同步清除。 */
+  private tempSessionFiles = new Map<string, string>();
 
   /** 标记某会话有未应答 UI 请求（防止被 LRU 淘汰）。可重复调用（refcount）。 */
   pin(sessionPath: string): void {
@@ -139,10 +144,12 @@ export class OmpProcessPool {
       }
     }
     // 历史会话（磁盘文件存在）→ -r resume 指定文件；
-    // 否则（tempKey 或文件不存在，如新建会话）→ 全新 spawn（不带 -r/-c）。
+    // tempKey 防分裂兜底（2026-09-14 bet_zp 事故根因）：temp 会话曾落盘过
+    // （tempSessionFiles 有记忆）→ 同样带 -r 续接，而不是全新 spawn 出第二个 .jsonl。
     // resume 判定已下移到 spawnEntry 内部用异步 stat 完成（issue 7），这里不再同步 existsSync，
     // 以保证容量检查 → spawning 注册之间不插入 await（维持 issue 1 的并发安全）。
-    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, undefined, undefined, hooks);
+    const knownFile = sessionPath.startsWith('__new_') ? this.tempSessionFiles.get(sessionPath) : undefined;
+    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, knownFile, undefined, hooks);
     this.spawning.set(sessionPath, p);
     try {
       return await p;
@@ -187,6 +194,9 @@ export class OmpProcessPool {
       this.pinned.delete(oldKey);
       this.pinned.set(newKey, pc);
     }
+    // tempKey 落盘记忆同步迁移：renameKey 说明渲染层已确认 temp→real 映射，
+    // 真实 path 本身就在磁盘上（spawnEntry 会 stat 到），tempKey 记忆已无用。
+    this.tempSessionFiles.delete(oldKey);
     return e;
   }
 
@@ -345,6 +355,19 @@ export class OmpProcessPool {
                   else reject(new Error('entry missing on ready'));
                 }
                 this.events.onReady(currentSessionKey());
+                // temp 会话：ready 后立即记下 omp 分配的真实落盘路径（spawn 时即已定，
+                // 首条消息后开始流式写入）。之后进程若被杀/淘汰，acquire(tempKey)
+                // 凭这条记忆带 -r 续接，不会全新 spawn 裂出第二个会话。
+                if (sessionPath.startsWith('__new_')) {
+                  const key = sessionPath;
+                  void ctx.router!.send({ type: 'get_state' }, 10_000).then((r) => {
+                    const sf = (r.data as { sessionFile?: unknown } | undefined)?.sessionFile;
+                    if (r.success && typeof sf === 'string' && sf && !sf.startsWith('__new_')) {
+                      // entry 可能已被 renameKey 迁走：只在仍是原 temp key 时记录
+                      if (ctx.entry && ctx.entry.sessionPath === key) this.tempSessionFiles.set(key, sf);
+                    }
+                  }).catch(() => undefined);
+                }
               },
               onFrame: (frame) => ctx.router?.dispatch(frame),
               onExit: (code) => {
