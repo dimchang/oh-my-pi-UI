@@ -66,15 +66,9 @@ export default function App(): React.ReactElement {
           } : {}),
           // isStreaming/isAborting 改由 procStateMap 驱动，这里不覆写
         });
-        // 持久化的 lastModel 跟 omp 当前 model 不一致 → 自动恢复
-        const last = useApp.getState().lastModel;
-        if (last && (!d.model || d.model.provider !== last.provider || d.model.id !== last.id)) {
-          void rpc.setModel(sp, last.provider, last.id).then((sr) => {
-            if (sr.success && sr.data && sp === useApp.getState().currentSessionPath) {
-              useApp.getState().setState({ model: sr.data as ModelInfo });
-            }
-          }).catch(() => undefined);
-        }
+        // 注意：这里**不做** lastModel 自动恢复——refreshState 的触发点很多（切会话/
+        // agent_end/轮询），任何一次触发都会把别的会话选的模型覆盖到本会话上
+        // （2026-09-16 串模型事故）。恢复只在进程拉起时做，见 restoreSessionModel。
       }
     }).catch(() => undefined);
   }, []);
@@ -83,6 +77,27 @@ export default function App(): React.ReactElement {
     return window.omp.listSessions()
       .then((list) => useApp.getState().setSessions(list))
       .catch(() => undefined);
+  }, []);
+
+  /** 进程 (re)spawn 后恢复该会话**自己**的模型选择：lastModelMap[sp] 优先，
+   *  无记录回退全局 lastModel（保持"新会话默认用最近选的模型"的旧行为）。
+   *  只在 onReady 调用——进程退出/淘汰重拉后 omp 会回到默认模型，这是唯一需要恢复的时机。
+   *  refreshState（切会话/agent_end 等高频触发点）绝不调它，否则会把别的会话选的模型
+   *  覆盖到本会话上（2026-09-16 串模型事故根因）。 */
+  const restoreSessionModel = useCallback((sessionPath: string): void => {
+    const st = useApp.getState();
+    const last = st.lastModelMap[sessionPath] ?? st.lastModel;
+    if (!last) return;
+    void rpc.getState(sessionPath).then((r) => {
+      if (!r.success || !r.data) return;
+      const d = r.data as RpcSessionState;
+      if (d.model && d.model.provider === last.provider && d.model.id === last.id) return;
+      void rpc.setModel(sessionPath, last.provider, last.id).then((sr) => {
+        if (sr.success && sr.data && sessionPath === useApp.getState().currentSessionPath) {
+          useApp.getState().setState({ model: sr.data as ModelInfo });
+        }
+      }).catch(() => undefined);
+    }).catch(() => undefined);
   }, []);
 
   /** 拉取某会话进程的可用技能 / 命令列表。
@@ -251,6 +266,8 @@ export default function App(): React.ReactElement {
         sessions: st.sessions.filter((x) => x.path !== cur),
         sessionNames,
       });
+      // 模型选择记录跟随迁移（tempKey → realPath），否则恢复时查不到
+      useApp.getState().migrateLastModelKey(cur, realPath);
       void rpc.renameKey(cur, realPath).then(done, done);
     }
   }, []);
@@ -363,6 +380,8 @@ export default function App(): React.ReactElement {
       useApp.getState().setReady(true);
       useApp.getState().setOmpExited(null);
       useApp.getState().setProcState(sessionPath, { status: 'online' });
+      // 进程刚拉起 → omp 回到了默认模型，恢复该会话自己的模型选择（会话间隔离）
+      restoreSessionModel(sessionPath);
       // 若 ready 的是当前显示会话，刷新状态栏 + 加载历史
       if (sessionPath === useApp.getState().currentSessionPath) {
         void refreshState(sessionPath).then(() => {
@@ -432,7 +451,7 @@ export default function App(): React.ReactElement {
     });
 
     return () => { offEvent(); offReady(); offExit(); offStderr(); };
-  }, [pushToast, refreshState, refreshSessions, refreshCommands, migrateTempSession]);
+  }, [pushToast, refreshState, refreshSessions, refreshCommands, restoreSessionModel, migrateTempSession]);
 
   // 渲染进程挂载：加载 workspaces，完成后通知主进程 renderer 就绪（多进程下主进程不再直接起 omp）
   const workspacesLoaded = useApp((s) => s.workspacesLoaded);
@@ -771,6 +790,8 @@ export default function App(): React.ReactElement {
       sessions,
       ...(wasCurrent ? { currentSessionPath: undefined, messages: [] } : {}),
     });
+    // 占位 key 的模型选择记录一并清掉（防 workspaces.json 无限膨胀）
+    useApp.getState().removeLastModelKey(path);
     return wasCurrent;
   }, [rpc]);
 
@@ -849,6 +870,7 @@ export default function App(): React.ReactElement {
     // 常规会话：先释放进程，再删磁盘文件；删完若删掉的是当前会话则切到其它会话
     void rpc.release(s.path).catch(() => undefined);
     void window.omp.deleteSession(s.path).then(async () => {
+      useApp.getState().removeLastModelKey(s.path);
       await refreshSessions();
       if (useApp.getState().currentSessionPath === s.path) {
         const nx = useApp.getState().sessions
@@ -1028,6 +1050,7 @@ export default function App(): React.ReactElement {
       for (const s of sessions) {
         await rpc.release(s.path).catch(() => undefined);
         await window.omp.deleteSession(s.path).catch(() => undefined);
+        useApp.getState().removeLastModelKey(s.path);
       }
     } catch {
       /* 列表失败也无妨，继续删除归档记录 */

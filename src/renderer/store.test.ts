@@ -339,3 +339,62 @@ describe('回复不显示三道防线', () => {
     expect(diag!.some((d) => d.type === 'agent_start' && d.display)).toBe(true);
   });
 });
+
+// 2026-09-16 串模型事故修复：模型选择按 sessionPath 隔离（lastModelMap），
+// B 会话切模型不得影响 A 会话（原全局单值 lastModel + refreshState 自动恢复导致串模型）。
+describe('lastModelMap（会话间模型隔离）', () => {
+  const A = 'D:/proj/a/session-01.jsonl';
+  const B = 'D:/proj/a/session-02.jsonl';
+  const glm = { provider: 'z-ai', id: 'glm-5.3-flash', name: 'GLM' };
+  const hy3 = { provider: 'moonshot', id: 'kimi-hy3', name: 'HY3' };
+
+  beforeEach(() => {
+    useApp.setState({ lastModel: undefined, lastModelMap: {} });
+  });
+
+  it('setLastModelForSession 按 sessionPath 各自记录，互不覆盖', () => {
+    const st = useApp.getState();
+    st.setLastModelForSession(A, glm);
+    st.setLastModelForSession(B, hy3);
+    const s = useApp.getState();
+    expect(s.lastModelMap[A]).toEqual(glm);
+    expect(s.lastModelMap[B]).toEqual(hy3);
+    // 全局 lastModel 仍记录最近一次选择（新会话兜底用）
+    expect(s.lastModel).toEqual(hy3);
+  });
+
+  it('migrateLastModelKey：tempKey → realPath 迁移，目标已有记录时不覆盖', () => {
+    const st = useApp.getState();
+    st.setLastModelForSession('__new_temp1', glm);
+    st.migrateLastModelKey('__new_temp1', B);
+    expect(useApp.getState().lastModelMap[B]).toEqual(glm);
+    expect(useApp.getState().lastModelMap['__new_temp1']).toBeUndefined();
+
+    // 目标已有自己的记录 → 保留目标记录
+    useApp.getState().setLastModelForSession(A, hy3);
+    useApp.getState().setLastModelForSession('__new_temp2', glm);
+    useApp.getState().migrateLastModelKey('__new_temp2', A);
+    expect(useApp.getState().lastModelMap[A]).toEqual(hy3);
+  });
+
+  it('removeLastModelKey：删除会话时清理记录，无记录时为无害 no-op', () => {
+    const st = useApp.getState();
+    st.setLastModelForSession(A, glm);
+    st.removeLastModelKey(A);
+    expect(useApp.getState().lastModelMap[A]).toBeUndefined();
+    // no-op 不抛错
+    expect(() => useApp.getState().removeLastModelKey(A)).not.toThrow();
+  });
+
+  it('恢复优先级：lastModelMap[sp] 优先于全局 lastModel（restoreSessionModel 的取值语义）', () => {
+    const st = useApp.getState();
+    st.setLastModelForSession(B, hy3);
+    // A 无 per-session 记录 → 回退全局 lastModel（B 的选择同时写入了全局）
+    const sp = A;
+    expect(useApp.getState().lastModelMap[sp]).toBeUndefined();
+    expect(useApp.getState().lastModelMap[sp] ?? useApp.getState().lastModel).toEqual(hy3);
+    // A 设了自己的记录后 → per-session 记录优先，不再吃全局兜底
+    useApp.getState().setLastModelForSession(sp, glm);
+    expect(useApp.getState().lastModelMap[sp] ?? useApp.getState().lastModel).toEqual(glm);
+  });
+});

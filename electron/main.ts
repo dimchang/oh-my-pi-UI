@@ -14,6 +14,18 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { randomUUID, createHash } from 'crypto';
 
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+
+// dev（electron-vite dev / 直接跑 electron）下 Electron 可能回退到默认应用名，userData 落到
+// %APPDATA%\Electron；而打包版是 %APPDATA%\omp-gui —— 两者会看到**两套**工作空间、会话与
+// 诊断日志，排查线上问题时现场根本对不上（2026-09-15 白屏取证踩到）。这里显式固定为与
+// 打包版相同的目录。放在模块顶层 = app ready 之前，必须早于任何 getPath('userData') 求值。
+// 注意：只是换了个目录看数据，旧目录里的文件不会被删除。
+if (!app.isPackaged) {
+  try {
+    app.setPath('userData', path.join(app.getPath('appData'), 'omp-gui'));
+  } catch { /* 取不到 appData 就保持 Electron 默认行为 */ }
+}
+
 import { OmpProcessPool } from './omp-pool';
 import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
 import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
@@ -193,6 +205,43 @@ class RateLimiter {
 /** 敏感操作限流：每个操作 10 秒内最多 20 次（正常用户操作远达不到）。 */
 const sensitiveLimiter = new RateLimiter(20, 10_000);
 
+// ---- 诊断日志（白屏/卡死取证，2026-09-15 白屏事故配套）----
+// 事故现场：renderer 持续 111% 单核 + 6.6GB 常驻 + 28.7k 句柄、不自愈；而主进程与 omp
+// 全 0% —— 无外部输入却持续输出。更要命的是**当时没有任何日志**：主进程没监听
+// render-process-gone / unresponsive，renderer 也没有 ErrorBoundary / window.onerror，
+// 白屏因此完全静默，事后只能靠猜。这里补上落盘通道：
+//   - 主进程侧：窗口崩溃/无响应/加载失败/console error|warn 自动记录
+//   - 渲染侧：心跳与错误经 IPC.DiagLog 交过来（renderer 无 fs 权限）
+// 落点 userData/logs/ui-YYYY-MM-DD.log；异步 append，绝不阻塞主进程事件循环。
+function diagLogDir(): string {
+  return path.join(app.getPath('userData'), 'logs');
+}
+function diagLogPath(): string {
+  const d = new Date();
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return path.join(diagLogDir(), `ui-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.log`);
+}
+let diagPending: string[] = [];
+let diagFlushTimer: ReturnType<typeof setTimeout> | null = null;
+/** 追加一行诊断（带 ISO 时间戳）。合并 250ms 内的写入批量落盘，避免高频 IPC 打爆磁盘。 */
+function appendDiag(line: string): void {
+  try {
+    diagPending.push(`[${new Date().toISOString()}] ${line}`);
+    // 极端情况下（磁盘故障/写入持续失败）不能在内存里堆到失控
+    if (diagPending.length > 20000) diagPending = diagPending.slice(-2000);
+    if (diagFlushTimer) return;
+    diagFlushTimer = setTimeout(() => {
+      diagFlushTimer = null;
+      if (diagPending.length === 0) return;
+      const chunk = diagPending.join('\n') + '\n';
+      diagPending = [];
+      void fs.promises.mkdir(diagLogDir(), { recursive: true })
+        .then(() => fs.promises.appendFile(diagLogPath(), chunk, 'utf8'))
+        .catch(() => undefined);
+    }, 250);
+  } catch { /* 诊断自身绝不能抛 */ }
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280, height: 840, minWidth: 900, minHeight: 600,
@@ -208,7 +257,34 @@ function createWindow(): void {
       sandbox: false,
     },
   });
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => { mainWindow = null; appendDiag('window closed'); });
+  // ---- 白屏取证：这几类事件此前完全没人记录，白屏才会"零日志" ----
+  const wc = mainWindow.webContents;
+  wc.on('render-process-gone', (_e, details) => {
+    appendDiag(`!! render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
+  });
+  wc.on('unresponsive', () => {
+    appendDiag('!! unresponsive —— 渲染进程超过 5s 无响应（白屏/卡死现场）');
+  });
+  wc.on('responsive', () => appendDiag('responsive —— 渲染进程恢复响应'));
+  wc.on('did-fail-load', (_e, code, desc, url) => {
+    appendDiag(`!! did-fail-load code=${code} desc=${desc} url=${url}`);
+  });
+  wc.on('preload-error', (_e, preloadPath, err) => {
+    appendDiag(`!! preload-error ${preloadPath} ${err?.message ?? String(err)}`);
+  });
+  // console-message 签名在 Electron 35+ 改成了 (event, details)，旧版是
+  // (event, level, message, line, sourceId)。两种都兼容，只落 warning/error 防日志爆炸。
+  type ConsoleMsgLike = { level?: number | string; message?: string; lineNumber?: number; sourceId?: string };
+  const onConsoleMessage = (...args: unknown[]): void => {
+    const d = (args[1] ?? {}) as ConsoleMsgLike;
+    const lvl = typeof d.level === 'string' ? d.level : Number(d.level);
+    const isErr = lvl === 'error' || lvl === 3;
+    const isWarn = lvl === 'warning' || lvl === 2;
+    if (!isErr && !isWarn) return;
+    appendDiag(`console[${isErr ? 'error' : 'warn'}] ${String(d.message ?? '')} @${String(d.sourceId ?? '')}:${String(d.lineNumber ?? 0)}`);
+  };
+  (wc as unknown as { on: (ev: string, cb: (...a: unknown[]) => void) => void }).on('console-message', onConsoleMessage);
   if (USE_CUSTOM_TITLE_BAR) {
     mainWindow.on('maximize', () => sendToRenderer(IPC.WindowMaximizedChange, true));
     mainWindow.on('unmaximize', () => sendToRenderer(IPC.WindowMaximizedChange, false));
@@ -774,6 +850,13 @@ function registerIpc(): void {
     ipcMain.handle(IPC.MenuToggleFullscreen, () => { if (!mainWindow) return; mainWindow.setFullScreen(!mainWindow.isFullScreen()); });
     ipcMain.handle(IPC.MenuShowAbout, () => showAboutDialog());
     ipcMain.handle(IPC.MenuStatsClick, () => { mainWindow?.webContents.send(IPC.MenuStats); });
+
+    // 渲染侧诊断上报（白屏取证）：renderer 把心跳/错误快照交过来落盘。
+    // 用 on 而非 handle：卡死的 renderer 不该为了写日志等回执。
+    ipcMain.on(IPC.DiagLog, (_e, lines: unknown) => {
+      if (!Array.isArray(lines)) return;
+      for (const l of lines.slice(0, 500)) appendDiag(`renderer ${String(l)}`);
+    });
   }
 }
 
@@ -804,6 +887,10 @@ app.whenReady().then(() => {
   });
 
   registerIpc();
+  appendDiag(`=== app start pid=${process.pid} version=${app.getVersion()} electron=${process.versions.electron} ===`);
+  // dev（electron-vite）与打包版的 userData 可能不同 —— 把真实路径记进日志首行，
+  // 免得事后在 omp-gui / Electron 两个候选目录之间猜
+  appendDiag(`userData=${app.getPath('userData')} log=${diagLogPath()}`);
   createWindow();
   buildAppMenu();
 
@@ -827,6 +914,9 @@ function buildAppMenu(): void {
       { label: '关于 OMP UI', click: () => showAboutDialog() },
       { type: 'separator' },
       { label: 'Stats (会话统计)', click: () => { mainWindow?.webContents.send(IPC.MenuStats); } },
+      { type: 'separator' },
+      // 白屏/卡死取证入口：日志落在 userData/logs，用户不必自己找路径
+      { label: '打开诊断日志目录', click: () => { void shell.openPath(diagLogDir()); } },
     ] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));

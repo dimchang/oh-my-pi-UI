@@ -15,6 +15,8 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 
 const api: OmpApi = {
   platform: process.platform,
+  // 诊断上报用 send 而非 invoke：卡死现场不应等回执，也不能因为主进程忙碌而挂住 renderer
+  diagLog: (lines: string[]) => ipcRenderer.send(IPC.DiagLog, lines),
   send: <T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T> =>
     ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>

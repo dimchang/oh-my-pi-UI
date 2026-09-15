@@ -91,6 +91,10 @@ export const IPC = {
   // 图片：粘贴/拖拽落盘 + 读取为 data URL（聊天框贴图功能）
   SavePastedImage: 'image:save-pasted', // (data: ArrayBuffer, ext: string) => Promise<PastedImageResult> — 存剪贴板/拖拽图片到 userData/pasted-images
   ReadImageAsDataUrl: 'image:read-as-dataurl', // (filePath: string) => Promise<ImageDataUrlResult> — 读图片为 data URL（白名单防本地文件泄露）
+
+  // 诊断（白屏/卡死取证）：renderer → main，单向 send（不需要回执，免得给卡死的 renderer 加负担）。
+  // renderer 无文件系统权限，诊断行必须交主进程 append 到 userData/logs/ui-YYYY-MM-DD.log。
+  DiagLog: 'diag:log', // (lines: string[]) => void
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -282,9 +286,15 @@ export interface WorkspacesFile {
   /** 用户主动彻底删除过的 cwd 列表（小写形式）。
    *  启动自动补全工作空间时跳过这些路径，避免删了又自动复活。 */
   removedCwds?: string[];
-  /** 用户上次选中的模型（omp 进程重启后会回到默认模型，启动时按此恢复）。
-   *  存的是用户选择本身（provider+id），避免与 omp 内部 default 混淆。 */
+  /** 用户上次选中的模型（omp 进程重启后会回到默认模型，进程拉起时按此恢复）。
+   *  存的是用户选择本身（provider+id），避免与 omp 内部 default 混淆。
+   *  角色已弱化为「新会话兜底」：会话自身的选择记录在 lastModelMap。 */
   lastModel?: { provider: string; id: string; name?: string };
+  /** 各会话用户最后选中的模型（key = sessionPath）。会话间互相隔离——
+   *  在 B 会话切模型绝不能影响 A 会话（2026-09-16 串模型事故：全局单值 lastModel
+   *  + refreshState 里无条件自动恢复，导致 A 被 B 的选择静默覆盖）。
+   *  进程拉起恢复时 lastModelMap[sp] 优先，无记录回退全局 lastModel。 */
+  lastModelMap?: Record<string, { provider: string; id: string; name?: string }>;
   /** 模型启用白名单（key = `${provider}/${modelId}`）。
    *  undefined 或空数组 = 未配置过 → ModelPicker 显示全部模型；
    *  非空 = 只显示白名单里的模型（当前正在用的模型始终显示，避免"选中的被藏"）。 */
@@ -360,6 +370,9 @@ export interface OmpModelsConfig {
 export interface OmpApi {
   /** 运行平台，用于 renderer 判断是否需要绘制自定义标题栏等 */
   platform: 'win32' | 'darwin' | 'linux' | string;
+  /** 上报诊断日志（单向、fire-and-forget）。renderer 卡死前把现场快照交给主进程落盘，
+   *  落点 userData/logs/ui-YYYY-MM-DD.log。失败静默——诊断绝不能反过来拖垮 UI。 */
+  diagLog(lines: string[]): void;
   // issue 18: 泛型化返回类型，调用方可声明期望的响应类型（如 send<MyData>(...)），
   // 不再强制 any/unknown 断言；preload 实现返回 Promise<any> 可安全赋给 Promise<T>。
   send<T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T>;

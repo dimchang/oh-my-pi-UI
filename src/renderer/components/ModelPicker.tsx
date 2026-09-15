@@ -126,9 +126,10 @@ export const ModelPicker: React.FC = () => {
     void rpc.setModel(sp, m.provider, m.id).then((r) => {
       if (r.success && r.data) {
         useApp.getState().setState({ model: r.data as ModelInfo });
-        // 记录到 lastModel 并持久化，重启 UI 后能自动恢复
+        // 按 sessionPath 记录（lastModelMap，会话间隔离）+ 全局 lastModel 兜底（新会话默认值），
+        // 重启/进程重拉后按会话各自的记录恢复，B 会话的选择不影响 A 会话。
         const mm = r.data as ModelInfo;
-        useApp.getState().setLastModel({ provider: mm.provider, id: mm.id, name: mm.name });
+        useApp.getState().setLastModelForSession(sp, { provider: mm.provider, id: mm.id, name: mm.name });
       }
     }).catch(() => undefined);
   };

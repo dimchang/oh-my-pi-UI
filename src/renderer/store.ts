@@ -18,6 +18,7 @@ import type {
 } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
 import type { SkillInfo } from '../shared/ipc-channels';
+import { ompStat } from './diagnostics';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 import { buildThemeCSS, getThemePreset } from './themes';
 import { extractDiff, extractChangeSummary } from './components/DiffView';
@@ -297,8 +298,12 @@ interface AppState {
   workspacesLoaded: boolean;
   /** 用户主动彻底删除过的 cwd（小写形式）。启动补全时跳过这些路径，避免"删了又复活"。 */
   removedCwds: string[];
-  /** 用户上次选中的模型。omp 进程重启后会回到默认，启动时按此自动 setModel 恢复。 */
+  /** 全局兜底模型：新会话（lastModelMap 无记录）进程拉起时按此恢复。
+   *  会话自身的选择以 lastModelMap 为准（会话间隔离）。 */
   lastModel?: { provider: string; id: string; name?: string };
+  /** 各会话用户最后选中的模型（key = sessionPath）。会话间互相隔离，
+   *  B 会话切模型不影响 A 会话。持久化到 workspaces.json。 */
+  lastModelMap: Record<string, { provider: string; id: string; name?: string }>;
   /** omp 子进程**实际** cwd（来自主进程 OmpCwd 事件）。
    *  这是"是否需要 restart"的唯一可信来源——别用 currentWorkspace() 推断（启动时序错位）。 */
   ompCwd: string | null;
@@ -310,8 +315,13 @@ interface AppState {
   setCurrentWorkspaceId(id: string | null): void;
   /** 记录 omp 实际 cwd（主进程 OmpCwd 事件推过来） */
   setOmpCwd(cwd: string | null): void;
-  /** 记录用户选的 model（同时写 lastModel，触发持久化） */
-  setLastModel(m: { provider: string; id: string; name?: string }): void;
+  /** 记录某会话用户选的 model：写 lastModelMap[sessionPath]（会话隔离）+ 全局 lastModel 兜底，
+   *  同时触发持久化。sessionPath 必须显式传入（调用点持有快照，禁内部重读指针）。 */
+  setLastModelForSession(sessionPath: string, m: { provider: string; id: string; name?: string }): void;
+  /** tempKey→realPath 迁移时同步迁移该会话的模型记录（同 sessionNames 的迁移语义）。 */
+  migrateLastModelKey(from: string, to: string): void;
+  /** 删除会话时清理其模型记录，防 workspaces.json 无限膨胀。 */
+  removeLastModelKey(sessionPath: string): void;
   /** 新增/更新工作空间。**不改变当前选中** —— 「发现/更新一个工作区」与「聚焦它」是两件事
    *  （2026-09-12 幽灵工作区事故：reconcile 自动补全会走到这里，隐式切换会劫持用户的当前焦点）。
    *  需要聚焦请显式调 setCurrentWorkspaceId（用户主动入口 onAddWorkspace 已补）。 */
@@ -524,6 +534,8 @@ const FRAME_DIAG_CAP = 600;
 const frameDiag: FrameDiagEntry[] = [];
 (globalThis as { __ompDiag?: FrameDiagEntry[] }).__ompDiag = frameDiag;
 function pushFrameDiag(e: FrameDiagEntry): void {
+  // 帧计数供诊断模块对照 renders 使用（区分「帧太多」与「render 自己空转」）
+  ompStat.frames++;
   frameDiag.push(e);
   if (frameDiag.length > FRAME_DIAG_CAP) frameDiag.splice(0, frameDiag.length - FRAME_DIAG_CAP);
 }
@@ -678,6 +690,7 @@ export const useApp = create<AppState>((set, get) => ({
   workspacesLoaded: false,
   removedCwds: [],
   lastModel: undefined,
+  lastModelMap: {},
   ompCwd: null,
   draftInput: undefined,
 
@@ -756,6 +769,7 @@ export const useApp = create<AppState>((set, get) => ({
       workspacesLoaded: true,
       removedCwds: file.removedCwds ?? [],
       lastModel: file.lastModel,
+      lastModelMap: file.lastModelMap ?? {},
       enabledModels: migratedEnabledModels,
       systemPrompt: file.systemPrompt,
       appearance: migratedAppearance,
@@ -778,9 +792,29 @@ export const useApp = create<AppState>((set, get) => ({
   setOmpCwd: (cwd) => set({ ompCwd: cwd }),
   setDraftInput: (v) => set({ draftInput: v }),
 
-  setLastModel: (m) => {
-    set({ lastModel: m });
+  setLastModelForSession: (sessionPath, m) => {
+    set((s) => ({ lastModel: m, lastModelMap: { ...s.lastModelMap, [sessionPath]: m } }));
     // 写回磁盘
+    get().persistWorkspaces();
+  },
+
+  migrateLastModelKey: (from, to) => {
+    const s = get();
+    const m = s.lastModelMap[from];
+    if (!m) return;
+    const next = { ...s.lastModelMap };
+    delete next[from];
+    if (!next[to]) next[to] = m;
+    set({ lastModelMap: next });
+    get().persistWorkspaces();
+  },
+
+  removeLastModelKey: (sessionPath) => {
+    const s = get();
+    if (!s.lastModelMap[sessionPath]) return;
+    const next = { ...s.lastModelMap };
+    delete next[sessionPath];
+    set({ lastModelMap: next });
     get().persistWorkspaces();
   },
 
@@ -879,6 +913,7 @@ export const useApp = create<AppState>((set, get) => ({
         archived: s.archived,
         removedCwds: s.removedCwds,
         lastModel: s.lastModel,
+        lastModelMap: s.lastModelMap,
         enabledModels: s.enabledModels,
         systemPrompt: s.systemPrompt,
         appearance: s.appearance,
