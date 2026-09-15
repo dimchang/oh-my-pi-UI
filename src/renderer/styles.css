@@ -541,6 +541,7 @@ body {
 
 .session-list { padding: 2px 0; }
 .session-item {
+  position: relative;
   padding: 6px 10px;
   border-radius: var(--radius-md);
   cursor: pointer;
@@ -549,6 +550,24 @@ body {
 }
 .session-item:hover { background: hsl(var(--bg-300) / 0.5); }
 .session-item.active { background: hsl(var(--accent-main-000) / 0.14); }
+/* 有状态点时右侧让位，圆点绝对定位在左缘 */
+.session-item.has-dot { padding-left: 18px; }
+.session-status-dot {
+  position: absolute;
+  left: 6px;
+  top: 12px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.session-status-dot.red { background: #ff453a; }
+.session-status-dot.orange { background: #ff9f0a; animation: sessionDotPulse 1.6s ease-in-out infinite; }
+.session-status-dot.green { background: #30d158; }
+@keyframes sessionDotPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
 .session-title {
   font-size: 12.5px;
   white-space: nowrap;

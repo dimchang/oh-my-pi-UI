@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useApp } from '../store';
+import { sessionDotStatus, SESSION_DOT_TITLES } from '../store';
 import type { SessionSummary } from '../../shared/ipc-channels';
 
 function relTime(mtime: number): string {
@@ -45,6 +46,11 @@ export const SessionList: React.FC<{
   const closeMenu = () => setCtxMenu(null);
   // 会话显示名覆盖层（host 侧重命名），优先于扫盘得到的 title
   const sessionNames = useApp((s) => s.sessionNames);
+  // 侧栏状态点数据源：运行中 / 待确认 / 出错 / 未读结果
+  const procStateMap = useApp((s) => s.procStateMap);
+  const unreadSessions = useApp((s) => s.unreadSessions);
+  const sessionErrors = useApp((s) => s.sessionErrors);
+  const uiQueue = useApp((s) => s.uiQueue);
 
   // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
   const openMenu = (menu: NonNullable<typeof ctxMenu>) => {
@@ -71,21 +77,25 @@ export const SessionList: React.FC<{
 
   return (
     <>
-      {sessions.map((s) => (
-        <div
-          key={s.path}
-          className={`session-item ${currentPath === s.path ? 'active' : ''}`}
-          onClick={() => onSelect(s)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            openMenu({ x: e.clientX, y: e.clientY, session: s });
-          }}
-          title={s.path}
-        >
-          <div className="session-title">{sessionNames[s.path] ?? s.title}</div>
-          <div className="session-time">{relTime(s.mtime)}</div>
-        </div>
-      ))}
+      {sessions.map((s) => {
+        const dot = sessionDotStatus(s.path, { procStateMap, unreadSessions, sessionErrors, uiQueue });
+        return (
+          <div
+            key={s.path}
+            className={`session-item ${currentPath === s.path ? 'active' : ''} ${dot ? 'has-dot' : ''}`}
+            onClick={() => onSelect(s)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              openMenu({ x: e.clientX, y: e.clientY, session: s });
+            }}
+            title={s.path}
+          >
+            {dot && <span className={`session-status-dot ${dot}`} title={SESSION_DOT_TITLES[dot]} />}
+            <div className="session-title">{sessionNames[s.path] ?? s.title}</div>
+            <div className="session-time">{relTime(s.mtime)}</div>
+          </div>
+        );
+      })}
 
       {ctxMenu && createPortal(
         <div

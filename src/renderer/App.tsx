@@ -268,6 +268,8 @@ export default function App(): React.ReactElement {
       });
       // 模型选择记录跟随迁移（tempKey → realPath），否则恢复时查不到
       useApp.getState().migrateLastModelKey(cur, realPath);
+      // 侧栏状态点标记（未读/出错）跟随迁移，tempKey 上打的标不丢
+      useApp.getState().migrateSessionStatus(cur, realPath);
       void rpc.renameKey(cur, realPath).then(done, done);
     }
   }, []);
@@ -792,6 +794,8 @@ export default function App(): React.ReactElement {
     });
     // 占位 key 的模型选择记录一并清掉（防 workspaces.json 无限膨胀）
     useApp.getState().removeLastModelKey(path);
+    // 侧栏状态点标记一并清掉
+    useApp.getState().clearSessionStatus(path);
     return wasCurrent;
   }, [rpc]);
 
@@ -871,6 +875,7 @@ export default function App(): React.ReactElement {
     void rpc.release(s.path).catch(() => undefined);
     void window.omp.deleteSession(s.path).then(async () => {
       useApp.getState().removeLastModelKey(s.path);
+      useApp.getState().clearSessionStatus(s.path);
       await refreshSessions();
       if (useApp.getState().currentSessionPath === s.path) {
         const nx = useApp.getState().sessions
@@ -1051,6 +1056,7 @@ export default function App(): React.ReactElement {
         await rpc.release(s.path).catch(() => undefined);
         await window.omp.deleteSession(s.path).catch(() => undefined);
         useApp.getState().removeLastModelKey(s.path);
+        useApp.getState().clearSessionStatus(s.path);
       }
     } catch {
       /* 列表失败也无妨，继续删除归档记录 */

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useApp, connTone, connDetail } from './store';
+import { useApp, connTone, connDetail, sessionDotStatus } from './store';
 import type { ToolPart } from './store';
 
 const SP = 'D:/proj';
@@ -396,5 +396,101 @@ describe('lastModelMap（会话间模型隔离）', () => {
     // A 设了自己的记录后 → per-session 记录优先，不再吃全局兜底
     useApp.getState().setLastModelForSession(sp, glm);
     expect(useApp.getState().lastModelMap[sp] ?? useApp.getState().lastModel).toEqual(glm);
+  });
+});
+
+// 侧栏会话状态点（2026-09-16）：橙=运行中、绿=有结果未查看、红=出错或待确认。
+describe('侧栏会话状态点', () => {
+  const BG = 'D:/proj/bg-session.jsonl'; // 后台会话（非当前显示）
+  const evBg = (frame: Record<string, unknown>): void =>
+    useApp.getState().applyAgentEvent({ __sessionPath: BG, ...frame } as Record<string, unknown>);
+
+  beforeEach(() => {
+    useApp.setState({
+      currentSessionPath: SP,
+      messages: [],
+      sessionsMap: {},
+      procStateMap: {},
+      unreadSessions: {},
+      sessionErrors: {},
+      uiQueue: [],
+    });
+  });
+
+  const dot = (sp: string) =>
+    sessionDotStatus(sp, {
+      procStateMap: useApp.getState().procStateMap,
+      unreadSessions: useApp.getState().unreadSessions,
+      sessionErrors: useApp.getState().sessionErrors,
+      uiQueue: useApp.getState().uiQueue,
+    });
+
+  it('后台会话 agent_end → 绿点；当前显示会话不打标', () => {
+    evBg({ type: 'agent_end' });
+    expect(useApp.getState().unreadSessions[BG]).toBe(true);
+    expect(dot(BG)).toBe('green');
+    // 当前正在显示的会话（SP）回合结束 → 用户正在看，不打标
+    ev({ type: 'agent_end' });
+    expect(useApp.getState().unreadSessions[SP]).toBeUndefined();
+  });
+
+  it('后台会话 message_end stopReason=error → 红点（错误文本入 sessionErrors）', () => {
+    evBg({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: '404 model not found', content: [] } });
+    expect(useApp.getState().sessionErrors[BG]).toBe('404 model not found');
+    expect(dot(BG)).toBe('red');
+  });
+
+  it('uiQueue 有该会话的待应答请求 → 红点', () => {
+    useApp.setState({
+      uiQueue: [{ id: 'r1', method: 'confirm', title: '允许执行 bash?', sessionPath: BG, raw: {} }],
+    });
+    expect(dot(BG)).toBe('red');
+  });
+
+  it('isStreaming → 橙点', () => {
+    useApp.setState({
+      procStateMap: { [BG]: { status: 'online', isStreaming: true, isAborting: false } },
+    });
+    expect(dot(BG)).toBe('orange');
+  });
+
+  it('优先级：红 > 橙 > 绿', () => {
+    useApp.setState({
+      procStateMap: { [BG]: { status: 'online', isStreaming: true, isAborting: false } },
+      unreadSessions: { [BG]: true },
+      sessionErrors: { [BG]: 'boom' },
+    });
+    expect(dot(BG)).toBe('red');
+    useApp.setState({ sessionErrors: {} });
+    expect(dot(BG)).toBe('orange');
+    useApp.setState({ procStateMap: { [BG]: { status: 'online', isStreaming: false, isAborting: false } } });
+    expect(dot(BG)).toBe('green');
+  });
+
+  it('无任何标记 → null（不显示点）', () => {
+    expect(dot(BG)).toBeNull();
+  });
+
+  it('setCurrentSessionPath：选中即视为已查看，清掉未读与错误标记', () => {
+    evBg({ type: 'agent_end' });
+    evBg({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'x', content: [] } });
+    expect(dot(BG)).toBe('red');
+    useApp.getState().setCurrentSessionPath(BG);
+    expect(useApp.getState().currentSessionPath).toBe(BG);
+    expect(useApp.getState().unreadSessions[BG]).toBeUndefined();
+    expect(useApp.getState().sessionErrors[BG]).toBeUndefined();
+    expect(dot(BG)).toBeNull();
+  });
+
+  it('migrateSessionStatus / clearSessionStatus：tempKey 迁移与删除清理', () => {
+    useApp.setState({ unreadSessions: { __new_t1: true }, sessionErrors: { __new_t1: 'err' } });
+    useApp.getState().migrateSessionStatus('__new_t1', BG);
+    expect(useApp.getState().unreadSessions[BG]).toBe(true);
+    expect(useApp.getState().sessionErrors[BG]).toBe('err');
+    expect(useApp.getState().unreadSessions['__new_t1']).toBeUndefined();
+    useApp.getState().clearSessionStatus(BG);
+    expect(dot(BG)).toBeNull();
+    // 无记录时 no-op 不抛错
+    expect(() => useApp.getState().clearSessionStatus(BG)).not.toThrow();
   });
 });

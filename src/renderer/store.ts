@@ -304,6 +304,12 @@ interface AppState {
   /** 各会话用户最后选中的模型（key = sessionPath）。会话间互相隔离，
    *  B 会话切模型不影响 A 会话。持久化到 workspaces.json。 */
   lastModelMap: Record<string, { provider: string; id: string; name?: string }>;
+  /** 侧栏状态点「有结果未查看」：后台会话 agent_end 时打标，选中查看后清除。
+   *  运行时态，不持久化（重启后从干净状态开始）。 */
+  unreadSessions: Record<string, boolean>;
+  /** 侧栏状态点「出错」：后台会话 message_end 带 stopReason==='error' 时记录错误文本。
+   *  运行时态，不持久化；选中查看后清除。 */
+  sessionErrors: Record<string, string>;
   /** omp 子进程**实际** cwd（来自主进程 OmpCwd 事件）。
    *  这是"是否需要 restart"的唯一可信来源——别用 currentWorkspace() 推断（启动时序错位）。 */
   ompCwd: string | null;
@@ -322,6 +328,10 @@ interface AppState {
   migrateLastModelKey(from: string, to: string): void;
   /** 删除会话时清理其模型记录，防 workspaces.json 无限膨胀。 */
   removeLastModelKey(sessionPath: string): void;
+  /** 清除某会话的侧栏状态点标记（选中查看 / 删除会话时调用）。 */
+  clearSessionStatus(sessionPath: string): void;
+  /** tempKey→realPath 迁移时同步迁移侧栏状态点标记（同 migrateLastModelKey 语义）。 */
+  migrateSessionStatus(from: string, to: string): void;
   /** 新增/更新工作空间。**不改变当前选中** —— 「发现/更新一个工作区」与「聚焦它」是两件事
    *  （2026-09-12 幽灵工作区事故：reconcile 自动补全会走到这里，隐式切换会劫持用户的当前焦点）。
    *  需要聚焦请显式调 setCurrentWorkspaceId（用户主动入口 onAddWorkspace 已补）。 */
@@ -515,6 +525,36 @@ export function connDetail(s: ConnSnapshot): string {
   return s.ready ? '就绪' : '连接中';
 }
 
+// ---- 侧栏会话状态点（2026-09-16）----
+// 橙=运行中（该会话进程正在流式生成）；红=出错或等待用户确认；绿=有结果未查看。
+export type SessionDot = 'red' | 'orange' | 'green';
+
+/** 判定状态点所需的最小状态切片。 */
+export interface SessionDotSnapshot {
+  procStateMap: Record<string, ProcState>;
+  unreadSessions: Record<string, boolean>;
+  sessionErrors: Record<string, string>;
+  uiQueue: UiRequest[];
+}
+
+/** 会话状态点标题（侧栏 tooltip）。 */
+export const SESSION_DOT_TITLES: Record<SessionDot, string> = {
+  red: '出错或等待确认',
+  orange: '运行中',
+  green: '有新结果未查看',
+};
+
+/** 纯函数：给定会话 path 与状态切片，返回应显示的状态点颜色（无则 null）。
+ *  优先级：红（出错/待确认）> 橙（运行中）> 绿（未读结果）。
+ *  等待确认 = uiQueue 里有 sessionPath 指向该会话的待应答请求（confirm/select/input/editor）。 */
+export function sessionDotStatus(sessionPath: string, snap: SessionDotSnapshot): SessionDot | null {
+  if (snap.sessionErrors[sessionPath]) return 'red';
+  if (snap.uiQueue.some((q) => q.sessionPath === sessionPath)) return 'red';
+  if (snap.procStateMap[sessionPath]?.isStreaming) return 'orange';
+  if (snap.unreadSessions[sessionPath]) return 'green';
+  return null;
+}
+
 // ---- 帧诊断环形日志（2026-09-13「回复不显示」排查配套）----
 // 每帧记一条：type / sessionPath / isDisplay / 缓冲与显示长度；帧处理抛错时记 err。
 // 再次复现「agent 已回复但 UI 不显示」时，DevTools Console 读 window.__ompDiag：
@@ -681,7 +721,22 @@ export const useApp = create<AppState>((set, get) => ({
       return { sessions: [...s.sessions, placeholder] };
     }),
   setSkills: (list) => set({ skills: list }),
-  setCurrentSessionPath: (p) => set({ currentSessionPath: p, todoPhases: [], diffs: [], subagents: [], subagentsAt: 0 }),
+  setCurrentSessionPath: (p) => {
+    // 选中即视为「已查看」：清掉该会话的侧栏未读/错误标记（绿/红点）
+    const cleared: Partial<AppState> = {};
+    if (p) {
+      const s = get();
+      if (s.unreadSessions[p] || s.sessionErrors[p]) {
+        const unreadSessions = { ...s.unreadSessions };
+        const sessionErrors = { ...s.sessionErrors };
+        delete unreadSessions[p];
+        delete sessionErrors[p];
+        cleared.unreadSessions = unreadSessions;
+        cleared.sessionErrors = sessionErrors;
+      }
+    }
+    set({ currentSessionPath: p, todoPhases: [], diffs: [], subagents: [], subagentsAt: 0, ...cleared });
+  },
 
   // M5: 工作空间
   workspaces: [],
@@ -691,6 +746,8 @@ export const useApp = create<AppState>((set, get) => ({
   removedCwds: [],
   lastModel: undefined,
   lastModelMap: {},
+  unreadSessions: {},
+  sessionErrors: {},
   ompCwd: null,
   draftInput: undefined,
 
@@ -817,6 +874,30 @@ export const useApp = create<AppState>((set, get) => ({
     set({ lastModelMap: next });
     get().persistWorkspaces();
   },
+
+  clearSessionStatus: (sessionPath) =>
+    set((s) => {
+      if (!s.unreadSessions[sessionPath] && !s.sessionErrors[sessionPath]) return s;
+      const unreadSessions = { ...s.unreadSessions };
+      const sessionErrors = { ...s.sessionErrors };
+      delete unreadSessions[sessionPath];
+      delete sessionErrors[sessionPath];
+      return { unreadSessions, sessionErrors };
+    }),
+
+  migrateSessionStatus: (from, to) =>
+    set((s) => {
+      const unread = s.unreadSessions[from];
+      const err = s.sessionErrors[from];
+      if (unread === undefined && err === undefined) return s;
+      const unreadSessions = { ...s.unreadSessions };
+      const sessionErrors = { ...s.sessionErrors };
+      delete unreadSessions[from];
+      delete sessionErrors[from];
+      if (unread) unreadSessions[to] = true;
+      if (err) sessionErrors[to] = err;
+      return { unreadSessions, sessionErrors };
+    }),
 
   upsertWorkspace: (ws) =>
     set((s) => {
@@ -1122,6 +1203,11 @@ export const useApp = create<AppState>((set, get) => ({
     const getBuf = (): ChatMessage[] =>
       (buffer ??= s.sessionsMap[rawTargetPath] ? [...s.sessionsMap[rawTargetPath]] : []);
     let bufferTouched = false;
+    // 侧栏状态点（2026-09-16）：后台会话回合结束 → 绿点「有结果未查看」；
+    // 后台会话模型请求失败 → 红点「出错」（错误文本存 sessionErrors）。
+    // 当前正在显示的会话不打标（用户正看着，无需提醒）。
+    let markUnread = false;
+    let markErrorText: string | undefined;
 
     try {
     switch (type) {
@@ -1134,6 +1220,8 @@ export const useApp = create<AppState>((set, get) => ({
       case 'agent_end': {
         procStreaming = false;
         procAborting = false;
+        // 后台会话回合完成 → 未读绿点；当前显示会话不标（用户正在看）
+        if (!isDisplay) markUnread = true;
         break;
       }
       case 'message_start': {
@@ -1176,6 +1264,8 @@ export const useApp = create<AppState>((set, get) => ({
         const errorText = isError
           ? (msg.errorMessage ?? `请求失败${msg.errorStatus ? ` (${msg.errorStatus})` : ''}`)
           : undefined;
+        // 后台会话模型请求失败 → 红点标记（错误文本入 sessionErrors）；当前显示会话不打标
+        if (errorText && !isDisplay) markErrorText = errorText;
         const buf = getBuf();
         let matched = false;
         for (let i = buf.length - 1; i >= 0; i--) {
@@ -1363,6 +1453,12 @@ export const useApp = create<AppState>((set, get) => ({
         } as ProcState,
       },
     };
+    if (markUnread) {
+      updates.unreadSessions = { ...s.unreadSessions, [rawTargetPath]: true };
+    }
+    if (markErrorText) {
+      updates.sessionErrors = { ...s.sessionErrors, [rawTargetPath]: markErrorText };
+    }
     if (bufferTouched) {
       updates.sessionsMap = { ...s.sessionsMap, [rawTargetPath]: buffer! };
       if (isDisplay) updates.messages = buffer!;
