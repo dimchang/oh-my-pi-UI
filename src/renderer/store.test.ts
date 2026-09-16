@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useApp, connTone, connDetail, sessionDotStatus } from './store';
+import { useApp, connTone, connDetail, sessionDotStatus, shouldHealStuckStreaming, shouldClearStaleRetry, RETRY_WORK_FRAME_TYPES, RETRY_STALE_MS } from './store';
 import type { ToolPart } from './store';
 
 const SP = 'D:/proj';
@@ -492,5 +492,127 @@ describe('侧栏会话状态点', () => {
     expect(dot(BG)).toBeNull();
     // 无记录时 no-op 不抛错
     expect(() => useApp.getState().clearSessionStatus(BG)).not.toThrow();
+  });
+});
+
+// 流式状态对账判定（2026-09-16 橙点常亮修复）：omp 的 abort/异常路径不补发 agent_end，
+// 帧流断掉后本侧 isStreaming 卡 true。以 omp get_state 为权威真值对账，带新鲜度守卫。
+describe('shouldHealStuckStreaming（agent_end 丢失自愈判定）', () => {
+  const ps = (o: Record<string, unknown>) =>
+    ({ status: 'online', isStreaming: true, isAborting: false, ...o }) as Parameters<typeof shouldHealStuckStreaming>[0];
+
+  it('本侧 streaming + omp 报已结束 + 往返期间无新帧 → 需要自愈', () => {
+    const sentAt = 1000;
+    expect(shouldHealStuckStreaming(ps({ lastFrameAt: 900 }), false, sentAt)).toBe(true);
+    // lastFrameAt 缺失视为很旧 → 需要自愈
+    expect(shouldHealStuckStreaming(ps({}), false, sentAt)).toBe(true);
+  });
+
+  it('往返期间有新帧 → 帧流是权威，不覆写（可能已 agent_end 或新回合已 agent_start）', () => {
+    const sentAt = 1000;
+    expect(shouldHealStuckStreaming(ps({ lastFrameAt: 1001 }), false, sentAt)).toBe(false);
+  });
+
+  it('omp 仍报 streaming（含 undefined 未知）→ 不自愈（真挂死走 stuck 提示分支）', () => {
+    const sentAt = 1000;
+    expect(shouldHealStuckStreaming(ps({ lastFrameAt: 900 }), true, sentAt)).toBe(false);
+    expect(shouldHealStuckStreaming(ps({ lastFrameAt: 900 }), undefined, sentAt)).toBe(false);
+  });
+
+  it('本侧已不 streaming（agent_end 已正常处理）→ 无需对账', () => {
+    const sentAt = 1000;
+    expect(shouldHealStuckStreaming(ps({ isStreaming: false, lastFrameAt: 900 }), false, sentAt)).toBe(false);
+    expect(shouldHealStuckStreaming(undefined, false, sentAt)).toBe(false);
+  });
+});
+
+// 2026-09-17「重试中 (1/10)… 常亮」修复：omp 的 auto_retry_end 不保证送达
+// （成功路径被 IX(e)/#s>0 两道门挡住就直接 return；失败路径多处只在 #s>1 时补发）。
+// 复现：session 01a0ab4b-66c0-750d-b8e0-0e3a01775714 断网触发重试，网络恢复后同一回合
+// 正常续跑、后续多轮对话全部 stopReason=stop，但结束帧始终没到 → 气泡永久常亮。
+describe('重试气泡终结（auto_retry_end 丢失兜底）', () => {
+  const BG = 'D:/proj-bg';
+  const reset = (): void =>
+    useApp.setState({
+      currentSessionPath: SP,
+      isRetrying: false,
+      retryInfo: '',
+      retrySessionPath: null,
+      retryStartedAt: 0,
+    });
+  /** 制造一次进行中的重试气泡（模拟 auto_retry_start，与实测帧一致） */
+  const startRetry = (): void =>
+    ev({ type: 'auto_retry_start', attempt: 1, maxAttempts: 10, delayMs: 5000, errorMessage: 'socket closed' });
+
+  beforeEach(reset);
+
+  it('auto_retry_start → 气泡出现并记录归属', () => {
+    startRetry();
+    const s = useApp.getState();
+    expect(s.isRetrying).toBe(true);
+    expect(s.retryInfo).toBe('重试中 (1/10)…');
+    expect(s.retrySessionPath).toBe(SP);
+  });
+
+  it('auto_retry_end（正常路径）→ 气泡清除', () => {
+    startRetry();
+    ev({ type: 'auto_retry_end', success: true, attempt: 1 });
+    expect(useApp.getState().isRetrying).toBe(false);
+    expect(useApp.getState().retrySessionPath).toBeNull();
+  });
+
+  it('关键回归：结束帧丢失时，回合内出现「干活」帧即终结气泡', () => {
+    // 断网那次的失败回合：message_end(error) + agent_end 不得清掉气泡（否则退避期间气泡会闪没）
+    startRetry();
+    ev({
+      type: 'message_end',
+      message: { role: 'assistant', stopReason: 'error', errorMessage: 'socket closed', content: [{ type: 'thinking', thinking: 'x' }] },
+    });
+    expect(useApp.getState().isRetrying).toBe(true);
+    ev({ type: 'agent_end' });
+    expect(useApp.getState().isRetrying).toBe(true);
+    // 网络恢复：重试续跑开始产出（agent_start / message_update / 工具执行任一命中即可）
+    ev({ type: 'message_update', message: { role: 'assistant', content: [{ type: 'text', text: '继续' }] } });
+    expect(useApp.getState().isRetrying).toBe(false);
+    expect(useApp.getState().retryInfo).toBe('');
+    expect(useApp.getState().retrySessionPath).toBeNull();
+  });
+
+  it('agent_start / tool_execution_* 同样是终结信号', () => {
+    for (const frame of [
+      { type: 'agent_start' },
+      { type: 'tool_execution_start', toolCallId: 'c1', toolName: 'bash', args: {} },
+      { type: 'tool_execution_end', toolCallId: 'c1', toolName: 'bash', result: 'ok' },
+    ]) {
+      reset();
+      startRetry();
+      ev(frame);
+      expect(useApp.getState().isRetrying, JSON.stringify(frame)).toBe(false);
+    }
+  });
+
+  it('归属隔离：别的会话的帧不会清掉本会话气泡，切会话则清', () => {
+    startRetry();
+    // 后台会话的干活帧 → 不影响本会话气泡
+    useApp.getState().applyAgentEvent({ __sessionPath: BG, type: 'agent_start' } as Record<string, unknown>);
+    expect(useApp.getState().isRetrying).toBe(true);
+    // 切到别的会话 → 气泡不跟着串台
+    useApp.getState().setCurrentSessionPath(BG);
+    expect(useApp.getState().isRetrying).toBe(false);
+    expect(useApp.getState().retrySessionPath).toBeNull();
+  });
+
+  it('shouldClearStaleRetry：超阈值才算过期，新一轮 auto_retry_start 会刷新计时', () => {
+    expect(shouldClearStaleRetry(false, 1000, 1000 + RETRY_STALE_MS)).toBe(false);
+    expect(shouldClearStaleRetry(true, 1000, 1000 + RETRY_STALE_MS - 1)).toBe(false);
+    expect(shouldClearStaleRetry(true, 1000, 1000 + RETRY_STALE_MS)).toBe(true);
+    // lastStartAt 缺失（0）视为未知，不误清
+    expect(shouldClearStaleRetry(true, 0, Number.MAX_SAFE_INTEGER)).toBe(false);
+  });
+
+  it('RETRY_WORK_FRAME_TYPES 不含收尾类帧（避免退避期间误清）', () => {
+    expect(RETRY_WORK_FRAME_TYPES.has('message_end')).toBe(false);
+    expect(RETRY_WORK_FRAME_TYPES.has('agent_end')).toBe(false);
+    expect(RETRY_WORK_FRAME_TYPES.has('auto_retry_start')).toBe(false);
   });
 });

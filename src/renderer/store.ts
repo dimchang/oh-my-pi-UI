@@ -222,6 +222,10 @@ interface AppState {
   isCompacting: boolean;
   isRetrying: boolean;
   retryInfo: string;
+  /** `isRetrying` 归属的会话 path（null = 没有进行中的重试气泡）。见 RETRY_WORK_FRAME_TYPES 注释。 */
+  retrySessionPath: string | null;
+  /** 最近一次 `auto_retry_start` 的时间戳（兜底过期判定用，0=无）。 */
+  retryStartedAt: number;
   compactionInfo: string;
   sessionStats?: { totalTokens?: number; totalCost?: number; messageCount?: number };
   /** 右栏 Diff 面板内容：从 tool_execution_end 结果中提取的 unified diff 列表。 */
@@ -555,6 +559,61 @@ export function sessionDotStatus(sessionPath: string, snap: SessionDotSnapshot):
   return null;
 }
 
+/** 流式状态对账判定（纯函数，2026-09-16 橙点常亮修复）。
+ *  背景：omp 的 agent 循环异常/中止路径（帧收集器 FG.fail）**不补发 agent_end 帧**，
+ *  帧流戛然而止 → 渲染层 procStateMap.isStreaming 永久卡 true（实证 session 01a0a638
+ *  工作早已完成但侧栏橙点常亮，直到用户点回该会话）。
+ *  omp 内部 isStreaming（rpc get_state 返回）是权威真值。当满足：
+ *    1) 本侧镜像仍标记 streaming；2) omp 报已结束（isStreaming === false，严格判 false，
+ *    undefined 视为未知不动）；3) RPC 往返期间无新帧到达（lastFrameAt <= sentAt——
+ *    有新帧说明帧流是权威，可能已 agent_end 或新回合已 agent_start，不覆写）
+ *  时，应以 omp 为准重置本侧镜像。 */
+export function shouldHealStuckStreaming(
+  ps: ProcState | undefined,
+  ompIsStreaming: boolean | undefined,
+  sentAt: number,
+): boolean {
+  return !!ps?.isStreaming && ompIsStreaming === false && (ps.lastFrameAt ?? 0) <= sentAt;
+}
+
+// ---- 重试气泡终结判定（2026-09-17「重试中 (1/10)… 常亮」修复）----
+// 背景：omp 的 `auto_retry_end` **不保证送达** —— 与 agent_end 属同一类契约缺口
+// （对照上方 shouldHealStuckStreaming 的取证结论）。grep omp 18.0.4 内嵌源码（bun --compile 产物）实证：
+//   成功路径：auto_retry_end 只从 onAssistantSettledSuccessfully 发出，前置两道门
+//             `if (!IX(e)) return;`（IX 要求 stopReason 非 error/aborted 且 content 含可见块）
+//             和 `if (this.#s === 0) return;`；任一不满足就直接返回，**不补发**。
+//   失败路径：多处 `if (this.#s > 1) { emit }` 之后才 `#s = 0` —— 首次重试（#s===1）失败时
+//             同样静默归零，**不补发**。
+// 实测（session 01a0ab4b-66c0-750d-b8e0-0e3a01775714，omp 18.0.4，用户断网触发）：
+//   omp 日志 01:39:36 `agent turn ended with provider error`（socket closed）→ UI 显示
+//   「重试中 (1/10)…」→ 01:39:55 起同一回合正常恢复、后续多轮对话全部 stopReason=stop，
+//   但结束帧始终没到 → 气泡永久常亮。
+//
+// 判定原则：**重试只发生在"静默退避等待"期**。因此该会话一旦出现任何「正在干活」的帧，
+// 就说明 omp 已经越过退避阶段（成功续跑或被新的 auto_retry_start 重新点亮），重试已终结。
+// 刻意排除 message_end / agent_end：失败那一次尝试的收尾帧可能晚于 auto_retry_start 到达，
+// 把它们算作"干活"会在正常退避期间误清气泡。
+export const RETRY_WORK_FRAME_TYPES: ReadonlySet<string> = new Set([
+  'agent_start', // 新回合（含重试续跑）开始
+  'message_start', // 新的 assistant 消息开始流式
+  'message_update', // 模型正在产出 token
+  'tool_execution_start', // 工具开始执行
+  'tool_execution_end', // 工具执行结束
+]);
+
+/** 兜底过期阈值：连续这么久没收到任何「干活」帧也没收到新的 auto_retry_start，认定结束帧丢失。 */
+export const RETRY_STALE_MS = 10 * 60 * 1000;
+
+/** 重试气泡过期判定（纯函数）：超阈值仍未收到终结信号 → 强制清除。
+ *  lastStartAt 每次 `auto_retry_start` 刷新，所以正常的多轮退避重试不会被误清。 */
+export function shouldClearStaleRetry(
+  isRetrying: boolean,
+  lastStartAt: number,
+  now: number,
+): boolean {
+  return isRetrying && lastStartAt > 0 && now - lastStartAt >= RETRY_STALE_MS;
+}
+
 // ---- 帧诊断环形日志（2026-09-13「回复不显示」排查配套）----
 // 每帧记一条：type / sessionPath / isDisplay / 缓冲与显示长度；帧处理抛错时记 err。
 // 再次复现「agent 已回复但 UI 不显示」时，DevTools Console 读 window.__ompDiag：
@@ -607,6 +666,8 @@ export const useApp = create<AppState>((set, get) => ({
   isCompacting: false,
   isRetrying: false,
   retryInfo: '',
+  retrySessionPath: null,
+  retryStartedAt: 0,
   compactionInfo: '',
   rightPanel: 'off',
   diffs: [],
@@ -695,9 +756,9 @@ export const useApp = create<AppState>((set, get) => ({
 
   setSessions: (list) =>
     set((s) => {
-      // 保留尚未落盘的临时会话占位（__new_ 开头）：新会话首条消息 agent_end 才写 .jsonl，
-      // 期间 refreshSessions 多次扫盘都扫不到，若直接覆盖会清掉刚乐观插入的占位条目。
-      // 占位在 migrateTempSession 时由真实 path 替换 / 移除（见 App.tsx）。
+      // 保留尚未落盘的临时会话占位（__new_ 开头）：占位在首条消息提交时插入，而 omp 要到
+      // 该回合的 .jsonl 落盘后才会被扫盘扫到，期间若直接覆盖会让刚出现在侧栏的条目闪一下
+      // 消失。占位在 migrateTempSession 时由真实 path 替换 / 移除（见 App.tsx）。
       const placeholders = s.sessions.filter(
         (x) => x.path.startsWith('__new_') && !list.some((y) => y.path === x.path),
       );
@@ -713,8 +774,10 @@ export const useApp = create<AppState>((set, get) => ({
         path,
         id: path,
         cwd,
-        // 若用户在落盘前就已重命名过（sessionNames 里有该 tempKey 覆盖），沿用之
-        title: s.sessionNames[path] ?? '新会话',
+        // 2026-09-17 起本方法只在「首条消息提交」时被调用（App.tsx autoNameTempSession），
+        // 调用方保证 sessionNames[path] 已经写好名字；兜底值也不再是「新会话」——
+        // 侧栏不允许出现任何形式的临时标题。
+        title: s.sessionNames[path] ?? '（未命名会话）',
         mtime: Date.now(),
         cwdExists: true, // 占位会话的 cwd 刚由用户选定/当前工作区给出，必然有效
       };
@@ -735,7 +798,21 @@ export const useApp = create<AppState>((set, get) => ({
         cleared.sessionErrors = sessionErrors;
       }
     }
-    set({ currentSessionPath: p, todoPhases: [], diffs: [], subagents: [], subagentsAt: 0, ...cleared });
+    set({
+      currentSessionPath: p,
+      todoPhases: [],
+      diffs: [],
+      subagents: [],
+      subagentsAt: 0,
+      // 重试气泡是「切走前那个会话」的临时进度提示：切会话即清。
+      // 否则 omp 漏发结束帧时会串到新会话上常亮（气泡归属只对当前显示会话记录，
+      // 回到原会话时若重试仍在进行，omp 每轮退避都会重发 start 帧，气泡会自然恢复）。
+      isRetrying: false,
+      retryInfo: '',
+      retrySessionPath: null,
+      retryStartedAt: 0,
+      ...cleared,
+    });
   },
 
   // M5: 工作空间
@@ -986,6 +1063,9 @@ export const useApp = create<AppState>((set, get) => ({
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       persistTimer = null;
+      // 测试环境（node）无 window：防抖定时器可能在测试文件结束后才触发，
+      // 此时 rpc-client 的 window.omp 不存在，静默跳过持久化（避免 unhandled rejection）
+      if (typeof window === 'undefined') return;
       const s = get();
       const file: WorkspacesFile = {
         version: 1,
@@ -1193,6 +1273,13 @@ export const useApp = create<AppState>((set, get) => ({
     // sessionsMap 的 key 始终用原始格式（与 loadSessionMessages/appendUserMessage 一致），
     // 仅在 isDisplay 比较时归一化（__sessionPath 可能含 \ 而 currentSessionPath 含 /）。
     const isDisplay = pathsEqual(rawTargetPath, s.currentSessionPath ?? '');
+    // 该帧是否属于"正在显示重试气泡的那个会话"（重试终结信号按会话判定，避免串台）
+    const retryOwned = !!s.retrySessionPath && pathsEqual(s.retrySessionPath, rawTargetPath);
+    // 兜底：重试气泡超期未收到任何终结信号（omp 结束帧丢失）→ 强制清除，防止永久常亮
+    if (shouldClearStaleRetry(s.isRetrying, s.retryStartedAt, now)) {
+      set({ isRetrying: false, retryInfo: '', retrySessionPath: null, retryStartedAt: 0 });
+      pushFrameDiag({ t: now, type: 'retry-stale-cleared', sp: s.retrySessionPath ?? '', display: false });
+    }
     // per-session 流式状态（后台会话独立维护，不污染全局 isStreaming）
     let procStreaming = s.procStateMap[rawTargetPath]?.isStreaming ?? false;
     let procAborting = s.procStateMap[rawTargetPath]?.isAborting ?? false;
@@ -1414,12 +1501,20 @@ export const useApp = create<AppState>((set, get) => ({
         if (isDisplay) {
           const attempt = (frame.attempt ?? frame.retryCount ?? '?') as number | string;
           const max = (frame.maxAttempts ?? frame.maxRetries ?? '?') as number | string;
-          set({ isRetrying: true, retryInfo: `重试中 (${attempt}/${max})…` });
+          set({
+            isRetrying: true,
+            retryInfo: `重试中 (${attempt}/${max})…`,
+            retrySessionPath: rawTargetPath,
+            retryStartedAt: now,
+          });
         }
         return;
       }
       case 'auto_retry_end': {
-        if (isDisplay) set({ isRetrying: false, retryInfo: '' });
+        // 只终结归属自己的那一份（多会话并发时不会误清别人的气泡）
+        if (!s.retrySessionPath || pathsEqual(s.retrySessionPath, rawTargetPath)) {
+          set({ isRetrying: false, retryInfo: '', retrySessionPath: null, retryStartedAt: 0 });
+        }
         return;
       }
       case 'todo_reminder': {
@@ -1458,6 +1553,14 @@ export const useApp = create<AppState>((set, get) => ({
     }
     if (markErrorText) {
       updates.sessionErrors = { ...s.sessionErrors, [rawTargetPath]: markErrorText };
+    }
+    // 重试气泡终结：该会话出现了「正在干活」的帧 → omp 已越过退避重试阶段（见 RETRY_WORK_FRAME_TYPES）。
+    // 这是 auto_retry_end 丢失时的主要兜底，保证气泡不会跨回合常亮。
+    if (retryOwned && RETRY_WORK_FRAME_TYPES.has(type)) {
+      updates.isRetrying = false;
+      updates.retryInfo = '';
+      updates.retrySessionPath = null;
+      updates.retryStartedAt = 0;
     }
     if (bufferTouched) {
       updates.sessionsMap = { ...s.sessionsMap, [rawTargetPath]: buffer! };

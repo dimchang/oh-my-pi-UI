@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useApp, type UiRequest, type Attachment, toolNameOf, isImageFile } from './store';
+import { useApp, type UiRequest, type Attachment, toolNameOf, isImageFile, shouldHealStuckStreaming } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -14,9 +14,15 @@ import { TodoPanel } from './components/TodoPanel';
 import { JobPanel } from './components/JobPanel';
 import { DiffView } from './components/DiffView';
 import { SettingsPanel } from './components/SettingsPanel';
-import { cwdKey, makeWorkspaceId, basename } from './utils/path-key';
+import { cwdKey, makeWorkspaceId, basename, pathsEqual } from './utils/path-key';
 import { planWorkspaceReconcile } from './utils/workspace-reconcile';
 import { stripDataUrlPrefix } from './utils/image-data-url';
+import {
+  TEMP_KEY_PREFIX,
+  UNNAMED_SESSION,
+  LEGACY_TEMP_TITLE,
+  deriveSessionName,
+} from './utils/temp-session';
 import { applyAppearance } from './store';
 import type { OmpFrame, RpcExtensionUIRequest, RpcImage, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
 import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
@@ -51,6 +57,7 @@ export default function App(): React.ReactElement {
         useApp.getState().setState({ sessionStats: sr.data });
       }
     }).catch(() => undefined);
+    const sentAt = Date.now();
     return rpc.getState(sp).then((r) => {
       if (r.success && r.data) {
         const d = r.data as RpcSessionState;
@@ -64,8 +71,18 @@ export default function App(): React.ReactElement {
             todoPhases: d.todoPhases ?? [],
             isCompacting: d.isCompacting ?? false,
           } : {}),
-          // isStreaming/isAborting 改由 procStateMap 驱动，这里不覆写
+          // isStreaming/isAborting 仍由 procStateMap 驱动；但若镜像与 omp 真值漂移
+          // （agent_end 帧丢失），下面立即校正——选中即对账，不等 30s 看门狗。
         });
+        // 流式状态对账（2026-09-16 橙点常亮修复）：omp 报已结束而本侧镜像仍 streaming
+        // → 以 omp 为准重置（含新鲜度守卫，见 shouldHealStuckStreaming）。
+        const stNow = useApp.getState();
+        if (shouldHealStuckStreaming(stNow.procStateMap[sp], d.isStreaming, sentAt)) {
+          stNow.setProcState(sp, { isStreaming: false, isAborting: false, stuckSince: undefined });
+          if (sp === useApp.getState().currentSessionPath) {
+            useApp.getState().setState({ isStreaming: false, isAborting: false });
+          }
+        }
         // 注意：这里**不做** lastModel 自动恢复——refreshState 的触发点很多（切会话/
         // agent_end/轮询），任何一次触发都会把别的会话选的模型覆盖到本会话上
         // （2026-09-16 串模型事故）。恢复只在进程拉起时做，见 restoreSessionModel。
@@ -75,7 +92,32 @@ export default function App(): React.ReactElement {
 
   const refreshSessions = useCallback((): Promise<void> => {
     return window.omp.listSessions()
-      .then((list) => useApp.getState().setSessions(list))
+      .then((list) => {
+        useApp.getState().setSessions(list);
+        // 扫盘后对账（2026-09-17）：已提交过消息的 temp 占位，若 omp 自报的落盘路径
+        // （get_state.sessionFile）已经出现在扫盘结果里，就立刻迁移，不必等 agent_end——
+        // omp 在首条消息生成期间就开始写盘，中间任何一次额外扫盘（切工作区 / 删别的会话）
+        // 都会让占位与真实条目在侧栏同时出现，看起来就是两条重复会话。
+        // 判据必须落在「真实文件确实已经可见」上：真实文件还不可见就迁移，会话会从侧栏
+        // 消失，比重复更糟。也正因为如此不用「同 cwd 最新会话」这种猜法（同目录下若另有
+        // 会话正在写盘会误判）。进程离线时 getState 失败 → 交给 onExit / agent_end 路径。
+        // migrateRef 转调以避开与 migrateTempSession 的声明顺序依赖。
+        for (const p of useApp.getState().sessions) {
+          if (!p.path.startsWith(TEMP_KEY_PREFIX)) continue;
+          if (!tempSubmittedKeys.current.has(p.path)) continue;
+          if (migratingTempKeys.current.has(p.path)) continue;
+          void rpc
+            .getState(p.path)
+            .then((r) => {
+              if (!r.success || !r.data) return;
+              const sf = (r.data as { sessionFile?: unknown }).sessionFile;
+              if (typeof sf !== 'string' || sf.startsWith(TEMP_KEY_PREFIX)) return;
+              if (!list.some((x) => x.path === sf)) return;
+              void migrateRef.current(p.path);
+            })
+            .catch(() => undefined);
+        }
+      })
       .catch(() => undefined);
   }, []);
 
@@ -145,6 +187,11 @@ export default function App(): React.ReactElement {
    *  会让用户实际用过的 temp 会话被 onSelectSession 静默清掉。
    *  onSend/onGuide/onQueue 成功 append 后记入；discardTempSession / 迁移成功后清除。 */
   const tempSubmittedKeys = useRef<Set<string>>(new Set());
+
+  /** tempKey → 新建时选定的 cwd。2026-09-17 起侧栏占位改到「首条消息提交」时才创建（见
+   *  autoNameTempSession），那一刻已经离开 doNewSession 作用域，需要把 cwd 带过来。
+   *  不用 currentWorkspace() 反推：用户完全可以在新建后切到别的工作区再回来发消息。 */
+  const tempCwdRef = useRef<Map<string, string>>(new Map());
 
   /** 新会话首条消息 agent_end 后 omp 才落盘 .jsonl。此时把临时 key（__new_ 开头）
    *  迁移成真实文件 path：缓冲/procState 迁移 + 通知主进程 renameKey。
@@ -237,6 +284,7 @@ export default function App(): React.ReactElement {
       claimedRealPaths.current.add(realPath);
       knownSessionPathsBeforeNew.current.add(realPath);
       tempSubmittedKeys.current.delete(cur);
+      tempCwdRef.current.delete(cur);
       const buf = st.sessionsMap[cur];
       const ps = st.procStateMap[cur];
       const sessionsMap = { ...st.sessionsMap };
@@ -276,18 +324,17 @@ export default function App(): React.ReactElement {
   // 回填自引用，供落盘竞态重试调度
   migrateRef.current = migrateTempSession;
 
-  /** 新建会话的「乐观选中」（同步，spawn 前调用）：
-   *  切指针 + 清缓冲 + 侧栏占位。2026-09-14 串台修复：旧实现 await spawn 完成后才切
-   *  currentSessionPath，存在 ~2.8s 空窗期（实测 2524~2951ms），期间输入框可用而指针仍指
-   *  旧会话 → 回车把 prompt 真实发给旧会话进程。现在指针在 spawn 前就切走，空窗期不存在。 */
-  const resolveAndSelectNewSession = useCallback((newSessionPath: string, cwd?: string): void => {
+  /** 新建会话的「乐观选中」（同步，spawn 前调用）：切指针 + 清缓冲。
+   *  2026-09-14 串台修复：旧实现 await spawn 完成后才切 currentSessionPath，存在 ~2.8s
+   *  空窗期（实测 2524~2951ms），期间输入框可用而指针仍指旧会话 → 回车把 prompt 真实发给
+   *  旧会话进程。现在指针在 spawn 前就切走，空窗期不存在。
+   *  2026-09-17：这里**不再**往侧栏插占位条目——占位改由首条消息提交时创建（那时名字已就位），
+   *  所以回车前侧栏不会出现任何新条目，也就永远不会有「新会话」这种临时标题与真实标题并存。 */
+  const resolveAndSelectNewSession = useCallback((newSessionPath: string): void => {
     useApp.getState().setCurrentSessionPath(newSessionPath);
     useApp.getState().resetChat();
     // 新会话统计从零开始，先清掉旧会话残留（refreshState 会重新拉取）
     useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined });
-    // 乐观插入占位：新会话首条消息 agent_end 才落盘 .jsonl，在此之前先在侧栏显示，
-    // 否则用户要等 LLM 回完才能看到刚开的会话（setSessions 会保留 __new_ 占位不被扫盘冲掉）。
-    if (cwd) useApp.getState().upsertSessionPlaceholder(newSessionPath, cwd);
   }, []);
 
   /** 加载 workspaces 文件并补全"扫盘发现的但 store 里没有"的工作空间。 */
@@ -297,6 +344,19 @@ export default function App(): React.ReactElement {
       // 恢复上次的外观配置（主题预设 / 背景色 / 字体 / 字号 / 配色模式）
       applyAppearance(useApp.getState().appearance);
       const st = useApp.getState();
+      // 清理上一运行周期残留的 temp 记忆（2026-09-17）：`__new_` 是内存态 key，磁盘上不可能
+      // 有对应 .jsonl，重启后永远用不到。不清就会随「提交首条消息后没等落盘就退出应用」
+      // 逐次累积（覆盖名落 sessionNames、切过的模型落 lastModelMap）。
+      const staleNames = Object.keys(st.sessionNames).filter((k) => k.startsWith(TEMP_KEY_PREFIX));
+      const staleModels = Object.keys(st.lastModelMap).filter((k) => k.startsWith(TEMP_KEY_PREFIX));
+      if (staleNames.length > 0 || staleModels.length > 0) {
+        const sessionNames = { ...st.sessionNames };
+        for (const k of staleNames) delete sessionNames[k];
+        const lastModelMap = { ...st.lastModelMap };
+        for (const k of staleModels) delete lastModelMap[k];
+        useApp.getState().setState({ sessionNames, lastModelMap });
+        useApp.getState().persistWorkspaces();
+      }
       // 判定全部收敛到纯函数 planWorkspaceReconcile（可单测）：
       //  - 幽灵防护：会话 cwd 已消失（cwdExists=false）→ 绝不自动造工作区；
       //  - currentId 失效回退：指向已消失目录 → 切到第一个可用工作区并明确提示。
@@ -407,7 +467,14 @@ export default function App(): React.ReactElement {
       // 旧实现只在 code!==0 时走迁移 → evict 路径下 tempKey 永不迁移，指针滞留死 key，
       // 之后 ensureOnline/acquire(tempKey) 对一个磁盘上不存在的 key 全新 spawn →
       // 一个用户会话裂成两个 .jsonl（实证 2026-09-14 bet_zp：01a0a046 被杀后 spawn 出 01a0a048）。
-      if (sessionPath.startsWith('__new_')) {
+      if (sessionPath.startsWith(TEMP_KEY_PREFIX)) {
+        // 从未提交过消息的 temp 不可能落盘（omp 只在收到 prompt 后才写 .jsonl）：直接丢弃。
+        // 走迁移反而有风险——扫盘兜底判据无法区分「哪个新会话是它的」，可能把指针认领到
+        // 同 cwd 里的别的会话上（2026-09-17）。
+        if (!tempSubmittedKeys.current.has(sessionPath)) {
+          discardTempSession(sessionPath);
+          return;
+        }
         void refreshSessions()
           .then(() => migrateTempSession(sessionPath))
           .then(() => {
@@ -496,8 +563,12 @@ export default function App(): React.ReactElement {
    *  不存在而全新 spawn，一个用户会话裂成两个（实证 2026-09-14 bet_zp）。
    *  进程在线或确实未落盘时原样返回。 */
   const resolveSessionKey = useCallback(async (sp: string): Promise<string> => {
-    if (!sp.startsWith('__new_')) return sp;
+    if (!sp.startsWith(TEMP_KEY_PREFIX)) return sp;
     if (useApp.getState().procStateMap[sp]?.status === 'online') return sp;
+    // 从未提交过消息的 temp 不可能已落盘（omp 只在收到 prompt 后才写 .jsonl）：此时迁移
+    // 只会把指针挪到别的路径上，随后上架的侧栏条目反而失去归属，还可能靠扫盘兜底误认领
+    // 同 cwd 里的其它新会话。这种情况按原 key 继续 acquire 即可（2026-09-17）。
+    if (!tempSubmittedKeys.current.has(sp)) return sp;
     // 进程离线：落盘过的 temp 会话（首条消息后 omp 即流式写盘，无需等 agent_end）
     // 一定已能被扫盘看到。migrateTempSession 会把指针/缓冲/pool key 全部迁到真实 path。
     await refreshSessions();
@@ -507,6 +578,27 @@ export default function App(): React.ReactElement {
     if (!now.procStateMap[sp] && now.currentSessionPath) return now.currentSessionPath;
     return sp;
   }, [refreshSessions, migrateTempSession]);
+
+  /** 新会话首条消息提交时的「取名 + 上架」：先按输入首行（退回附件名）生成会话名，写入
+   *  host 侧覆盖层 sessionNames，再把占位条目插进侧栏——顺序保证侧栏里出现的第一个状态
+   *  就已经是「有名字的会话」，全程不会出现「新会话」这种临时标题（2026-09-17 需求）。
+   *  调用点在 onSend/onGuide/onQueue 的 rpc.acquire 之后、rpc.prompt 之前：名字先于 prompt
+   *  生效，用户看到条目时消息尚未发给 LLM。temp→real 迁移时 migrateTempSession 会把覆盖名
+   *  一并迁到真实 path（持久化不丢）。
+   *  判据见 utils/temp-session.deriveSessionName（与主进程 titleFallback 同源）；用户已手动
+   *  命名（覆盖层存在且不是占位/兜底值）时不覆盖，但条目仍要上架。 */
+  const autoNameTempSession = useCallback((key: string, text: string, attachments?: Attachment[]) => {
+    if (!key.startsWith(TEMP_KEY_PREFIX)) return;
+    const st = useApp.getState();
+    const existing = st.sessionNames[key];
+    const alreadyNamed = !!existing && existing !== LEGACY_TEMP_TITLE && existing !== UNNAMED_SESSION;
+    if (!alreadyNamed) {
+      st.renameSession(key, deriveSessionName(text, attachments?.[0]?.name));
+    }
+    // 上架：名字写完之后，条目才出现在侧栏（先取名，后出现）
+    const cwd = tempCwdRef.current.get(key);
+    if (cwd) useApp.getState().upsertSessionPlaceholder(key, cwd);
+  }, []);
 
   const onSend = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
@@ -534,13 +626,14 @@ export default function App(): React.ReactElement {
       // 杜绝两次 await 之间指针切换导致「气泡进 X、prompt 进 Y」。
       useApp.getState().appendUserMessage(text, { attachments }, key);
       if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      autoNameTempSession(key, text, attachments);
       await rpc.prompt(key, promptText, imageRefs);
       refreshSessions();
     };
     void doSend().catch((err) =>
       pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, resolveSessionKey]);
+  }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
 
   /** Help 菜单 "Stats" 子项：等同于在当前会话输入 /stats 并提交。 */
   useEffect(() => {
@@ -565,16 +658,16 @@ export default function App(): React.ReactElement {
       // 同 onSend：temp key 进程离线时先迁移到落盘 realPath，避免分裂
       const key = await resolveSessionKey(sp!);
       await rpc.acquire(key, cwd, approvalMode);
-      // 显式传 key（同 onSend，P0-3）：气泡与 steer 目标必须同一会话
       useApp.getState().appendUserMessage(text, { steered: true, attachments }, key);
       if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      autoNameTempSession(key, text, attachments);
       await rpc.steer(key, promptText, imageRefs);
       refreshSessions();
     };
     void doGuide().catch((err) =>
       pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, resolveSessionKey]);
+  }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
 
   /** 排队（follow_up）：等当前 agent turn 跑完再处理（不打断当前 tool/t）。 */
   const onQueue = useCallback((text: string, attachments?: Attachment[]) => {
@@ -595,13 +688,14 @@ export default function App(): React.ReactElement {
       // 显式传 key（同 onSend，P0-3）：气泡与 follow_up 目标必须同一会话
       useApp.getState().appendUserMessage(text, { queued: true, attachments }, key);
       if (key.startsWith('__new_')) tempSubmittedKeys.current.add(key);
+      autoNameTempSession(key, text, attachments);
       await rpc.followUp(key, promptText, imageRefs);
       refreshSessions();
     };
     void doQueue().catch((err) =>
       pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     );
-  }, [pushToast, refreshSessions, resolveSessionKey]);
+  }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
 
   // 中止当前 agent 轮
   const onAbort = useCallback(() => {
@@ -629,19 +723,31 @@ export default function App(): React.ReactElement {
       });
   }, []);
 
-  // ---- 流式看门狗：检测"生成中但长时间无任何帧"的疑似卡死会话 ----
+  // ---- 流式看门狗：检测"生成中但长时间无任何帧"的疑似卡死会话 + 流式状态对账自愈 ----
   // 背景（实证 session 01a02a7c）：omp 工具执行无超时，eval 挂死 9h38m 期间不发任何帧，
-  // UI 的 isStreaming 只认 agent_end，于是永远显示"生成中"。这里每 30s 扫描 procStateMap：
-  //   - isStreaming 且距最后帧 >= STUCK_AFTER_MS → 标记 stuckSince + toast 警告（每轮只提示一次）
+  // UI 的 isStreaming 只认 agent_end，于是永远显示"生成中"。
+  // 背景 2（2026-09-16 实证 session 01a0a638，橙点常亮）：omp 的 agent 循环异常/中止路径
+  // **不补发 agent_end 帧**（二进制内嵌源码：FG.fail 只 reject），回合结束后帧流戛然而止，
+  // procStateMap.isStreaming 卡 true → 侧栏橙点不灭。
+  // 这里每 30s 扫描 procStateMap：
+  //   - 在线会话：向 omp get_state 对账。omp 报已结束 → 重置本侧镜像（橙点解除）；
+  //     omp 仍在跑且静默 >= STUCK_AFTER_MS → 标记 stuckSince + toast 警告（每轮只提示一次）。
   //   - 恢复收帧时 applyAgentEvent 会刷新 lastFrameAt 并清 stuckSince → 自动解除
-  // 阈值取 10 分钟：正常长工具调用（bash/网页抓取）可能合法静默数分钟；只提示不自动中断。
+  // 阈值取 10 分钟：正常长工具调用（bash/网页抓取）可能合法静默数分钟。
   useEffect(() => {
     const STUCK_AFTER_MS = 10 * 60 * 1000;
     const timer = window.setInterval(() => {
       const st = useApp.getState();
       const now = Date.now();
       for (const [path, ps] of Object.entries(st.procStateMap)) {
-        if (!ps.isStreaming || !ps.lastFrameAt) continue;
+        if (!ps.isStreaming) continue;
+        if (ps.status === 'online') {
+          // 在线：以 omp 内部 isStreaming 为权威真值对账（自愈/挂死提示都由此触发）
+          void reconcileStreamingState(path, STUCK_AFTER_MS);
+          continue;
+        }
+        // 非 online（spawning 等过渡态）：退回纯静默判定
+        if (!ps.lastFrameAt) continue;
         const silentMs = now - ps.lastFrameAt;
         if (silentMs >= STUCK_AFTER_MS && !ps.stuckSince) {
           st.setProcState(path, { stuckSince: ps.lastFrameAt });
@@ -683,6 +789,13 @@ export default function App(): React.ReactElement {
   const doNewSession = useCallback(async (cwd?: string): Promise<boolean> => {
     useApp.getState().setMainView('chat');
     const st = useApp.getState();
+    // 2026-09-17：占位不再在新建时插入，未提交的空 temp 在侧栏完全不可见——连点两次
+    // 「新建会话」就会留下一个既看不见、也删不掉的进程（旧实现的残留占位至少还能手动删）。
+    // 这里主动丢弃：只丢「从未提交过消息」的，已提交的留给 agent_end 正常迁移。
+    const stale = st.currentSessionPath;
+    if (stale && stale.startsWith(TEMP_KEY_PREFIX) && !tempSubmittedKeys.current.has(stale)) {
+      discardTempSession(stale);
+    }
     const targetCwd = cwd ?? st.currentWorkspace()?.cwd;
     if (!targetCwd) {
       pushToast('请先选择或新建一个工作空间', 'error');
@@ -697,13 +810,15 @@ export default function App(): React.ReactElement {
     // tempKey 渲染层生成（替代旧实现"主进程 spawn 完才返回 path 再切指针"）：
     // 先切指针 + 占位，再 await spawn —— 空窗期不存在，期间发送的消息会正确路由到
     // tempKey 进程（pool.acquire 对在途 spawning 的同 key 会复用同一个 pending promise）。
-    const tempKey = '__new_' + randomUUID();
+    const tempKey = TEMP_KEY_PREFIX + randomUUID();
+    // 侧栏占位要到首条消息提交时才创建，那时已经离开本函数作用域 —— cwd 先记下来
+    tempCwdRef.current.set(tempKey, targetCwd);
     const prevSessionPath = st.currentSessionPath;
     // 先快照当前已知真实 path，tempKey→realPath 迁移时用它识别真正的新会话（兜底路径），避免误迁到旧会话。
     knownSessionPathsBeforeNew.current = new Set(
-      st.sessions.map((s) => s.path).filter((p) => !p.startsWith('__new_')),
+      st.sessions.map((s) => s.path).filter((p) => !p.startsWith(TEMP_KEY_PREFIX)),
     );
-    resolveAndSelectNewSession(tempKey, targetCwd);
+    resolveAndSelectNewSession(tempKey);
     try {
       pushToast('正在新建会话…', 'info');
       // 多进程：spawn 不带 -c（新 .jsonl），tempKey 已在上方先行选中
@@ -783,6 +898,7 @@ export default function App(): React.ReactElement {
     migratingTempKeys.current.delete(path);
     knownSessionPathsBeforeNew.current.delete(path);
     tempSubmittedKeys.current.delete(path);
+    tempCwdRef.current.delete(path);
     const wasCurrent = st.currentSessionPath === path;
     useApp.getState().setState({
       sessionsMap,
@@ -1108,7 +1224,7 @@ export default function App(): React.ReactElement {
         />
         <div className="main">
         <div className="topbar">
-          <span className="topbar-title">{currentSessionTitle ?? '新会话'}</span>
+          <span className="topbar-title">{currentSessionTitle ?? ''}</span>
           <div className="topbar-actions">
             <button
               className={`icon-btn ${rightPanel === 'files' ? 'active' : ''}`}
@@ -1310,6 +1426,45 @@ function getWorkDir(): string {
   const ws = useApp.getState().currentWorkspace();
   if (ws?.cwd) return ws.cwd;
   return cwdProcess.cwd?.() ?? '';
+}
+
+/** 流式状态对账自愈（2026-09-16 橙点常亮修复）。
+ *  omp 的 agent 循环异常/中止路径不补发 agent_end 帧 → 本侧 procStateMap.isStreaming 卡 true，
+ *  侧栏橙点不灭（实证 session 01a0a638）。以 omp 内部 isStreaming（get_state）为权威真值：
+ *  不一致且 RPC 往返期间无新帧到达时重置本侧镜像；omp 确实仍在跑且静默超阈值才提示疑似卡死。 */
+async function reconcileStreamingState(sessionPath: string, stuckAfterMs: number): Promise<void> {
+  const sentAt = Date.now();
+  try {
+    const r = await rpc.getState(sessionPath);
+    if (!r.success) return;
+    const d = r.data as RpcSessionState;
+    const stNow = useApp.getState();
+    const psNow = stNow.procStateMap[sessionPath];
+    // 已被 agent_end / onExit 修正 → 无需对账
+    if (!psNow?.isStreaming) return;
+    // RPC 往返期间有新帧到达 → 帧流是权威，不覆写（可能已 agent_end 或新回合已 agent_start）
+    if ((psNow.lastFrameAt ?? 0) > sentAt) return;
+    if (d.isStreaming === false) {
+      // omp 内部已结束、帧流丢了 agent_end → 以 omp 为准重置镜像，橙点解除
+      stNow.setProcState(sessionPath, { isStreaming: false, isAborting: false, stuckSince: undefined });
+      if (pathsEqual(sessionPath, stNow.currentSessionPath ?? '')) {
+        stNow.setState({ isStreaming: false, isAborting: false });
+      }
+      return;
+    }
+    // omp 仍在跑：静默超阈值 → 疑似工具挂死，提示一次（stuckSince 任意新帧自动清除）
+    const silentMs = Date.now() - (psNow.lastFrameAt ?? 0);
+    if (silentMs >= stuckAfterMs && !psNow.stuckSince) {
+      stNow.setProcState(sessionPath, { stuckSince: psNow.lastFrameAt });
+      const label = sessionPath.split(/[\\/]/).pop() ?? sessionPath;
+      stNow.pushToast(
+        `⚠️ 会话 ${label} 已 ${Math.round(silentMs / 60000)} 分钟无任何响应，疑似卡死（工具可能挂死）。可点输入框停止按钮强制中断。`,
+        'warning',
+      );
+    }
+  } catch {
+    /* 进程离线等：交给 onExit 路径处理 */
+  }
 }
 
 /** 处理 extension_ui_request：需应答的入队（带 __sessionPath），单向的直接执行，cancel 的关对应 */

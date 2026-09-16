@@ -1,6 +1,24 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import type { FileEntry } from '../../shared/ipc-channels';
 import { Icon } from './Icon';
+import { useApp } from '../store';
+
+/** 把右键菜单定位 clamp 到视口内，避免溢出屏幕（估算菜单尺寸做兜底） */
+function clampMenuPos(x: number, y: number): { left: number; top: number } {
+  const estW = 180;
+  const estH = 120;
+  return {
+    left: Math.max(0, Math.min(x, window.innerWidth - estW)),
+    top: Math.max(0, Math.min(y, window.innerHeight - estH)),
+  };
+}
+
+interface FileMenuState {
+  entry: FileEntry;
+  x: number;
+  y: number;
+}
 
 function formatSize(bytes?: number): string {
   if (bytes === undefined) return '';
@@ -22,7 +40,8 @@ const EntryNode: React.FC<{
   expanded: Set<string>;
   version: number;
   onToggle: (entry: FileEntry) => void;
-}> = ({ entry, depth, expanded, version, onToggle }) => {
+  onOpenMenu: (entry: FileEntry, x: number, y: number) => void;
+}> = ({ entry, depth, expanded, version, onToggle, onOpenMenu }) => {
   const isOpen = expanded.has(entry.path);
   const iconName = entry.isDir ? (isOpen ? 'folderOpen' : 'folder') : 'file';
   return (
@@ -31,6 +50,10 @@ const EntryNode: React.FC<{
         className="ft-item"
         style={{ paddingLeft: 12 + depth * 16 }}
         onClick={() => onToggle(entry)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onOpenMenu(entry, e.clientX, e.clientY);
+        }}
         title={entry.path}
       >
         <span className="ft-icon"><Icon name={iconName} size={15} /></span>
@@ -38,7 +61,7 @@ const EntryNode: React.FC<{
         {!entry.isDir && <span className="ft-size">{formatSize(entry.size)}</span>}
       </div>
       {entry.isDir && isOpen && (
-        <DirChildren dir={entry.path} depth={depth + 1} expanded={expanded} version={version} onToggle={onToggle} />
+        <DirChildren dir={entry.path} depth={depth + 1} expanded={expanded} version={version} onToggle={onToggle} onOpenMenu={onOpenMenu} />
       )}
     </div>
   );
@@ -50,7 +73,8 @@ const DirChildren: React.FC<{
   expanded: Set<string>;
   version: number;
   onToggle: (entry: FileEntry) => void;
-}> = ({ dir, depth, expanded, version, onToggle }) => {
+  onOpenMenu: (entry: FileEntry, x: number, y: number) => void;
+}> = ({ dir, depth, expanded, version, onToggle, onOpenMenu }) => {
   const [kids, setKids] = useState<FileEntry[]>([]);
   const [err, setErr] = useState('');
   useEffect(() => {
@@ -68,7 +92,7 @@ const DirChildren: React.FC<{
   if (err) {
     return <div className="panel-empty" style={{ paddingLeft: 12 + depth * 16 }}>{err}</div>;
   }
-  return <>{kids.map((e) => <EntryNode key={e.path} entry={e} depth={depth} expanded={expanded} version={version} onToggle={onToggle} />)}</>;
+  return <>{kids.map((e) => <EntryNode key={e.path} entry={e} depth={depth} expanded={expanded} version={version} onToggle={onToggle} onOpenMenu={onOpenMenu} />)}</>;
 };
 
 export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
@@ -77,6 +101,8 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
   const [error, setError] = useState('');
   /** 刷新版本号：每次刷新 +1，传给 DirChildren 作为 effect 依赖，强制已展开子目录重新拉取 */
   const [version, setVersion] = useState(0);
+  const [fileMenu, setFileMenu] = useState<FileMenuState | null>(null);
+  const pushToast = useApp((s) => s.pushToast);
 
   const load = useCallback((dir: string) => {
     void window.omp.listFiles(dir).then((list) => {
@@ -106,6 +132,43 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
     setVersion((v) => v + 1); // 让已展开子目录也重新拉取
   }, [cwd, load]);
 
+  const openMenu = useCallback((entry: FileEntry, x: number, y: number) => {
+    document.dispatchEvent(new CustomEvent('omp:ctxmenu-open'));
+    setFileMenu({ entry, x, y });
+  }, []);
+
+  const closeMenu = useCallback(() => setFileMenu(null), []);
+
+  // 右键菜单关闭：click（非 mousedown，避免提前关闭吞掉 ctx-item 的 onClick）+ 其他菜单打开时互斥
+  React.useEffect(() => {
+    if (!fileMenu) return;
+    const onDoc = () => closeMenu();
+    const onOtherMenu = () => closeMenu();
+    document.addEventListener('click', onDoc);
+    document.addEventListener('omp:ctxmenu-open', onOtherMenu);
+    return () => {
+      document.removeEventListener('click', onDoc);
+      document.removeEventListener('omp:ctxmenu-open', onOtherMenu);
+    };
+  }, [fileMenu, closeMenu]);
+
+  /** 目录 → 资源管理器打开；文件 → 系统关联应用打开（shell.openPath）。 */
+  const handleOpen = useCallback(async (entry: FileEntry) => {
+    closeMenu();
+    try {
+      await window.omp.openPath(entry.path);
+    } catch (e) {
+      pushToast(`打开失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
+  }, [closeMenu, pushToast]);
+
+  /** 在文件管理器中定位并高亮该文件（仅文件项）。 */
+  const handleReveal = useCallback((entry: FileEntry) => {
+    closeMenu();
+    void window.omp.showItemInFolder(entry.path)
+      .catch((e) => pushToast(`打开目录失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+  }, [closeMenu, pushToast]);
+
   return (
     <div className="file-tree">
       <div className="panel-header">
@@ -118,8 +181,23 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
         <div className="panel-empty">空目录</div>
       ) : (
         <div className="ft-list">
-          {entries.map((e) => <EntryNode key={e.path} entry={e} depth={1} expanded={expanded} version={version} onToggle={toggle} />)}
+          {entries.map((e) => <EntryNode key={e.path} entry={e} depth={1} expanded={expanded} version={version} onToggle={toggle} onOpenMenu={openMenu} />)}
         </div>
+      )}
+      {fileMenu && createPortal(
+        <div
+          className="ctx-menu"
+          style={{ ...clampMenuPos(fileMenu.x, fileMenu.y), position: 'fixed' }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="ctx-item" onClick={() => void handleOpen(fileMenu.entry)}>
+            {fileMenu.entry.isDir ? '在资源管理器中打开' : '用系统应用打开'}
+          </div>
+          {!fileMenu.entry.isDir && (
+            <div className="ctx-item" onClick={() => handleReveal(fileMenu.entry)}>在文件管理器中显示</div>
+          )}
+        </div>,
+        document.body
       )}
     </div>
   );
