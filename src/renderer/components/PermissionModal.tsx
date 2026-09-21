@@ -1,11 +1,18 @@
 import React, { useMemo, useState } from 'react';
 import type { UiRequest } from '../store';
 import { useApp, toolNameOf } from '../store';
+import { pathsEqual } from '../utils/path-key';
 import { rpc } from '../rpc-client';
 
 /**
  * PermissionModal — 按 extension_ui_request.method 渲染 confirm/select/input/editor。
  * 单队列顺序展示（store.uiQueue[0]），cancel 帧由 App 负责关对应 modal。
+ *
+ * 信息架构（2026-09-22）：
+ *  - 顶部「任务 · xxx」：显示触发请求的会话名（sessionNames 覆盖名 → 侧栏标题兜底）；
+ *  - 标题 = omp title 首行（omp 把工具名/命令等详情用 \n 塞在 title 后续行）；
+ *  - 「详细 ▾」折叠区：title 剩余行（命令等）+ prompt + meta（工具/类型/会话/请求 ID）。
+ *    select 类请求协议上没有 message 字段，详情只能并进 title 多行（配 OMP-HOOK project-guard）。
  *
  * "始终允许"链路：confirm 勾选后，应答成功即把 工具名 写入 per-session 缓存（store.permAllow）；
  * 下次同一会话同一工具的 confirm 在 handleUiRequest 里命中缓存、自动放行、不弹窗。
@@ -30,8 +37,31 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   const [always, setAlways] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
   const busyRef = React.useRef(false);
   const lastPayload = React.useRef<{ value?: string; confirmed?: boolean; cancelled?: boolean }>({});
+
+  // 任务名称：让用户知道是哪个会话/任务触发了本次权限请求。
+  // 优先用户自定义覆盖名（sessionNames），兜底侧栏会话标题；都拿不到则不显示该行。
+  const sessionNames = useApp((s) => s.sessionNames);
+  const sessions = useApp((s) => s.sessions);
+  const taskName = useMemo(() => {
+    const sp = req.sessionPath;
+    if (!sp) return null;
+    const override = sessionNames[sp];
+    if (override) return override;
+    const hit = sessions.find((x) => pathsEqual(x.path, sp));
+    return hit?.title ?? null;
+  }, [req.sessionPath, sessionNames, sessions]);
+
+  // omp 把工具名 + 命令等详情塞在 title 里（\n 分隔）：首行做标题，剩余行收进「详细」折叠区。
+  const rawTitle = req.title ?? titleOf(req.method);
+  const nlIdx = rawTitle.indexOf('\n');
+  const titleHead = nlIdx >= 0 ? rawTitle.slice(0, nlIdx) : rawTitle;
+  const titleRest = nlIdx >= 0 ? rawTitle.slice(nlIdx + 1).trim() : '';
+  // 详细区的 meta 行：工具名 / 请求类型 / 来源会话 / 请求 ID
+  const detailTool = toolNameOf(req);
+  const sessionBasename = req.sessionPath ? (req.sessionPath.split(/[\\/]/).pop() ?? req.sessionPath) : null;
 
   // open_url 请求：批准后才真正打开链接（issue #5）。req.raw.method 在 App 中保留为 'open_url'。
   const openUrl = (req.raw as unknown as { __openUrl?: string; method?: string } | undefined)?.['__openUrl']
@@ -164,7 +194,46 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
   return (
     <div className="modal-overlay">
       <div className="modal">
-        <ModalTitle req={req} />
+        {taskName && (
+          <div className="modal-task-line">
+            任务 · <span className="modal-task-name">{taskName}</span>
+          </div>
+        )}
+        <div className="modal-title-row">
+          <div className="modal-title">{titleHead}</div>
+          <button
+            type="button"
+            className="modal-detail-toggle"
+            onClick={() => setDetailOpen((o) => !o)}
+          >
+            {detailOpen ? '收起 ▴' : '详细 ▾'}
+          </button>
+        </div>
+        {detailOpen && (
+          <div className="modal-detail">
+            {titleRest && <pre>{titleRest}</pre>}
+            {req.prompt && req.prompt !== req.message && <pre>{req.prompt}</pre>}
+            {!titleRest && !req.prompt && <div className="modal-detail-empty">（omp 未随请求附带更多操作细节）</div>}
+            <div className="modal-detail-meta">
+              {detailTool && detailTool !== titleHead && (
+                <>
+                  <span>工具</span>
+                  <span>{detailTool}</span>
+                </>
+              )}
+              <span>类型</span>
+              <span>{req.method}</span>
+              {sessionBasename && (
+                <>
+                  <span>会话</span>
+                  <span title={req.sessionPath}>{sessionBasename}</span>
+                </>
+              )}
+              <span>请求</span>
+              <span>{req.id}</span>
+            </div>
+          </div>
+        )}
         {err ? (
           <div className="modal-message" style={{ color: 'var(--accent-danger, #e5484d)' }}>{err}</div>
         ) : (
@@ -178,22 +247,6 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
         )}
       </div>
     </div>
-  );
-};
-
-/** omp 工具权限弹窗把工具名 + 命令都塞在 title 里（用 \n 分隔），
- *  拆出来让命令单独成行用 monospace 字体显示，更清晰。 */
-const ModalTitle: React.FC<{ req: UiRequest }> = ({ req }) => {
-  const raw = req.title ?? titleOf(req.method);
-  const idx = raw.indexOf('\n');
-  if (idx < 0) return <div className="modal-title">{raw}</div>;
-  const head = raw.slice(0, idx);
-  const rest = raw.slice(idx + 1);
-  return (
-    <>
-      <div className="modal-title">{head}</div>
-      <div className="modal-subtitle">{rest}</div>
-    </>
   );
 };
 

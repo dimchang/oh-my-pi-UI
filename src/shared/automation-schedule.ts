@@ -46,8 +46,11 @@ export function computeNextRunAt(
   const hm = parseHM(schedule.time);
   if (schedule.kind !== 'once' && !hm) return null;
 
-  // 首个候选 = 今天（本地时区）的计划时刻；若 ≤ base 再逐周期前推
-  const cursor = new Date();
+  // 首个候选锚点：base 有效时以 base 为锚（扣账语义：严格晚于 base，跨天/补算都确定）；
+  // base 过旧（从未执行传 0 / 系统时钟异常）时以当前时间为锚——与「不补发多天前的任务」一致，
+  // 错过的周期直接跳到下一个未来时刻（否则 400 次迭代上限在远古锚点下永远追不上现在）。
+  const BASE_FLOOR = new Date(2020, 0, 1).getTime();
+  const cursor = base >= BASE_FLOOR ? new Date(base) : new Date();
   let advance: () => void;
   switch (schedule.kind) {
     case 'once': {
