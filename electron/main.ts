@@ -30,8 +30,9 @@ import { OmpProcessPool } from './omp-pool';
 import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
 import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
 import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
+import { loadAutomations, saveAutomations, recordAutomationRun, startAutomationTicker } from './automations';
 import { IPC } from '../src/shared/ipc-channels';
-import type { FileEntry, WorkspacesFile, WorkspacesLoadResult, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult } from '../src/shared/ipc-channels';
+import type { FileEntry, WorkspacesFile, WorkspacesLoadResult, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult, AutomationsFile, AutomationRun } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -464,8 +465,7 @@ function registerIpc(): void {
     pool?.renameKey(oldKey, newKey);
   });
 
-  ipcMain.handle(IPC.SessionList, async (_e, cwd?: string) => listSessions(cwd));
-  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => {
+  ipcMain.handle(IPC.SessionList, async (_e, cwd?: string) => listSessions(cwd));  ipcMain.handle(IPC.SessionDelete, async (_e, p: string) => {
     if (!sensitiveLimiter.allow('session-delete')) throw new Error('操作过于频繁，请稍后再试');
     await deleteSession(p);
   });
@@ -479,6 +479,14 @@ function registerIpc(): void {
     return listSkills();
   });
   ipcMain.handle(IPC.SkillsUninstall, async (_e, name: string) => uninstallSkill(name));
+
+  // 定时任务（automations）：持久化在主进程，调度由 ticker 负责，执行由渲染层完成
+  ipcMain.handle(IPC.AutomationGet, async () => loadAutomations());
+  ipcMain.handle(IPC.AutomationSave, async (_e, file: AutomationsFile) => {
+    await saveAutomations(file);
+    return loadAutomations();
+  });
+  ipcMain.handle(IPC.AutomationRecordRun, async (_e, run: AutomationRun) => recordAutomationRun(run));
 
   ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown', agentDir: getAgentDir() }));
 
@@ -893,6 +901,22 @@ app.whenReady().then(() => {
   appendDiag(`userData=${app.getPath('userData')} log=${diagLogPath()}`);
   createWindow();
   buildAppMenu();
+
+  // 定时任务调度 ticker：主进程时钟（渲染层最小化时定时器会被节流，不能依赖）。
+  // 窗口关闭/销毁后 send 静默无效——不补发，等下个周期（任务未过期就会正常触发）。
+  startAutomationTicker({
+    fire: (task) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.AutomationTrigger, task);
+      }
+    },
+    onChanged: (file: AutomationsFile) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.AutomationChanged, file);
+      }
+    },
+    log: (line) => appendDiag(line),
+  });
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

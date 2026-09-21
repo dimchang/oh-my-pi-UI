@@ -16,7 +16,7 @@ import type {
   TodoPhase,
   TodoItem,
 } from '../shared/rpc-types';
-import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig } from '../shared/ipc-channels';
+import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig, AutomationTask } from '../shared/ipc-channels';
 import type { SkillInfo } from '../shared/ipc-channels';
 import { ompStat } from './diagnostics';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
@@ -122,6 +122,9 @@ export function toolNameOf(req: UiRequest): string | null {
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'tool' | string;
+  /** 墙钟时间（epoch ms）：user=本地发送时刻；assistant=omp 该次模型请求的开始时刻
+   *  （JSONL 实测 timestamp 字段，历史回放可重建）。回合「开始→结束·总用时」时间线据此计算。 */
+  timestamp?: number;
   parts: MessagePart[];
   streaming?: boolean;
   /** 用量：totalTokens 是**该次请求的上下文总量**（input+cacheRead+output，不可跨请求累加）；
@@ -232,9 +235,14 @@ interface AppState {
   diffs: Array<{ toolName: string; diff: string }>;
   /** 右栏标签：off|files|diff|todo|jobs */
   rightPanel: 'off' | 'files' | 'todo' | 'diff' | 'jobs';
-  /** 主工作区视图：chat=对话，skills=技能/插件面板 */
-  mainView: 'chat' | 'skills';
-  setMainView(v: 'chat' | 'skills'): void;
+  /** 主工作区视图：chat=对话，skills=技能/插件面板，automation=定时任务面板 */
+  mainView: 'chat' | 'skills' | 'automation';
+  setMainView(v: 'chat' | 'skills' | 'automation'): void;
+
+  // ---- 定时任务（automations）----
+  /** 任务列表（主进程 automations.json 的 tasks，触发/扣账后由事件刷新） */
+  automations: AutomationTask[];
+  setAutomations(tasks: AutomationTask[]): void;
 
   // ---- 配置页 ----
   /** 配置页是否打开（全屏 overlay） */
@@ -672,6 +680,7 @@ export const useApp = create<AppState>((set, get) => ({
   rightPanel: 'off',
   diffs: [],
   mainView: 'chat',
+  automations: [],
   settingsOpen: false,
   settingsTab: 'model',
   enabledModels: undefined,
@@ -681,6 +690,7 @@ export const useApp = create<AppState>((set, get) => ({
 
   setReady: (v) => set({ ready: v }),
   setMainView: (v) => set({ mainView: v }),
+  setAutomations: (tasks) => set({ automations: tasks }),
   setSettingsOpen: (v) => set({ settingsOpen: v }),
   setSettingsTab: (tab) => set({ settingsTab: tab }),
 
@@ -1219,6 +1229,7 @@ export const useApp = create<AppState>((set, get) => ({
             streaming: false,
             usage: toUsage(m),
             error: errorText,
+            timestamp: m.timestamp,
             // 历史回放标记重建（2026-07-27 probe-followup.mjs v3 实测确认）：
             //   - steer（引导）：omp 在 JSONL 内层 message 持久化 "steering":true → 可重建 steered。
             //   - follow_up（排队）：omp 在 JSONL 上**不打任何标记**（message 与普通 prompt 逐字节相同），
@@ -1248,6 +1259,7 @@ export const useApp = create<AppState>((set, get) => ({
     const userMsg: ChatMessage = {
       id: `u${Date.now()}_${userSeq++}`,
       role: 'user',
+      timestamp: Date.now(),
       parts: [{ kind: 'text', text }],
       streaming: false,
       steered: opts?.steered ?? false,
@@ -1325,7 +1337,7 @@ export const useApp = create<AppState>((set, get) => ({
           }
           break;
         }
-        getBuf().push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true });
+        getBuf().push({ id: nid(), role: msg.role, parts: contentToParts(msg), streaming: true, timestamp: msg.timestamp ?? now });
         bufferTouched = true;
         break;
       }
@@ -1369,6 +1381,7 @@ export const useApp = create<AppState>((set, get) => ({
               streaming: false,
               usage: toUsage(msg),
               error: errorText,
+              timestamp: m.timestamp ?? msg.timestamp ?? now,
             };
             matched = true;
             bufferTouched = true;
@@ -1391,6 +1404,7 @@ export const useApp = create<AppState>((set, get) => ({
               streaming: false,
               usage: toUsage(msg),
               error: errorText,
+              timestamp: msg.timestamp ?? now,
             });
             bufferTouched = true;
           }

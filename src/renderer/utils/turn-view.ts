@@ -49,18 +49,31 @@ export interface TurnStats {
   outputTokens: number;
   /** 回合内模型请求耗时之和（ms），不含工具执行时间 */
   durationMs: number;
+  /** 回合起始墙钟时间（epoch ms）= 回合内最早的 assistant 消息 timestamp。
+   *  omp 的 assistant 消息 timestamp 即该次模型请求的开始时刻（JSONL 实测）。 */
+  startAt?: number;
+  /** 回合结束墙钟时间（epoch ms）= 最晚的（timestamp + duration）。
+   *  仅统计已完成的请求：流式中最后一条消息无 duration，其 endAt 取其开始时刻，摘要照常随帧刷新。 */
+  endAt?: number;
 }
 
 export function computeTurnStats(msgs: ChatMessage[]): TurnStats {
   let thinkingTokens = 0;
   let outputTokens = 0;
   let durationMs = 0;
+  let startAt: number | undefined;
+  let endAt: number | undefined;
   for (const m of msgs) {
     thinkingTokens += m.usage?.reasoningTokens ?? 0;
     outputTokens += m.usage?.outputTokens ?? 0;
     durationMs += m.usage?.duration ?? 0;
+    if (m.role === 'assistant' && typeof m.timestamp === 'number' && m.timestamp > 0) {
+      if (startAt === undefined || m.timestamp < startAt) startAt = m.timestamp;
+      const e = m.timestamp + (m.usage?.duration ?? 0);
+      if (endAt === undefined || e > endAt) endAt = e;
+    }
   }
-  return { steps: msgs.length, thinkingTokens, outputTokens, durationMs };
+  return { steps: msgs.length, thinkingTokens, outputTokens, durationMs, startAt, endAt };
 }
 
 /** 把 parts 切成「折叠块」与「最终回答」两部分。
@@ -108,12 +121,31 @@ export function formatTokens(n: number): string {
   return `${(n / 1000000).toFixed(2)}M`;
 }
 
-/** 摘要行文案：`思考过程 · 39 步 · 思考 3.4k tokens · 生成 1.2k tokens · 45.3s`
- *  各项缺省则省略（如非推理模型无 thinkingTokens）。 */
+/** 墙钟时间 HH:MM:SS（本地时区），回合摘要里的开始/结束时刻用。 */
+export function formatClock(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** 总用时紧凑格式：<60s 一位小数秒，≥60s 分秒（8m33s）。 */
+export function formatElapsed(ms: number): string {
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const total = Math.round(ms / 1000);
+  return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, '0')}s`;
+}
+
+/** 摘要行文案：`思考过程 · 39 步 · 思考 3.4k tokens · 生成 1.2k tokens · 45.3s · 19:30:12 → 19:38:45 · 总用时 8m33s`
+ *  各项缺省则省略（如非推理模型无 thinkingTokens；旧会话消息无 timestamp 时无时间线段）。 */
 export function formatTurnSummary(s: TurnStats): string {
   const out = [`思考过程 · ${s.steps} 步`];
   if (s.thinkingTokens > 0) out.push(`思考 ${formatTokens(s.thinkingTokens)} tokens`);
   if (s.outputTokens > 0) out.push(`生成 ${formatTokens(s.outputTokens)} tokens`);
   if (s.durationMs > 0) out.push(`${(s.durationMs / 1000).toFixed(1)}s`);
+  // 时间线段：开始（模型开始思考）→ 结束（回答完成），总用时为墙钟差（含工具执行时间）
+  if (s.startAt !== undefined && s.endAt !== undefined && s.endAt >= s.startAt) {
+    out.push(`${formatClock(s.startAt)} → ${formatClock(s.endAt)}`);
+    out.push(`总用时 ${formatElapsed(s.endAt - s.startAt)}`);
+  }
   return out.join(' · ');
 }

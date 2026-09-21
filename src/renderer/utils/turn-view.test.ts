@@ -6,6 +6,8 @@ import {
   computeTurnStats,
   formatTurnSummary,
   formatTokens,
+  formatClock,
+  formatElapsed,
 } from './turn-view';
 
 /** 便捷构造：assistant 消息，parts 由简写生成。't'=thinking, 'n'=narration 过程说明, 'x'=工具卡, 'r'=最终回答 */
@@ -130,6 +132,57 @@ describe('computeTurnStats / formatTurnSummary', () => {
   it('非推理模型（无 thinkingTokens）省略该段', () => {
     const s = computeTurnStats([asst('r', { totalTokens: 100, outputTokens: 12, duration: 900 })]);
     expect(formatTurnSummary(s)).toBe('思考过程 · 1 步 · 生成 12 tokens · 0.9s');
+  });
+});
+
+describe('回合时间线（开始 → 结束 · 总用时）', () => {
+  // omp JSONL 实测（2026-09-21 probe）：assistant 消息带 timestamp（epoch ms，请求开始）
+  // 与 duration（ms）→ 结束 = timestamp + duration。相邻请求的 timestamp 紧跟上一条结束。
+  const t0 = new Date(2026, 8, 21, 19, 30, 12).getTime();
+  const msgs = [
+    asst('tx', { outputTokens: 155, reasoningTokens: 37, duration: 1800 }),
+    asst('xx', { outputTokens: 151, reasoningTokens: 10, duration: 1959 }),
+    asst('r', { outputTokens: 271, reasoningTokens: 98, duration: 2108 }),
+  ];
+  msgs[0]!.timestamp = t0;
+  msgs[1]!.timestamp = t0 + 1900; // 中间含工具执行间隔
+  msgs[2]!.timestamp = t0 + 4000;
+
+  it('startAt = 最早的 assistant timestamp；endAt = 最晚的 timestamp + duration（含工具执行墙钟时间）', () => {
+    const s = computeTurnStats(msgs);
+    expect(s.startAt).toBe(t0);
+    expect(s.endAt).toBe(t0 + 4000 + 2108);
+    // durationMs 仍是不含工具时间的模型请求耗时之和（既有契约不回退）
+    expect(s.durationMs).toBe(5867);
+  });
+
+  it('摘要行追加「开始 → 结束 · 总用时」段', () => {
+    const text = formatTurnSummary(computeTurnStats(msgs));
+    expect(text).toBe(
+      `思考过程 · 3 步 · 思考 145 tokens · 生成 577 tokens · 5.9s · ${formatClock(t0)} → ${formatClock(t0 + 6108)} · 总用时 6.1s`,
+    );
+  });
+
+  it('消息无 timestamp（旧会话/未知来源）→ 时间线段整体省略，不崩', () => {
+    const text = formatTurnSummary(computeTurnStats([asst('r', { duration: 900 })]));
+    expect(text).toBe('思考过程 · 1 步 · 0.9s');
+  });
+
+  it('流式中最后一条消息无 duration → endAt 退化为该消息开始时刻，不产生负值段', () => {
+    const streaming = [...msgs];
+    const last = { ...asst('r', { duration: 0 }), timestamp: t0 + 60_000, streaming: true };
+    streaming[2] = last;
+    const s = computeTurnStats(streaming);
+    expect(s.endAt).toBe(t0 + 60_000);
+    expect(s.endAt! >= s.startAt!).toBe(true);
+  });
+
+  it('formatClock / formatElapsed 边界', () => {
+    expect(formatClock(new Date(2026, 8, 21, 9, 5, 3).getTime())).toBe('09:05:03');
+    expect(formatElapsed(45_300)).toBe('45.3s');
+    expect(formatElapsed(59_900)).toBe('59.9s');
+    expect(formatElapsed(60_000)).toBe('1m00s');
+    expect(formatElapsed(513_000)).toBe('8m33s');
   });
 });
 

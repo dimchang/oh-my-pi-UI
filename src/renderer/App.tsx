@@ -14,6 +14,7 @@ import { TodoPanel } from './components/TodoPanel';
 import { JobPanel } from './components/JobPanel';
 import { DiffView } from './components/DiffView';
 import { SettingsPanel } from './components/SettingsPanel';
+import { AutomationPanel } from './components/AutomationPanel';
 import { cwdKey, makeWorkspaceId, basename, pathsEqual } from './utils/path-key';
 import { planWorkspaceReconcile } from './utils/workspace-reconcile';
 import { stripDataUrlPrefix } from './utils/image-data-url';
@@ -25,7 +26,7 @@ import {
 } from './utils/temp-session';
 import { applyAppearance } from './store';
 import type { OmpFrame, RpcExtensionUIRequest, RpcImage, AvailableCommandsUpdateFrame, RpcSessionState, TodoPhase, ModelInfo, SlashCommand } from '../shared/rpc-types';
-import type { SessionSummary, Workspace, ApprovalMode } from '../shared/ipc-channels';
+import type { SessionSummary, Workspace, ApprovalMode, AutomationTask, AutomationRun } from '../shared/ipc-channels';
 
 export default function App(): React.ReactElement {
   const ready = useApp((s) => s.ready);
@@ -430,6 +431,18 @@ export default function App(): React.ReactElement {
         // omp 在 agent_end 时 flush 完整 JSONL，重新扫盘；新会话此时才落盘，迁移 tempKey→realPath。
         // 传入帧自带的 __sessionPath：即使该会话不是当前显示会话（用户已切走），也能正确迁移。
         void refreshSessions().then(() => migrateTempSession(sp));
+        // 定时任务执行完成（agent_end = 该次 agent run 正常收尾）→ 回写成功记录
+        const autoRun = sp ? automationRuns.current.get(sp) : undefined;
+        if (autoRun) {
+          automationRuns.current.delete(sp!);
+          void window.omp.recordAutomationRun({
+            ...autoRun,
+            finishedAt: Date.now(),
+            status: 'success',
+            sessionPath: sp,
+          }).catch(() => undefined);
+          useApp.getState().pushToast(`✅ 定时任务「${autoRun.taskName}」已完成`, 'info');
+        }
         // 仅当 agent_end 来自当前显示会话，才刷新状态栏
         if (sp && sp === useApp.getState().currentSessionPath) {
           void refreshState(sp);
@@ -458,6 +471,19 @@ export default function App(): React.ReactElement {
     });
 
     const offExit = window.omp.onExit(({ sessionPath, code }) => {
+      // 定时任务会话进程退出且尚未收到 agent_end → 记失败（正常完成的在 agent_end 已删映射）
+      const autoRun = automationRuns.current.get(sessionPath);
+      if (autoRun) {
+        automationRuns.current.delete(sessionPath);
+        void window.omp.recordAutomationRun({
+          ...autoRun,
+          finishedAt: Date.now(),
+          status: 'error',
+          error: `会话进程退出 (code=${code ?? 'null'})，任务未正常完成`,
+          sessionPath,
+        }).catch(() => undefined);
+        useApp.getState().pushToast(`⚠️ 定时任务「${autoRun.taskName}」异常中止`, 'error');
+      }
       useApp.getState().setProcState(sessionPath, { status: 'offline', isStreaming: false, isAborting: false });
       // 仅当退出的是当前显示会话，弹“已退出”遮罩
       if (sessionPath === useApp.getState().currentSessionPath) {
@@ -915,6 +941,73 @@ export default function App(): React.ReactElement {
     return wasCurrent;
   }, [rpc]);
 
+  // ---- 定时任务执行 ----
+  // 分工：主进程 ticker 只判「何时到期」（发 AutomationTrigger），实际执行在这里——
+  // 复用手动发消息的全链路（tempKey 新会话 → prompt → agent_end 落盘迁移），保证
+  // 会话生命周期与手动操作完全同构，不另造一套后台执行机制。
+  /** 执行中的定时任务会话（tempKey → 记录元数据）：agent_end 成功 / 进程退出失败时回写记录。 */
+  const automationRuns = useRef<Map<string, AutomationRun>>(new Map());
+
+  const runAutomationTask = useCallback(async (task: AutomationTask): Promise<void> => {
+    const st = useApp.getState();
+    if (!task.cwd || !task.prompt.trim()) return;
+    const startedAt = Date.now();
+    const run: AutomationRun = {
+      id: `ar${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      taskId: task.id,
+      taskName: task.name,
+      startedAt,
+      status: 'running',
+    };
+    const tempKey = TEMP_KEY_PREFIX + randomUUID();
+    automationRuns.current.set(tempKey, run);
+    st.pushToast(`⏰ 定时任务「${task.name}」已触发`, 'info');
+    void window.omp.recordAutomationRun(run).catch(() => undefined);
+    try {
+      tempCwdRef.current.set(tempKey, task.cwd);
+      await rpc.newSessionForCwd(tempKey, task.cwd, task.approvalMode ?? 'write');
+      useApp.getState().setProcState(tempKey, { status: 'online' });
+      // 已提交标记：agent_end 后正常走 tempKey→realPath 落盘迁移（与手动消息同路径）
+      tempSubmittedKeys.current.add(tempKey);
+      useApp.getState().appendUserMessage(task.prompt, {}, tempKey);
+      // 先命名再上架：侧栏出现的第一个状态就是有名字的会话（与手动发送同序）
+      useApp.getState().renameSession(tempKey, task.name);
+      useApp.getState().upsertSessionPlaceholder(tempKey, task.cwd);
+      if (task.model?.provider && task.model?.id) {
+        await rpc.setModel(tempKey, task.model.provider, task.model.id).catch(() => undefined);
+      }
+      await rpc.prompt(tempKey, task.prompt);
+      void refreshSessions();
+    } catch (e) {
+      automationRuns.current.delete(tempKey);
+      const failed: AutomationRun = {
+        ...run,
+        finishedAt: Date.now(),
+        status: 'error',
+        error: e instanceof Error ? e.message : String(e),
+        sessionPath: tempKey,
+      };
+      void window.omp.recordAutomationRun(failed).catch(() => undefined);
+      useApp.getState().pushToast(`定时任务「${task.name}」执行失败：${failed.error}`, 'error');
+    }
+  }, [refreshSessions]);
+
+  // 触发订阅 + 主进程侧文件变更（到期扣账/过期停用）同步
+  useEffect(() => {
+    const offTrigger = window.omp.onAutomationTrigger((task) => { void runAutomationTask(task); });
+    const offChanged = window.omp.onAutomationChanged((file) => {
+      useApp.getState().setAutomations(file.tasks);
+    });
+    return () => { offTrigger(); offChanged(); };
+  }, [runAutomationTask]);
+
+  // 启动时加载任务列表（侧栏卡片计数 + 面板显示）
+  useEffect(() => {
+    void window.omp.getAutomations()
+      .then((f) => useApp.getState().setAutomations(f.tasks))
+      .catch(() => undefined);
+  }, []);
+
   const onSelectSession = useCallback((s: SessionSummary) => {
     useApp.getState().setMainView('chat');
     const st = useApp.getState();
@@ -1258,6 +1351,8 @@ export default function App(): React.ReactElement {
         </div>
         {mainView === 'skills' ? (
           <SkillsPanel />
+        ) : mainView === 'automation' ? (
+          <AutomationPanel onRunTask={(t) => void runAutomationTask(t)} />
         ) : (
           <>
             <ChatView />

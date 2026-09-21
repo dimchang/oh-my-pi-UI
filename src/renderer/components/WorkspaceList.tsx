@@ -71,6 +71,8 @@ export const WorkspaceList: React.FC<{
   const slashCommands = useApp((s) => s.slashCommands);
   // 已安装技能列表（技能页网格；加载后优先用它计数，更完整）
   const installedSkills = useApp((s) => s.skills);
+  // 定时任务（侧栏卡片计数：仅统计启用中的）
+  const automations = useApp((s) => s.automations);
   // 主工作区当前视图（chat | skills）—— 技能卡片激活态
   const mainView = useApp((s) => s.mainView);
   const [search, setSearch] = useState('');
@@ -205,6 +207,19 @@ export const WorkspaceList: React.FC<{
           {installedSkills.length > 0
             ? installedSkills.length
             : slashCommands.filter((c) => c.source === 'skill').length}
+        </span>
+      </button>
+
+      {/* 定时任务卡片（插件/skill 之下、任务区之上）：主工作区切到定时任务面板 */}
+      <button
+        className={`skill-card ${mainView === 'automation' ? 'active' : ''}`}
+        onClick={() => useApp.getState().setMainView('automation')}
+        title="定时执行提示词任务（到点自动新建会话运行）"
+      >
+        <span className="skill-card-icon"><Icon name="clock" size={15} /></span>
+        <span className="skill-card-label">定时任务</span>
+        <span className="skill-card-count">
+          {automations.filter((t) => t.enabled !== false).length}
         </span>
       </button>
 

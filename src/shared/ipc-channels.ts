@@ -95,6 +95,13 @@ export const IPC = {
   // 诊断（白屏/卡死取证）：renderer → main，单向 send（不需要回执，免得给卡死的 renderer 加负担）。
   // renderer 无文件系统权限，诊断行必须交主进程 append 到 userData/logs/ui-YYYY-MM-DD.log。
   DiagLog: 'diag:log', // (lines: string[]) => void
+
+  // 定时任务（automations）：主进程持久化 + 调度（ticker），渲染进程负责实际执行（复用会话创建全链路）
+  AutomationGet: 'automation:get', // () => Promise<AutomationsFile>
+  AutomationSave: 'automation:save', // (file: AutomationsFile) => Promise<void>
+  AutomationRecordRun: 'automation:record-run', // (run: AutomationRun) => Promise<void> — 按 run.id upsert，cap 200 条
+  AutomationTrigger: 'automation:trigger', // (task: AutomationTask) — main → renderer：任务到期，渲染层执行
+  AutomationChanged: 'automation:changed', // (file: AutomationsFile) — main → renderer：文件被主进程改动（到期扣账/过期停用），渲染层刷新
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -327,6 +334,65 @@ export interface WorkspacesLoadResult {
   staleCwds: string[];
 }
 
+// ---- 定时任务（automations）----
+
+/** 执行频率：once=单次（到点跑一次）；daily/weekly/monthly=周期任务 */
+export type AutomationScheduleKind = 'once' | 'daily' | 'weekly' | 'monthly';
+
+export interface AutomationSchedule {
+  kind: AutomationScheduleKind;
+  /** once：ISO 本地时间（datetime-local 输入值，如 '2026-09-21T20:23'），主进程按本地时区解析 */
+  at?: string;
+  /** 周期任务：'HH:MM'（本地时区） */
+  time?: string;
+  /** weekly：0=周日 … 6=周六 */
+  weekday?: number;
+  /** monthly：1-31（超出当月天数时取当月最后一天） */
+  day?: number;
+}
+
+/** 一个定时任务。调度（何时触发）在主进程，执行（起会话跑 prompt）在渲染进程。 */
+export interface AutomationTask {
+  id: string;
+  name: string;
+  /** 到点后作为用户消息发给新会话的提示词 */
+  prompt: string;
+  /** 目标工作空间目录（每次执行都在该 cwd 新建会话） */
+  cwd: string;
+  /** OMP-UI 权限模式（随会话进程 spawn 生效）：yolo / write / always-ask */
+  approvalMode: ApprovalMode;
+  /** 指定模型（provider+id）；缺省 = omp 会话默认模型 */
+  model?: { provider: string; id: string; name?: string };
+  schedule: AutomationSchedule;
+  /** 有效期截止日 'YYYY-MM-DD'（当天仍有效）；空 = 长期有效。过期后不再触发。 */
+  validUntil?: string;
+  enabled: boolean;
+  createdAt: number;
+  /** 上次实际触发时刻（ms，主进程在发出 trigger 前写死，防重复触发）。 */
+  lastRunAt?: number;
+}
+
+/** 一次执行记录 */
+export interface AutomationRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  startedAt: number;
+  finishedAt?: number;
+  status: 'running' | 'success' | 'error';
+  error?: string;
+  /** 执行所在的会话 key（通常是 __new_ 临时 key，落盘后为真实路径） */
+  sessionPath?: string;
+}
+
+/** 持久化到 userData/automations.json 的完整结构 */
+export interface AutomationsFile {
+  version: 1;
+  tasks: AutomationTask[];
+  /** 执行记录（新在前，cap 200 条） */
+  runs: AutomationRun[];
+}
+
 // ---- 模型配置：omp 原生 ~/.omp/agent/models.yml ----
 
 /** models.yml 里 provider 下单个模型的定义（自定义 provider 手填模型时用，字段与 omp ModelDefinition 对齐，只保留 GUI 需要的） */
@@ -438,6 +504,16 @@ export interface OmpApi {
   skillsDetail(name: string): Promise<SkillDetail>;
   skillsSetEnabled(name: string, enabled: boolean): Promise<SkillInfo[]>;
   skillsUninstall(name: string): Promise<{ ok: boolean; moved: string[]; error?: string }>;
+
+  // 定时任务（automations）
+  getAutomations(): Promise<AutomationsFile>;
+  saveAutomations(file: AutomationsFile): Promise<AutomationsFile>;
+  /** 按 run.id upsert 一条执行记录（先报 running，结束后补 success/error） */
+  recordAutomationRun(run: AutomationRun): Promise<void>;
+  /** 主进程 ticker 判定任务到期（渲染层负责实际执行：新建会话 + prompt） */
+  onAutomationTrigger(cb: (task: AutomationTask) => void): () => void;
+  /** 主进程侧改动了任务文件（到期扣账 / 过期停用），渲染层刷新列表 */
+  onAutomationChanged(cb: (file: AutomationsFile) => void): () => void;
 
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow(): Promise<void>;

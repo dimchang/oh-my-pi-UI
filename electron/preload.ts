@@ -3,7 +3,7 @@
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig } from '../src/shared/ipc-channels';
+import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun } from '../src/shared/ipc-channels';
 import type { ModelInfo } from '../src/shared/rpc-types';
 import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
 
@@ -66,6 +66,13 @@ const api: OmpApi = {
   skillsSetEnabled: (name: string, enabled: boolean) =>
     ipcRenderer.invoke(IPC.SkillsSetEnabled, name, enabled),
   skillsUninstall: (name: string) => ipcRenderer.invoke(IPC.SkillsUninstall, name),
+
+  // 定时任务（automations）：存储/记录在主进程，触发事件由主进程 ticker 发出
+  getAutomations: () => ipcRenderer.invoke(IPC.AutomationGet),
+  saveAutomations: (file: AutomationsFile) => ipcRenderer.invoke(IPC.AutomationSave, file),
+  recordAutomationRun: (run: AutomationRun) => ipcRenderer.invoke(IPC.AutomationRecordRun, run),
+  onAutomationTrigger: (cb: (task: AutomationTask) => void) => subscribe<AutomationTask>(IPC.AutomationTrigger, cb),
+  onAutomationChanged: (cb: (file: AutomationsFile) => void) => subscribe<AutomationsFile>(IPC.AutomationChanged, cb),
 
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow: () => ipcRenderer.invoke(IPC.WindowMinimize),
