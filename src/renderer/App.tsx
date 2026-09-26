@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useApp, type UiRequest, type Attachment, toolNameOf, isImageFile, shouldHealStuckStreaming } from './store';
+import { useApp, type UiRequest, type Attachment, toolNameOf, isImageFile, shouldHealStuckStreaming, shouldHealFromDisk, SESSION_STALL_MS } from './store';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -286,6 +286,14 @@ export default function App(): React.ReactElement {
       knownSessionPathsBeforeNew.current.add(realPath);
       tempSubmittedKeys.current.delete(cur);
       tempCwdRef.current.delete(cur);
+      // 0.5.21：automationRuns 的 key 跟随迁移（tempKey → realPath）。此前未迁移——
+      // agent_end 记成功（:automationRuns.get(sp)）与 onExit 记失败在迁移后按 realPath
+      // 查不到映射，定时任务的执行记录一直在丢（评审 §5 发现的现存 bug）。
+      const autoRun = automationRuns.current.get(cur);
+      if (autoRun) {
+        automationRuns.current.delete(cur);
+        automationRuns.current.set(realPath, { ...autoRun, sessionPath: realPath });
+      }
       const buf = st.sessionsMap[cur];
       const ps = st.procStateMap[cur];
       const sessionsMap = { ...st.sessionsMap };
@@ -484,11 +492,8 @@ export default function App(): React.ReactElement {
         }).catch(() => undefined);
         useApp.getState().pushToast(`⚠️ 定时任务「${autoRun.taskName}」异常中止`, 'error');
       }
-      useApp.getState().setProcState(sessionPath, { status: 'offline', isStreaming: false, isAborting: false });
-      // 仅当退出的是当前显示会话，弹“已退出”遮罩
-      if (sessionPath === useApp.getState().currentSessionPath) {
-        useApp.getState().setOmpExited(code);
-      }
+      // 0.5.21：清理逻辑提取为 clearSessionProc（reconcile/healFromDisk 失联路径复用）
+      clearSessionProc(sessionPath, { exitedCode: code });
       // temp 会话进程退出（含 evict 的 code=null，如权限切换/池淘汰）：先迁移再考虑恢复。
       // 旧实现只在 code!==0 时走迁移 → evict 路径下 tempKey 永不迁移，指针滞留死 key，
       // 之后 ensureOnline/acquire(tempKey) 对一个磁盘上不存在的 key 全新 spawn →
@@ -756,8 +761,11 @@ export default function App(): React.ReactElement {
   // **不补发 agent_end 帧**（二进制内嵌源码：FG.fail 只 reject），回合结束后帧流戛然而止，
   // procStateMap.isStreaming 卡 true → 侧栏橙点不灭。
   // 这里每 30s 扫描 procStateMap：
+  //   - 静默超阈值（10min）：先做 P1 磁盘对账（jsonl 尾部 stop 收尾 → turn 必然已完结，
+  //     自愈不依赖 omp RPC——0.5.21，01a0cc6c 事故：exit 丢失 + RPC 失败双向盲区）；
   //   - 在线会话：向 omp get_state 对账。omp 报已结束 → 重置本侧镜像（橙点解除）；
-  //     omp 仍在跑且静默 >= STUCK_AFTER_MS → 标记 stuckSince + toast 警告（每轮只提示一次）。
+  //     对账失败 → 计数，连续 3 次（或 not online 即刻）按失联清理；omp 仍在跑且
+  //     静默 >= STUCK_AFTER_MS → 标记 stuckSince + toast 警告（每轮只提示一次）。
   //   - 恢复收帧时 applyAgentEvent 会刷新 lastFrameAt 并清 stuckSince → 自动解除
   // 阈值取 10 分钟：正常长工具调用（bash/网页抓取）可能合法静默数分钟。
   useEffect(() => {
@@ -767,22 +775,24 @@ export default function App(): React.ReactElement {
       const now = Date.now();
       for (const [path, ps] of Object.entries(st.procStateMap)) {
         if (!ps.isStreaming) continue;
+        const silentMs = now - (ps.lastFrameAt ?? 0);
         if (ps.status === 'online') {
           // 在线：以 omp 内部 isStreaming 为权威真值对账（自愈/挂死提示都由此触发）
           void reconcileStreamingState(path, STUCK_AFTER_MS);
-          continue;
+        } else {
+          // 非 online（spawning 等过渡态）：退回纯静默判定
+          if (!ps.lastFrameAt) continue;
+          if (silentMs >= STUCK_AFTER_MS && !ps.stuckSince) {
+            st.setProcState(path, { stuckSince: ps.lastFrameAt });
+            const label = path.split(/[\\/]/).pop() ?? path;
+            st.pushToast(
+              `⚠️ 会话 ${label} 已 ${Math.round(silentMs / 60000)} 分钟无任何响应，疑似卡死（工具可能挂死）。可点输入框停止按钮强制中断。`,
+              'warning',
+            );
+          }
         }
-        // 非 online（spawning 等过渡态）：退回纯静默判定
-        if (!ps.lastFrameAt) continue;
-        const silentMs = now - ps.lastFrameAt;
-        if (silentMs >= STUCK_AFTER_MS && !ps.stuckSince) {
-          st.setProcState(path, { stuckSince: ps.lastFrameAt });
-          const label = path.split(/[\\/]/).pop() ?? path;
-          st.pushToast(
-            `⚠️ 会话 ${label} 已 ${Math.round(silentMs / 60000)} 分钟无任何响应，疑似卡死（工具可能挂死）。可点输入框停止按钮强制中断。`,
-            'warning',
-          );
-        }
+        // P1 磁盘对账（0.5.21）：与 RPC 对账并行——RPC 挂死/失联时它也能独立自愈
+        if (silentMs >= STUCK_AFTER_MS) void healFromDisk(path);
       }
     }, 30_000);
     return () => window.clearInterval(timer);
@@ -964,8 +974,15 @@ export default function App(): React.ReactElement {
     st.pushToast(`⏰ 定时任务「${task.name}」已触发`, 'info');
     void window.omp.recordAutomationRun(run).catch(() => undefined);
     try {
-      tempCwdRef.current.set(tempKey, task.cwd);
-      await rpc.newSessionForCwd(tempKey, task.cwd, task.approvalMode ?? 'write');
+    tempCwdRef.current.set(tempKey, task.cwd);
+    // 预播种任务模型到 lastModelMap（只写 map 不动全局兜底）：新会话进程 ready 时
+    // restoreSessionModel 对无记录会话会回退全局 lastModel，若后于下方 setModel 执行
+    // 就会把任务指定模型覆盖成别的模型（2026-09-23 自动化任务跑成 hy3 的根因）。
+    // 播种后恢复的即任务模型，任何时序下结果一致；后续 rpc.setModel 幂等保留。
+    if (task.model?.provider && task.model?.id) {
+      useApp.getState().seedSessionModel(tempKey, task.model);
+    }
+    await rpc.newSessionForCwd(tempKey, task.cwd, task.approvalMode ?? 'write');
       useApp.getState().setProcState(tempKey, { status: 'online' });
       // 已提交标记：agent_end 后正常走 tempKey→realPath 落盘迁移（与手动消息同路径）
       tempSubmittedKeys.current.add(tempKey);
@@ -1523,25 +1540,88 @@ function getWorkDir(): string {
   return cwdProcess.cwd?.() ?? '';
 }
 
+/** 会话进程失联/退出的公共清理（0.5.21 提取自 onExit，01a0cc6c 事故）。
+ *  只做「状态复位 + 当前会话遮罩」：**不含** tempKey 迁移与自动 respawn——
+ *  失联清理不自动重拉进程（会凭空造进程），下次 prompt 走既有 acquire 路径即可自愈。 */
+function clearSessionProc(sessionPath: string, opts?: { exitedCode?: number | null }): void {
+  useApp.getState().setProcState(sessionPath, {
+    status: 'offline',
+    isStreaming: false,
+    isAborting: false,
+    stuckSince: undefined,
+    reconFailCount: 0,
+  });
+  if (sessionPath === useApp.getState().currentSessionPath) {
+    useApp.getState().setOmpExited(opts?.exitedCode ?? null);
+  }
+}
+
+/** 流式状态对账失败计数（0.5.21）。连续达阈 → 判定进程失联并清理。
+ *  背景（实证 01a0cc6c 卡「运行中」25h）：exit 事件丢失后，对账每 30s 静默失败一次，
+ *  旧代码 catch{} 直接 return —— 失败必须被计数并最终收敛到清理动作。 */
+const RECON_MAX_FAILS = 3;
+function markReconFail(sessionPath: string, reason: string): void {
+  const st = useApp.getState();
+  const count = (st.procStateMap[sessionPath]?.reconFailCount ?? 0) + 1;
+  st.setProcState(sessionPath, { reconFailCount: count });
+  if (count >= RECON_MAX_FAILS) {
+    clearSessionProc(sessionPath);
+    const label = sessionPath.split(/[\\/]/).pop() ?? sessionPath;
+    st.pushToast(`会话「${label}」进程已失联（连续 ${count} 次对账失败：${reason}），发送消息将自动重连`, 'warning');
+  }
+}
+
+/** P1 磁盘对账自愈（0.5.21）：不依赖 omp RPC。静默超阈值时读 jsonl 尾部，
+ *  尾部最后一条 assistant 消息 stopReason==='stop' 且 mtime 已停滞 → turn 在服务端
+ *  必然已完结（omp 只在 agent_end flush JSONL），按完结清理并重载历史。
+ *  **顺序关键**：必须先清 isStreaming 再 loadSessionMessages——loadSessionMessages 的
+ *  竞态守卫在 isStreaming=true 时会丢弃磁盘快照（store.ts），顺序颠倒本自愈一行效果都没有。 */
+async function healFromDisk(sessionPath: string): Promise<void> {
+  try {
+    const st = useApp.getState();
+    if (!st.procStateMap[sessionPath]?.isStreaming) return;
+    const tail = await window.omp.sessionTail(sessionPath);
+    // RPC 往返期间状态可能已变（agent_end 修复 / onExit / 上一轮自愈），用最新态再判一次
+    const st2 = useApp.getState();
+    if (!shouldHealFromDisk(st2.procStateMap[sessionPath], tail ?? undefined)) return;
+    st2.setProcState(sessionPath, { isStreaming: false, isAborting: false, stuckSince: undefined });
+    if (sessionPath === st2.currentSessionPath) {
+      st2.setState({ isStreaming: false, isAborting: false });
+    }
+    st2.loadSessionMessages(sessionPath);
+    const label = sessionPath.split(/[\\/]/).pop() ?? sessionPath;
+    st2.pushToast(`会话「${label}」的回合已在后台完成（磁盘对账自愈），已重载历史`, 'info');
+  } catch {
+    /* 磁盘读取失败：下一轮看门狗重试 */
+  }
+}
+
 /** 流式状态对账自愈（2026-09-16 橙点常亮修复）。
  *  omp 的 agent 循环异常/中止路径不补发 agent_end 帧 → 本侧 procStateMap.isStreaming 卡 true，
  *  侧栏橙点不灭（实证 session 01a0a638）。以 omp 内部 isStreaming（get_state）为权威真值：
- *  不一致且 RPC 往返期间无新帧到达时重置本侧镜像；omp 确实仍在跑且静默超阈值才提示疑似卡死。 */
+ *  不一致且 RPC 往返期间无新帧到达时重置本侧镜像；omp 确实仍在跑且静默超阈值才提示疑似卡死。
+ *  0.5.21（01a0cc6c 事故）：catch / !success 不再静默 return——
+ *    - 错误含 `not online`：主进程池里已无该进程（exit 在主进程侧发生过但事件丢失）→ 权威死亡证据，立即清理；
+ *    - 其余失败（超时/异常）：计数，连续 RECON_MAX_FAILS 次 → 按失联清理；
+ *    - 对账用 3s 短超时：默认 5min 超时下僵死进程会让 pending 随 30s 看门狗无限堆积。 */
 async function reconcileStreamingState(sessionPath: string, stuckAfterMs: number): Promise<void> {
   const sentAt = Date.now();
   try {
-    const r = await rpc.getState(sessionPath);
-    if (!r.success) return;
+    const r = await rpc.getState(sessionPath, 3000);
+    if (!r.success) {
+      markReconFail(sessionPath, 'rpc-failed');
+      return;
+    }
     const d = r.data as RpcSessionState;
     const stNow = useApp.getState();
     const psNow = stNow.procStateMap[sessionPath];
-    // 已被 agent_end / onExit 修正 → 无需对账
+    // 已被 agent_end / onExit / healFromDisk 修正 → 无需对账
     if (!psNow?.isStreaming) return;
     // RPC 往返期间有新帧到达 → 帧流是权威，不覆写（可能已 agent_end 或新回合已 agent_start）
     if ((psNow.lastFrameAt ?? 0) > sentAt) return;
     if (d.isStreaming === false) {
       // omp 内部已结束、帧流丢了 agent_end → 以 omp 为准重置镜像，橙点解除
-      stNow.setProcState(sessionPath, { isStreaming: false, isAborting: false, stuckSince: undefined });
+      stNow.setProcState(sessionPath, { isStreaming: false, isAborting: false, stuckSince: undefined, reconFailCount: 0 });
       if (pathsEqual(sessionPath, stNow.currentSessionPath ?? '')) {
         stNow.setState({ isStreaming: false, isAborting: false });
       }
@@ -1549,16 +1629,26 @@ async function reconcileStreamingState(sessionPath: string, stuckAfterMs: number
     }
     // omp 仍在跑：静默超阈值 → 疑似工具挂死，提示一次（stuckSince 任意新帧自动清除）
     const silentMs = Date.now() - (psNow.lastFrameAt ?? 0);
+    const patch: { reconFailCount: number; stuckSince?: number } = { reconFailCount: 0 };
     if (silentMs >= stuckAfterMs && !psNow.stuckSince) {
-      stNow.setProcState(sessionPath, { stuckSince: psNow.lastFrameAt });
+      patch.stuckSince = psNow.lastFrameAt;
       const label = sessionPath.split(/[\\/]/).pop() ?? sessionPath;
       stNow.pushToast(
         `⚠️ 会话 ${label} 已 ${Math.round(silentMs / 60000)} 分钟无任何响应，疑似卡死（工具可能挂死）。可点输入框停止按钮强制中断。`,
         'warning',
       );
     }
-  } catch {
-    /* 进程离线等：交给 onExit 路径处理 */
+    stNow.setProcState(sessionPath, patch);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('not online')) {
+      // 进程已不在池：权威死亡证据（exit 在主进程发生过、事件丢失），立即清理，不必等计数
+      clearSessionProc(sessionPath);
+      const label = sessionPath.split(/[\\/]/).pop() ?? sessionPath;
+      useApp.getState().pushToast(`会话「${label}」进程已失联，发送消息将自动重连`, 'warning');
+      return;
+    }
+    markReconFail(sessionPath, msg.slice(0, 80));
   }
 }
 

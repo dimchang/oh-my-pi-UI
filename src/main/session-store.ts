@@ -269,6 +269,52 @@ export async function readSessionMessages(filePath: string): Promise<ReplayMessa
   return out;
 }
 
+/** 读 session JSONL 尾部（默认 64KB），返回 mtime + 最后一条 assistant 消息的 stopReason。
+ *  0.5.21 看门狗磁盘对账用：omp 只在 agent_end flush JSONL，尾部有 stop 收尾 ⟹ turn 已完结。
+ *  不复用全量 readSessionMessages——卡死会话每 30s 全量读数十 MB 不可接受。
+ *  判据校验（frame 183 实测）：assistant 消息的 stopReason 落在 message 顶层字段。 */
+export async function readSessionTail(filePath: string, maxBytes = 64 * 1024): Promise<{ mtimeMs: number; lastStopReason?: string } | null> {
+  try {
+    await assertWithinSessionsRoot(filePath);
+  } catch {
+    return null;
+  }
+  let fd: fs.promises.FileHandle | null = null;
+  try {
+    const st = await fs.promises.stat(filePath);
+    fd = await fs.promises.open(filePath, 'r');
+    const start = Math.max(0, st.size - maxBytes);
+    const len = st.size - start;
+    if (len === 0) return { mtimeMs: st.mtimeMs };
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await fd.read(buf, 0, len, start);
+    let text = new TextDecoder('utf8').decode(buf.subarray(0, bytesRead));
+    // 从文件中部起读时首行可能被截断，丢掉残行
+    if (start > 0) {
+      const nl = text.indexOf('\n');
+      text = nl >= 0 ? text.slice(nl + 1) : '';
+    }
+    const lines = text.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ln = lines[i]!.trim();
+      if (!ln) continue;
+      try {
+        const entry = JSON.parse(ln) as { type?: string; message?: { role?: string; stopReason?: string } };
+        if (entry.type === 'message' && entry.message?.role === 'assistant' && typeof entry.message.stopReason === 'string') {
+          return { mtimeMs: st.mtimeMs, lastStopReason: entry.message.stopReason };
+        }
+      } catch { /* 截断残行/损坏行跳过 */ }
+    }
+    return { mtimeMs: st.mtimeMs };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { await fd.close(); } catch { /* noop */ }
+    }
+  }
+}
+
 /** 读 session JSONL，返回所有 user 消息的 entry id + 文本（按出现顺序）。
  *  供分叉（branch）功能使用：branch 需要 user message 的 entryId 作为分叉点。
  *  同样改为 readline 流式解析，避免大文件全量读入阻塞主进程。 */

@@ -16,9 +16,10 @@ import type {
   TodoPhase,
   TodoItem,
 } from '../shared/rpc-types';
-import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig, AutomationTask } from '../shared/ipc-channels';
+import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig, AutomationTask, SessionTailInfo } from '../shared/ipc-channels';
+export type { SessionTailInfo } from '../shared/ipc-channels';
 import type { SkillInfo } from '../shared/ipc-channels';
-import { ompStat } from './diagnostics';
+import { ompStat, exportDiagLines } from './diagnostics';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
 import { buildThemeCSS, getThemePreset } from './themes';
 import { extractDiff, extractChangeSummary } from './components/DiffView';
@@ -177,6 +178,11 @@ export interface ProcState {
   /** 流式看门狗：判定卡死的起始时间（=触发时距最后帧已超阈值的时刻标记）。
    *  任意新帧到达即清除（applyAgentEvent 统一写 undefined）；仅提示，不自动中断。 */
   stuckSince?: number;
+  /** 流式看门狗（0.5.21）：get_state 对账**连续失败**计数（超时/异常）。
+   *  成功对账或任意新帧到达时归零；连续达阈（RECON_MAX_FAILS）→ 判定进程失联并清理。
+   *  背景（实证 01a0cc6c）：exit 事件丢失后 reconcileStreamingState 每 30s 静默失败一次，
+   *  无限循环 25h——失败必须被计数并最终收敛到清理动作。 */
+  reconFailCount?: number;
 }
 
 interface AppState {
@@ -336,6 +342,10 @@ interface AppState {
   /** 记录某会话用户选的 model：写 lastModelMap[sessionPath]（会话隔离）+ 全局 lastModel 兜底，
    *  同时触发持久化。sessionPath 必须显式传入（调用点持有快照，禁内部重读指针）。 */
   setLastModelForSession(sessionPath: string, m: { provider: string; id: string; name?: string }): void;
+  /** 只写 lastModelMap[sessionPath]，**不动**全局 lastModel 兜底。
+   *  用途：自动化任务 spawn 前预播种任务指定模型——否则新会话无 map 记录，
+   *  onReady 的 restoreSessionModel 会回退全局 lastModel 把任务模型覆盖掉（2026-09-23 hy3 串模型）。 */
+  seedSessionModel(sessionPath: string, m: { provider: string; id: string; name?: string }): void;
   /** tempKey→realPath 迁移时同步迁移该会话的模型记录（同 sessionNames 的迁移语义）。 */
   migrateLastModelKey(from: string, to: string): void;
   /** 删除会话时清理其模型记录，防 workspaces.json 无限膨胀。 */
@@ -538,8 +548,12 @@ export function connDetail(s: ConnSnapshot): string {
 }
 
 // ---- 侧栏会话状态点（2026-09-16）----
-// 橙=运行中（该会话进程正在流式生成）；红=出错或等待用户确认；绿=有结果未查看。
-export type SessionDot = 'red' | 'orange' | 'green';
+// 橙=运行中（该会话进程正在流式生成）；红=出错或等待用户确认；绿=有结果未查看；
+// 灰橙（0.5.21）=运行中但静默超阈值（疑似卡死/进程失联——让用户别对着假"运行中"干等）。
+export type SessionDot = 'red' | 'stalled' | 'orange' | 'green';
+
+/** 状态点「静默」阈值：与看门狗 STUCK_AFTER_MS 一致。 */
+export const SESSION_STALL_MS = 10 * 60 * 1000;
 
 /** 判定状态点所需的最小状态切片。 */
 export interface SessionDotSnapshot {
@@ -552,17 +566,25 @@ export interface SessionDotSnapshot {
 /** 会话状态点标题（侧栏 tooltip）。 */
 export const SESSION_DOT_TITLES: Record<SessionDot, string> = {
   red: '出错或等待确认',
+  stalled: '运行中但长时间无响应（疑似卡死）',
   orange: '运行中',
   green: '有新结果未查看',
 };
 
 /** 纯函数：给定会话 path 与状态切片，返回应显示的状态点颜色（无则 null）。
- *  优先级：红（出错/待确认）> 橙（运行中）> 绿（未读结果）。
- *  等待确认 = uiQueue 里有 sessionPath 指向该会话的待应答请求（confirm/select/input/editor）。 */
-export function sessionDotStatus(sessionPath: string, snap: SessionDotSnapshot): SessionDot | null {
+ *  优先级：红（出错/待确认）> 灰橙（运行中但静默）> 橙（运行中）> 绿（未读结果）。
+ *  等待确认 = uiQueue 里有 sessionPath 指向该会话的待应答请求（confirm/select/input/editor）。
+ *  判据用 lastFrameAt 而非 stuckSince——stuckSince 只在 get_state 对账成功路径写入，
+ *  进程失联时永远写不进去（判据自依赖失效，01a0cc6c 事故教训）。 */
+export function sessionDotStatus(sessionPath: string, snap: SessionDotSnapshot, now: number = Date.now()): SessionDot | null {
   if (snap.sessionErrors[sessionPath]) return 'red';
   if (snap.uiQueue.some((q) => q.sessionPath === sessionPath)) return 'red';
-  if (snap.procStateMap[sessionPath]?.isStreaming) return 'orange';
+  const ps = snap.procStateMap[sessionPath];
+  if (ps?.isStreaming) {
+    // lastFrameAt 未知（理论上 streaming 必有 agent_start 先行写入）时保守显示橙
+    if (ps.lastFrameAt !== undefined && now - ps.lastFrameAt >= SESSION_STALL_MS) return 'stalled';
+    return 'orange';
+  }
   if (snap.unreadSessions[sessionPath]) return 'green';
   return null;
 }
@@ -582,6 +604,30 @@ export function shouldHealStuckStreaming(
   sentAt: number,
 ): boolean {
   return !!ps?.isStreaming && ompIsStreaming === false && (ps.lastFrameAt ?? 0) <= sentAt;
+}
+
+// ---- P1 磁盘对账判定（0.5.21，01a0cc6c 事故：exit 丢失 + RPC 失败双向盲区兜底）----
+// 不依赖 omp RPC 的终极兜底：omp **只在 agent_end flush JSONL**（store.ts 读盘竞态注释、
+// App.tsx agent_end 自愈注释均为实证），因此「jsonl 尾部最后一条 assistant 消息带
+// stopReason==='stop'」⟹ turn 在服务端必然已完结——无论 exit 帧是否到达、RPC 是否可用。
+// 覆盖边界（评审修正）：只覆盖「omp 端已完成落盘、帧没送到/状态没复位」这一类；
+// 若 omp 进程僵死在收尾前（jsonl 无 stop 收尾），本判据不触发——那是 P0 失败计数清理的辖区。
+// （SessionTailInfo 类型统一定义在 shared/ipc-channels.ts，此处 re-export 供 renderer 侧引用。）
+
+/** 纯函数：磁盘对账自愈判定。全部满足才自愈：
+ *  1) 本侧镜像仍 streaming；2) 尾部 stopReason==='stop'；
+ *  3) 渲染层静默 >= stallMs（最后帧距今）；4) 文件 mtime 也已停滞 >= stallMs
+ *     （排除「omp 还在分批 flush」的窗口——10min 阈值远大于任何合理 flush 延迟）。 */
+export function shouldHealFromDisk(
+  ps: ProcState | undefined,
+  tail: SessionTailInfo | undefined,
+  now: number = Date.now(),
+  stallMs: number = SESSION_STALL_MS,
+): boolean {
+  if (!ps?.isStreaming || !tail) return false;
+  if (tail.lastStopReason !== 'stop') return false;
+  if (now - (ps.lastFrameAt ?? 0) < stallMs) return false;
+  return now - tail.mtimeMs >= stallMs;
 }
 
 // ---- 重试气泡终结判定（2026-09-17「重试中 (1/10)… 常亮」修复）----
@@ -646,6 +692,8 @@ function pushFrameDiag(e: FrameDiagEntry): void {
   frameDiag.push(e);
   if (frameDiag.length > FRAME_DIAG_CAP) frameDiag.splice(0, frameDiag.length - FRAME_DIAG_CAP);
 }
+/** 帧处理异常落盘节流（0.5.21）：30s 内只写第一笔，防坏帧风暴刷爆日志。 */
+let lastFrameErrLoggedAt = 0;
 
 // issue 10：persistWorkspaces 去抖。多次高频触发时只在静默窗口后写一次，
 // 且 flush 时读取最新 store 状态，避免用旧数据覆盖新数据。
@@ -939,6 +987,11 @@ export const useApp = create<AppState>((set, get) => ({
   setLastModelForSession: (sessionPath, m) => {
     set((s) => ({ lastModel: m, lastModelMap: { ...s.lastModelMap, [sessionPath]: m } }));
     // 写回磁盘
+    get().persistWorkspaces();
+  },
+
+  seedSessionModel: (sessionPath, m) => {
+    set((s) => ({ lastModelMap: { ...s.lastModelMap, [sessionPath]: m } }));
     get().persistWorkspaces();
   },
 
@@ -1604,13 +1657,20 @@ export const useApp = create<AppState>((set, get) => ({
     });
     } catch (err) {
       // 帧处理抛异常：记入诊断日志（该帧丢失可见化），不中断后续帧处理。
+      const errMsg = err instanceof Error ? err.message : String(err);
       pushFrameDiag({
         t: now,
         type,
         sp: rawTargetPath,
         display: isDisplay,
-        err: err instanceof Error ? err.message : String(err),
+        err: errMsg,
       });
+      // 0.5.21：err 同时落盘（节流 30s，避免刷爆日志文件）。内存环形缓冲只有 600 条，
+      // 长时间卡死会被滚动吞掉——01a0cc6c 事故就是事后无从查起。
+      if (now - lastFrameErrLoggedAt > 30_000) {
+        lastFrameErrLoggedAt = now;
+        exportDiagLines([`!! frame-error type=${type} sp=${rawTargetPath} display=${isDisplay} err=${errMsg}`]);
+      }
       console.error('[omp-frame-error]', type, err);
     }
   },

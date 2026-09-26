@@ -15,6 +15,7 @@ export const IPC = {
   SessionDelete: 'session:delete', // (path: string) => Promise<void>
   SessionMessages: 'session:messages', // (path: string) => Promise<ReplayMessage[]>
   SessionUserEntries: 'session:user-entries', // (path: string) => Promise<{id:string;text:string}[]> — 分叉用，取 user entry id + 文本
+  SessionTail: 'session:tail', // (path: string) => Promise<SessionTailInfo | null> — 读尾部 64KB 的 mtime + 最后 assistant stopReason（看门狗磁盘对账用，0.5.21）
   GetOmpInfo: 'omp:info', // () => Promise<{path:string; version:string}>
   OpenExternal: 'shell:open-external', // (url: string) => Promise<void>
   OpenPath: 'shell:open-path', // (dirPath: string) => Promise<void> — 用系统默认程序打开本地路径（目录→资源管理器）。本地路径禁走 openExternal（只收 http/https）
@@ -102,6 +103,12 @@ export const IPC = {
   AutomationRecordRun: 'automation:record-run', // (run: AutomationRun) => Promise<void> — 按 run.id upsert，cap 200 条
   AutomationTrigger: 'automation:trigger', // (task: AutomationTask) — main → renderer：任务到期，渲染层执行
   AutomationChanged: 'automation:changed', // (file: AutomationsFile) — main → renderer：文件被主进程改动（到期扣账/过期停用），渲染层刷新
+
+  // 企微桥（wecom bridge）：主进程常驻长连接，把企微智能机器人消息桥接到 OMP 会话
+  WecomGet: 'wecom:get', // () => Promise<WecomBridgeStatus> — 状态 + 配置快照
+  WecomSave: 'wecom:save', // (cfg: WecomBridgeConfig) => Promise<WecomBridgeStatus> — 保存配置并按需重连
+  WecomTest: 'wecom:test', // () => Promise<{ ok: boolean; message: string }> — 立即连一次验证凭证
+  WecomChanged: 'wecom:changed', // (status: WecomBridgeStatus) — main → renderer：连接/绑定状态变化
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -181,6 +188,15 @@ export interface SessionSummary {
    *  由主进程 listSessions 算出；渲染层 reconcile 用它挡掉「为已消失目录自动造工作区」
    *  （2026-09-12 幽灵工作区事故）。可选：占位会话/老数据缺省按存在处理。 */
   cwdExists?: boolean;
+}
+
+/** session JSONL 尾部信息（0.5.21 看门狗磁盘对账用）。
+ *  只读尾部 64KB，不复用全量 readSessionMessages（数十 MB 文件每 30s 全量读不可接受）。 */
+export interface SessionTailInfo {
+  /** 文件 mtime（ms） */
+  mtimeMs: number;
+  /** 尾部最后一条 assistant 消息的 stopReason；64KB 内解析不到为 undefined */
+  lastStopReason?: string;
 }
 
 /** omp 权限模式（对应启动参数 `--approval-mode`，spawn 时生效）。
@@ -393,6 +409,48 @@ export interface AutomationsFile {
   runs: AutomationRun[];
 }
 
+// ---- 企微桥（wecom bridge）----
+
+/** 一个聊天（群 chatid / 单聊 userid）与 OMP 会话的绑定 */
+export interface WecomBinding {
+  /** 群聊 = chatid；单聊 = from.userid */
+  chatKey: string;
+  /** 绑定的会话路径（__wecom_ 临时 key 或落盘后的真实 .jsonl 路径） */
+  sessionPath: string;
+  chatType: 'single' | 'group';
+  /** 绑定时的首条消息摘要（UI 展示用） */
+  title: string;
+  createdAt: number;
+}
+
+/** 企微桥持久化配置（userData/wecom-bridge.json） */
+export interface WecomBridgeConfig {
+  enabled: boolean;
+  /** 智能机器人 BotID（管理后台 → 智能机器人 → 长连接） */
+  botId: string;
+  /** 长连接专用 Secret（与回调模式的 Token/EncodingAESKey 无关） */
+  secret: string;
+  /** 远程会话的默认工作目录（空 = 第一个工作空间） */
+  cwd: string;
+  approvalMode: ApprovalMode;
+  /** 远程消息注入语义：steer=打断当前任务（默认）；followUp=排队不打断 */
+  injectMode: 'steer' | 'followUp';
+  bindings: WecomBinding[];
+}
+
+/** 企微桥运行状态（IPC 查询/推送） */
+export interface WecomBridgeStatus {
+  enabled: boolean;
+  connected: boolean;
+  botId: string;
+  cwd: string;
+  approvalMode: ApprovalMode;
+  injectMode: 'steer' | 'followUp';
+  bindings: WecomBinding[];
+  /** 有进行中流式回合的聊天 */
+  activeChats: string[];
+}
+
 // ---- 模型配置：omp 原生 ~/.omp/agent/models.yml ----
 
 /** models.yml 里 provider 下单个模型的定义（自定义 provider 手填模型时用，字段与 omp ModelDefinition 对齐，只保留 GUI 需要的） */
@@ -441,7 +499,8 @@ export interface OmpApi {
   diagLog(lines: string[]): void;
   // issue 18: 泛型化返回类型，调用方可声明期望的响应类型（如 send<MyData>(...)），
   // 不再强制 any/unknown 断言；preload 实现返回 Promise<any> 可安全赋给 Promise<T>。
-  send<T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T>;
+  /** timeoutMs 可覆盖 FrameRouter 默认 5min 超时（0.5.21：看门狗对账传 3s，防僵死进程堆积 pending） */
+  send<T = unknown>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<T>;
   /** 懒拉起某会话的进程（带 -c 续接历史）。已在线则 no-op。 */
   acquire(sessionPath: string, cwd: string, approvalMode?: ApprovalMode): Promise<void>;
   /** 新建会话：spawn 不带 -c，返回新 sessionPath。
@@ -455,6 +514,8 @@ export interface OmpApi {
   deleteSession(path: string): Promise<void>;
   /** 从磁盘读 session JSONL 消息历史（切换看历史不中断当前生成时用，绕过 omp current 限制） */
   readSessionMessages(path: string): Promise<ReplayMessage[]>;
+  /** 读 session JSONL 尾部 64KB（mtime + 最后 assistant stopReason），看门狗磁盘对账用（0.5.21） */
+  sessionTail(path: string): Promise<SessionTailInfo | null>;
   /** 读 session JSONL 中所有 user 消息的 entry id + 文本（分叉用） */
   getSessionUserEntries(path: string): Promise<{ id: string; text: string }[]>;
   getOmpInfo(): Promise<{ path: string; version: string }>;
@@ -465,7 +526,6 @@ export interface OmpApi {
   openInBrowser(browser: 'chrome' | 'edge', url: string): Promise<void>;
   /** 写系统剪贴板（用 electron clipboard，规避 renderer navigator.clipboard 的安全上下文限制） */
   copyText(text: string): Promise<void>;
-  /** 在系统文件管理器中定位并高亮指定文件（Windows 资源管理器 / macOS Finder） */
   showItemInFolder(fullPath: string): Promise<void>;
   showSaveDialog(defaultPath?: string): Promise<string | null>;
   listFiles(dirPath: string): Promise<FileEntry[]>;
@@ -481,6 +541,16 @@ export interface OmpApi {
   /** 通知主进程 renderer 就绪（多进程下不再直接起 omp，仅标记可响应 acquire） */
   /** 通知主进程 renderer 就绪（issue 85：handler 为无参 no-op，不再接收 initialCwd 死参） */
   notifyReady(): Promise<void>;
+
+  // 企微桥（wecom bridge）
+  /** 桥状态 + 配置快照 */
+  getWecomStatus(): Promise<WecomBridgeStatus>;
+  /** 保存配置（enabled/botId/secret 等变化会即时重连/断开） */
+  saveWecomConfig(cfg: WecomBridgeConfig): Promise<WecomBridgeStatus>;
+  /** 立即建立一次长连接验证凭证（不影响已保存配置） */
+  testWecom(botId: string, secret: string): Promise<{ ok: boolean; message: string }>;
+  /** 桥状态变化推送（连接建立/断开、绑定变化、回合起止） */
+  onWecomChanged(cb: (status: WecomBridgeStatus) => void): () => void;
 
   // M5: 工作空间
   getWorkspaces(): Promise<WorkspacesLoadResult>;

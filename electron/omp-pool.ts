@@ -200,12 +200,13 @@ export class OmpProcessPool {
     return e;
   }
 
-  /** 往某会话的进程发命令并等响应。 */
-  async send<T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<RpcResponse<T>> {
+  /** 往某会话的进程发命令并等响应。timeoutMs 可覆盖 FrameRouter 默认 5min 超时
+   *  （0.5.21：看门狗对账传 3s——进程僵死时 5min pending 会随 30s 看门狗无限堆积）。 */
+  async send<T = unknown>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<RpcResponse<T>> {
     const entry = this.get(sessionPath);
     if (!entry) throw new Error(`omp process not online for session: ${sessionPath}`);
     entry.lastActiveAt = Date.now();
-    return entry.router.send<T>(cmd);
+    return entry.router.send<T>(cmd, timeoutMs);
   }
 
   /** 直接写命令到某会话进程 stdin（不等响应，用于 extension_ui_response）。 */

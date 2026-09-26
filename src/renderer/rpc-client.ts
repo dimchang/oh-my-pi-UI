@@ -18,10 +18,10 @@ import type {
 } from '../shared/rpc-types';
 import type { WorkspacesFile, ApprovalMode } from '../shared/ipc-channels';
 
-async function send<T>(sessionPath: string, cmd: RpcCommand): Promise<RpcResponse<T>> {
+async function send<T>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<RpcResponse<T>> {
   // 主进程把 RPC 层错误（omp 错误帧 / not online 等）包成 { __rpcError } 信封返回，
   // 避免 Electron 对 ipcMain.handle 的 rejection 打堆栈日志；这里拆包还原为 throw。
-  const resp = (await window.omp.send<T>(sessionPath, cmd)) as RpcResponse<T> & { __rpcError?: string };
+  const resp = (await window.omp.send<T>(sessionPath, cmd, timeoutMs)) as RpcResponse<T> & { __rpcError?: string };
   if (resp && typeof resp === 'object' && typeof resp.__rpcError === 'string') {
     throw new Error(resp.__rpcError);
   }
@@ -29,7 +29,7 @@ async function send<T>(sessionPath: string, cmd: RpcCommand): Promise<RpcRespons
 }
 
 export const rpc = {
-  getState: (sp: string) => send<RpcSessionState>(sp, { type: 'get_state' }),
+  getState: (sp: string, timeoutMs?: number) => send<RpcSessionState>(sp, { type: 'get_state' }, timeoutMs),
   getAvailableModels: (sp: string) => send<AvailableModelsData>(sp, { type: 'get_available_models' }),
   getAvailableCommands: (sp: string) => send<{ commands?: SlashCommand[] }>(sp, { type: 'get_available_commands' }),
   getMessages: (sp: string) => send<{ messages: AgentMessage[] }>(sp, { type: 'get_messages' }),

@@ -27,12 +27,12 @@ if (!app.isPackaged) {
 }
 
 import { OmpProcessPool } from './omp-pool';
-import { listSessions, deleteSession, readSessionMessages, readUserEntries } from '../src/main/session-store';
+import { listSessions, deleteSession, readSessionMessages, readUserEntries, readSessionTail } from '../src/main/session-store';
 import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './omp-config';
 import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
 import { loadAutomations, saveAutomations, recordAutomationRun, startAutomationTicker } from './automations';
-import { IPC } from '../src/shared/ipc-channels';
-import type { FileEntry, WorkspacesFile, WorkspacesLoadResult, ApprovalMode, OmpProviderConfig, HookFileConfig, HookFileInfo, CustomCssConfig, PastedImageResult, ImageDataUrlResult, AutomationsFile, AutomationRun } from '../src/shared/ipc-channels';
+import { WecomBridge } from './wecom-bridge';
+import { IPC, type WecomBridgeConfig, type FileEntry, type WorkspacesFile, type WorkspacesLoadResult, type ApprovalMode, type OmpProviderConfig, type HookFileConfig, type HookFileInfo, type CustomCssConfig, type PastedImageResult, type ImageDataUrlResult, type AutomationsFile, type AutomationRun } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -88,6 +88,7 @@ const UI_VERSION = readUiVersion();
 let mainWindow: BrowserWindow | null = null;
 let pool: OmpProcessPool | null = null;
 let appQuitting = false;
+let wecomBridge: WecomBridge | null = null;
 
 const WORKSPACES_FILE = path.join(app.getPath('userData'), 'workspaces.json');
 
@@ -261,6 +262,19 @@ function createWindow(): void {
   mainWindow.on('closed', () => { mainWindow = null; appendDiag('window closed'); });
   // ---- 白屏取证：这几类事件此前完全没人记录，白屏才会"零日志" ----
   const wc = mainWindow.webContents;
+  // ---- 链接兜底（v0.5.19）：渲染层 MarkdownLink 已拦截 markdown 链接左键，这里兜住
+  // raw HTML <a>、target=_blank、SkillsPanel 等漏网入口——任何页面发起的导航都不允许
+  // 替换本窗口（原 bug：点链接整个 UI 被顶掉且无法返回），http/https 一律转系统默认浏览器。
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url).catch(() => undefined);
+    return { action: 'deny' };
+  });
+  wc.on('will-navigate', (e, url) => {
+    const devUrl = process.env.ELECTRON_RENDERER_URL;
+    if (devUrl && url.startsWith(devUrl)) return; // 开发态自身页面放行
+    e.preventDefault();
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url).catch(() => undefined);
+  });
   wc.on('render-process-gone', (_e, details) => {
     appendDiag(`!! render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
   });
@@ -408,7 +422,7 @@ async function syncCustomCss(list: CustomCssConfig[]): Promise<{ error?: string 
 
 function registerIpc(): void {
   // ---- 多进程 RPC 路由 ----
-  ipcMain.handle(IPC.RpcSend, async (_e, sessionPath: string, cmd: RpcCommand) => {
+  ipcMain.handle(IPC.RpcSend, async (_e, sessionPath: string, cmd: RpcCommand, timeoutMs?: number) => {
     if (!pool) throw new Error('pool not initialized');
     // extension_ui_response 无需等待 response（应答帧），直接 write
     if (cmd.type === 'extension_ui_response') {
@@ -425,7 +439,7 @@ function registerIpc(): void {
     // 避免 Electron 对 ipcMain.handle 的 rejection 打整段堆栈日志刷屏；
     // 渲染层 rpc-client.send() 拆出 __rpcError 后照常 throw，调用方语义不变。
     try {
-      return await pool.send(sessionPath, cmd);
+      return await pool.send(sessionPath, cmd, timeoutMs);
     } catch (e) {
       return { __rpcError: e instanceof Error ? e.message : String(e) };
     }
@@ -471,6 +485,8 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.SessionMessages, async (_e, p: string) => readSessionMessages(p));
   ipcMain.handle(IPC.SessionUserEntries, async (_e, p: string) => readUserEntries(p));
+  // 0.5.21 看门狗磁盘对账：尾部 64KB（mtime + 最后 assistant stopReason），不走 omp 进程
+  ipcMain.handle(IPC.SessionTail, async (_e, p: string) => readSessionTail(p));
   // 技能（Skills）管理
   ipcMain.handle(IPC.SkillsList, async () => listSkills());
   ipcMain.handle(IPC.SkillsDetail, async (_e, name: string) => readSkillDetail(name));
@@ -487,6 +503,28 @@ function registerIpc(): void {
     return loadAutomations();
   });
   ipcMain.handle(IPC.AutomationRecordRun, async (_e, run: AutomationRun) => recordAutomationRun(run));
+
+  // 企微桥（wecom bridge）
+  ipcMain.handle(IPC.WecomGet, async () => wecomBridge?.status() ?? null);
+  ipcMain.handle(IPC.WecomSave, async (_e, cfg: WecomBridgeConfig) => {
+    if (!wecomBridge) throw new Error('bridge not initialized');
+    return await wecomBridge.saveConfig(cfg);
+  });
+  ipcMain.handle(IPC.WecomTest, async (_e, botId: string, secret: string) => {
+    // 用临时 client 验证凭证，不动已保存配置与现有连接
+    if (!botId || !secret) return { ok: false, message: 'BotID 与 Secret 不能为空' };
+    const { WecomClient } = await import('./wecom-client');
+    return await new Promise<{ ok: boolean; message: string }>((resolve) => {
+      const probe = new WecomClient(botId, secret, {
+        onOpen: () => { probe.stop(); resolve({ ok: true, message: '连接成功，凭证有效' }); },
+        onClose: () => undefined,
+        onError: (err) => { probe.stop(); resolve({ ok: false, message: err }); },
+        onMessage: () => undefined,
+      });
+      probe.start();
+      setTimeout(() => { probe.stop(); resolve({ ok: false, message: '连接超时（15s），请检查 BotID/Secret 与网络' }); }, 15_000);
+    });
+  });
 
   ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown', agentDir: getAgentDir() }));
 
@@ -886,13 +924,46 @@ app.whenReady().then(() => {
       if (fr.type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
         pool?.pin(sessionPath);
       }
+      // 企微桥订阅帧流（流式增量 + agent_end 终态）
+      wecomBridge?.handleFrame(sessionPath, frame as Record<string, unknown>);
       sendToRenderer(IPC.RpcEvent, { ...(frame as object), __sessionPath: sessionPath });
     },
     onReady: (sessionPath) => sendToRenderer(IPC.RpcReady, sessionPath),
-    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
-    onStderr: (sessionPath, line) => sendToRenderer(IPC.OmpStderr, { sessionPath, line }),
+    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); wecomBridge?.handleProcessExit(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
     onLog: (line) => { /* pool 内部日志（如 LRU 淘汰），静默 */ },
   });
+
+  // 企微桥：主进程常驻（渲染层最小化/关闭都不影响），帧流经 pool onFrame 喂入。
+  // 默认 cwd = 配置值或第一个工作空间；钩子参数与 OmpAcquire 同源。
+  wecomBridge = new WecomBridge();
+  void (async () => {
+    try {
+      const wf = await loadWorkspacesFile();
+      const firstCwd = wf.workspaces[0]?.cwd ?? path.join(os.homedir(), 'Desktop');
+      await wecomBridge!.init({
+        pool: pool!,
+        resolveHooks: async () => {
+          const w = await loadWorkspacesFile();
+          return resolveHookArgs(w.hooks, undefined);
+        },
+        defaultCwd: firstCwd,
+        defaultApprovalMode: 'write',
+        onStatusChange: (status) => sendToRenderer(IPC.WecomChanged, status),
+        log: (line) => appendDiag(line),
+      });
+      // 桥配置里的 cwd 若为空，落到第一个工作空间（保存时固化）
+      const cfgCwd = (await wecomBridge!.loadConfig()).cwd;
+      if (!cfgCwd && firstCwd) {
+        const cfg = await wecomBridge!.loadConfig();
+        cfg.cwd = firstCwd;
+        await wecomBridge!.saveConfig(cfg);
+      }
+    } catch (e) {
+      appendDiag(`[wecom] init failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  })();
+
+  // 进程退出时桥清理对应活跃回合（流式消息不能再等，按已有文本收尾）。
 
   registerIpc();
   appendDiag(`=== app start pid=${process.pid} version=${app.getVersion()} electron=${process.versions.electron} ===`);
@@ -955,11 +1026,13 @@ function showAboutDialog(): void {
 
 app.on('window-all-closed', () => {
   appQuitting = true;
+  wecomBridge?.dispose();
   pool?.killAll();
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('before-quit', () => {
   appQuitting = true;
+  wecomBridge?.dispose();
   pool?.killAll();
 });
 

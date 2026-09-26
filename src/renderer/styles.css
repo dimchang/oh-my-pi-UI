@@ -563,6 +563,8 @@ body {
 }
 .session-status-dot.red { background: #ff453a; }
 .session-status-dot.orange { background: #ff9f0a; animation: sessionDotPulse 1.6s ease-in-out infinite; }
+/* 灰橙（0.5.21）：运行中但静默超阈值——降透明度+慢脉冲，视觉上"还在但不对劲" */
+.session-status-dot.stalled { background: #ff9f0a; opacity: 0.4; animation: sessionDotPulse 3.2s ease-in-out infinite; }
 .session-status-dot.green { background: #30d158; }
 @keyframes sessionDotPulse {
   0%, 100% { opacity: 1; }

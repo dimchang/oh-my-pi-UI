@@ -65,6 +65,14 @@ function send(lines: string[]): void {
   }
 }
 
+/** 把诊断行**直接落盘**（绕过环形缓冲与"可疑信号"触发条件）。
+ *  0.5.21：供 store 帧处理 catch 使用——帧抛错时立即可见化，不等别的异常触发回放
+ *  （01a0cc6c 教训：applyAgentEvent 抛错会静默吞掉 agent_end 的状态复位，而内存环形
+ *  缓冲在 25h 后早已滚动丢失，事后无法区分「帧未送达」与「送达但处理抛错」）。 */
+export function exportDiagLines(lines: string[]): void {
+  send(lines);
+}
+
 function isDisabled(): boolean {
   try {
     if (new URLSearchParams(location.search).get('diag') === '0') return true;

@@ -116,12 +116,19 @@ const CollapsibleCodeBlock: React.FC<{
 /** 链接右键菜单：由 ChatView 通过 context 提供打开函数（模块级组件无法访问组件状态，故走 context）。 */
 const LinkMenuContext = React.createContext<(url: string, x: number, y: number) => void>(() => {});
 
-/** 自定义 markdown 链接：左键保持内置浏览器行为（不改），右键弹菜单选 Chrome/Edge/默认/复制。 */
+/** 自定义 markdown 链接：左键 = 系统默认浏览器打开（原行为是当前窗口原地导航，
+ *  会把整个 UI 顶掉且无法返回，v0.5.19 修复），右键弹菜单选 Chrome/Edge/默认/复制。 */
 const MarkdownLink: React.FC<React.AnchorHTMLAttributes<HTMLAnchorElement>> = ({ href, children }) => {
   const openLinkMenu = React.useContext(LinkMenuContext);
   return (
     <a
       href={href}
+      onClick={(e) => {
+        e.preventDefault(); // 任何情况都不允许窗口原地导航
+        if (href && /^https?:\/\//i.test(href)) {
+          void window.omp.openExternal(href).catch(() => undefined);
+        }
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         if (href) openLinkMenu(href, e.clientX, e.clientY);

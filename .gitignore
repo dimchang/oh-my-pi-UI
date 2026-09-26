@@ -40,6 +40,14 @@ Thumbs.db
 probe-omp.mjs
 probe-*.mjs
 
+# ===== One-off diagnostic scratch files (root, throwaway output dumps) =====
+.git_chk*.txt
+.git_commit_out.txt
+.temp_diag*.txt
+.tsc_out.txt
+.vitest_out.txt
+.vitest_sum.txt
+
 # ===== Local sync helper (hardcodes /d/code/OMP-github path; not for public repo) =====
 /sync-to-github.ps1
 scripts/sync-core.ps1
@@ -67,6 +75,9 @@ resources/omp.exe
 
 # scratch fix notes, not project source
 gemini-balancer-fix.txt
+
+# omp upgrade impact analysis (one-off working doc, not project source)
+OMP_UPGRADE_18.3.2.MD
 
 # ===== Local electron-builder output (hundreds of MB, never commit) =====
 build-out/

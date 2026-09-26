@@ -3,9 +3,7 @@
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun } from '../src/shared/ipc-channels';
-import type { ModelInfo } from '../src/shared/rpc-types';
-import type { OmpFrame, RpcCommand } from '../src/shared/rpc-types';
+import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun, type WecomBridgeConfig, type WecomBridgeStatus } from '../src/shared/ipc-channels';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const listener = (_e: IpcRendererEvent, payload: T) => cb(payload);
@@ -17,8 +15,8 @@ const api: OmpApi = {
   platform: process.platform,
   // 诊断上报用 send 而非 invoke：卡死现场不应等回执，也不能因为主进程忙碌而挂住 renderer
   diagLog: (lines: string[]) => ipcRenderer.send(IPC.DiagLog, lines),
-  send: <T = unknown>(sessionPath: string, cmd: RpcCommand): Promise<T> =>
-    ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd),
+  send: <T = unknown>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<T> =>
+    ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd, timeoutMs),
   acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
     ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode),
   newSessionForCwd: (tempKey: string, cwd: string, approvalMode?: ApprovalMode) =>
@@ -28,6 +26,7 @@ const api: OmpApi = {
   listSessions: (cwd?: string) => ipcRenderer.invoke(IPC.SessionList, cwd),
   deleteSession: (p: string) => ipcRenderer.invoke(IPC.SessionDelete, p),
   readSessionMessages: (p: string) => ipcRenderer.invoke(IPC.SessionMessages, p),
+  sessionTail: (p: string) => ipcRenderer.invoke(IPC.SessionTail, p),
   getSessionUserEntries: (p: string) => ipcRenderer.invoke(IPC.SessionUserEntries, p),
   getOmpInfo: () => ipcRenderer.invoke(IPC.GetOmpInfo),
   openExternal: (url: string) => ipcRenderer.invoke(IPC.OpenExternal, url),
@@ -73,6 +72,11 @@ const api: OmpApi = {
   recordAutomationRun: (run: AutomationRun) => ipcRenderer.invoke(IPC.AutomationRecordRun, run),
   onAutomationTrigger: (cb: (task: AutomationTask) => void) => subscribe<AutomationTask>(IPC.AutomationTrigger, cb),
   onAutomationChanged: (cb: (file: AutomationsFile) => void) => subscribe<AutomationsFile>(IPC.AutomationChanged, cb),
+  // 企微桥（wecom bridge）
+  getWecomStatus: () => ipcRenderer.invoke(IPC.WecomGet),
+  saveWecomConfig: (cfg) => ipcRenderer.invoke(IPC.WecomSave, cfg),
+  testWecom: (botId, secret) => ipcRenderer.invoke(IPC.WecomTest, botId, secret),
+  onWecomChanged: (cb) => subscribe<WecomBridgeStatus>(IPC.WecomChanged, cb),
 
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow: () => ipcRenderer.invoke(IPC.WindowMinimize),

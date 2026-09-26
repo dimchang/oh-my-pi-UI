@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useApp, connTone, connDetail, sessionDotStatus, shouldHealStuckStreaming, shouldClearStaleRetry, RETRY_WORK_FRAME_TYPES, RETRY_STALE_MS } from './store';
+import { useApp, connTone, connDetail, sessionDotStatus, shouldHealStuckStreaming, shouldHealFromDisk, shouldClearStaleRetry, RETRY_WORK_FRAME_TYPES, RETRY_STALE_MS } from './store';
 import type { ToolPart } from './store';
 
 const SP = 'D:/proj';
@@ -523,6 +523,80 @@ describe('shouldHealStuckStreaming（agent_end 丢失自愈判定）', () => {
     const sentAt = 1000;
     expect(shouldHealStuckStreaming(ps({ isStreaming: false, lastFrameAt: 900 }), false, sentAt)).toBe(false);
     expect(shouldHealStuckStreaming(undefined, false, sentAt)).toBe(false);
+  });
+});
+
+// P1 磁盘对账判定（0.5.21，01a0cc6c 事故）：exit 丢失 + RPC 失败时，用 jsonl 尾部
+// （最后一条 assistant stopReason==='stop' + mtime 停滞）判定 turn 已完结。
+describe('shouldHealFromDisk（磁盘对账自愈判定）', () => {
+  const MIN = 60 * 1000;
+  const now = 100 * MIN;
+  const ps = (o: Record<string, unknown>) =>
+    ({ status: 'online', isStreaming: true, isAborting: false, lastFrameAt: now - 20 * MIN, ...o }) as Parameters<typeof shouldHealFromDisk>[0];
+  const tail = (o: { mtimeMs: number; lastStopReason?: string }) => o;
+
+  it('全部满足：streaming + stop 收尾 + 渲染层静默 + mtime 停滞 → 自愈', () => {
+    expect(shouldHealFromDisk(ps({}), tail({ mtimeMs: now - 20 * MIN, lastStopReason: 'stop' }), now)).toBe(true);
+  });
+
+  it('尾部非 stop（error/aborted/无收尾）→ 不自愈（真挂死或异常回合，交给 P0 失败计数）', () => {
+    const t = (r: string | undefined) => tail({ mtimeMs: now - 20 * MIN, lastStopReason: r });
+    expect(shouldHealFromDisk(ps({}), t('error'), now)).toBe(false);
+    expect(shouldHealFromDisk(ps({}), t('aborted'), now)).toBe(false);
+    expect(shouldHealFromDisk(ps({}), t(undefined), now)).toBe(false);
+    expect(shouldHealFromDisk(ps({}), undefined, now)).toBe(false);
+  });
+
+  it('渲染层静默不足（最后帧距今 < 10min）→ 不自愈', () => {
+    expect(
+      shouldHealFromDisk(ps({ lastFrameAt: now - 5 * MIN }), tail({ mtimeMs: now - 20 * MIN, lastStopReason: 'stop' }), now),
+    ).toBe(false);
+  });
+
+  it('mtime 仍在推进（omp 可能还在 flush）→ 不自愈', () => {
+    expect(
+      shouldHealFromDisk(ps({}), tail({ mtimeMs: now - 2 * MIN, lastStopReason: 'stop' }), now),
+    ).toBe(false);
+  });
+
+  it('本侧已不 streaming → 无需自愈', () => {
+    expect(
+      shouldHealFromDisk(ps({ isStreaming: false }), tail({ mtimeMs: now - 20 * MIN, lastStopReason: 'stop' }), now),
+    ).toBe(false);
+  });
+});
+
+// P2 灰橙点（0.5.21）：运行中但静默超阈值 → stalled（判据 lastFrameAt，非 stuckSince——
+// stuckSince 只在对账成功路径写入，进程失联时永远写不进去，判据会自依赖失效）。
+describe('sessionDotStatus stalled（运行中但静默）', () => {
+  const snap = (o: Record<string, unknown>) => ({
+    procStateMap: { [SP]: { status: 'online', isStreaming: true, isAborting: false, ...o } } as never,
+    unreadSessions: {},
+    sessionErrors: {},
+    uiQueue: [],
+  });
+  const now = 100 * 60 * 1000;
+
+  it('streaming + 静默 >= 10min → stalled', () => {
+    expect(sessionDotStatus(SP, snap({ lastFrameAt: now - 11 * 60 * 1000 }), now)).toBe('stalled');
+    // 恰好在阈值上
+    expect(sessionDotStatus(SP, snap({ lastFrameAt: now - 10 * 60 * 1000 }), now)).toBe('stalled');
+  });
+
+  it('streaming + 静默未超阈值 → orange（正常运行中）', () => {
+    expect(sessionDotStatus(SP, snap({ lastFrameAt: now - 5 * 60 * 1000 }), now)).toBe('orange');
+  });
+
+  it('lastFrameAt 未知 → 保守显示 orange（不误报 stalled）', () => {
+    expect(sessionDotStatus(SP, snap({}), now)).toBe('orange');
+  });
+
+  it('红点优先级高于 stalled（等确认 > 静默）', () => {
+    const s = {
+      ...snap({ lastFrameAt: now - 11 * 60 * 1000 }),
+      uiQueue: [{ sessionPath: SP, method: 'confirm', raw: {} }] as never,
+    };
+    expect(sessionDotStatus(SP, s, now)).toBe('red');
   });
 });
 
