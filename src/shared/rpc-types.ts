@@ -422,6 +422,13 @@ export interface RpcSessionState {
   queuedMessageCount?: number;
   todoPhases?: TodoPhase[];
   contextUsage?: ContextUsage;
+  /** omp 18.2.1+：非 TUI 客户端可用的生成吞吐（tok/s） */
+  tokensPerSecond?: number;
+  /** omp 18.2.1+：fast mode 可用/生效状态 */
+  fastModeEnabled?: boolean;
+  fastModeActive?: boolean;
+  /** omp 18.3.1+：RPC prompt 生命周期标识（配合 prompt_result 关联） */
+  promptId?: string;
   [k: string]: unknown;
 }
 

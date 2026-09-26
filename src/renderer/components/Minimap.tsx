@@ -21,13 +21,21 @@ function lorentzFalloff(d: number, sigma: number): number {
   return 1 / (1 + (d * d) / (sigma * sigma));
 }
 
-/** 从 ChatMessage.parts 里提取用户输入纯文本 */
+/** 从 ChatMessage.parts 里提取用户输入纯文本。
+ *  WeakMap 按消息引用缓存（2026-09-27 卡死修复 Fix C）：流式期间 messages 每帧换新
+ *  数组，tickItems 每帧重算；逐条正则清洗全部历史消息是 O(N) 重复劳动。消息对象不可变
+ *  （更新即换引用），WeakMap 缓存安全且随 GC 释放。 */
+const userTextCache = new WeakMap<ChatMessage, string>();
 function getUserText(msg: ChatMessage): string {
+  const hit = userTextCache.get(msg);
+  if (hit !== undefined) return hit;
   const texts: string[] = [];
   for (const p of msg.parts) {
     if (p.kind === 'text') texts.push(p.text);
   }
-  return texts.join(' ').replace(/\s+/g, ' ').trim();
+  const t = texts.join(' ').replace(/\s+/g, ' ').trim();
+  userTextCache.set(msg, t);
+  return t;
 }
 
 interface TickItem {

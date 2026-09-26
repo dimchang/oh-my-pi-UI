@@ -68,6 +68,7 @@ export default function App(): React.ReactElement {
             model: d.model,
             thinkingLevel: d.thinkingLevel,
             contextUsage: d.contextUsage,
+            tokensPerSecond: d.tokensPerSecond,
             sessionId: d.sessionId,
             todoPhases: d.todoPhases ?? [],
             isCompacting: d.isCompacting ?? false,
@@ -343,7 +344,7 @@ export default function App(): React.ReactElement {
     useApp.getState().setCurrentSessionPath(newSessionPath);
     useApp.getState().resetChat();
     // 新会话统计从零开始，先清掉旧会话残留（refreshState 会重新拉取）
-    useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined });
+    useApp.getState().setState({ sessionStats: undefined, contextUsage: undefined, tokensPerSecond: undefined });
   }, []);
 
   /** 加载 workspaces 文件并补全"扫盘发现的但 store 里没有"的工作空间。 */
@@ -422,6 +423,11 @@ export default function App(): React.ReactElement {
           // （如 `xd://: mounted mcp__node_repl_js, mcp__node_repl_js_add_node_module_dir, ...`），
           // 属于每次启动都会刷的运行时注册日志，对用户无意义，弹窗只会污染视线。直接丢弃。
           if (/^xd:\/\//i.test(n.message)) return;
+          // omp 18.2.1+（§2.3）：会话存储停止接受写入（磁盘满/文件被锁/盘被移除）时
+          // 以 error notice 上报。这是致命错误——除 toast 外标记会话红点，让用户能从侧栏定位。
+          if (n.level === 'error' && sp) {
+            useApp.getState().markSessionError(sp, n.message);
+          }
           pushToast(n.message, n.level ?? 'info');
         }
         return;
@@ -919,6 +925,9 @@ export default function App(): React.ReactElement {
    *  返回是否丢弃的正是当前会话。 */
   const discardTempSession = useCallback((path: string): boolean => {
     if (!path.startsWith('__new_')) return false;
+    // §2.3：该 temp 会话收到过致命 error notice（如写盘失败）→ transcript 可能未落盘，
+    // 不能当"空会话"丢弃，否则用户看到会话凭空消失。保留占位，交用户手动处理。
+    if (useApp.getState().sessionErrors[path]) return false;
     // 释放该 temp key 绑定的 omp 进程（避免进程池泄漏）
     void rpc.release(path).catch(() => undefined);
     const st = useApp.getState();
@@ -1059,6 +1068,7 @@ export default function App(): React.ReactElement {
       // 新值由 refreshState（在线立即 / 懒拉起后 onReady）重新拉取。
       sessionStats: undefined,
       contextUsage: undefined,
+      tokensPerSecond: undefined,
     });
     // 若该会话从未缓冲过，从磁盘读历史
     if (!stNow.sessionsMap[s.path]) {
@@ -1077,6 +1087,7 @@ export default function App(): React.ReactElement {
         model: undefined,
         thinkingLevel: undefined,
         contextUsage: undefined,
+        tokensPerSecond: undefined,
         sessionStats: undefined,
       });
     }

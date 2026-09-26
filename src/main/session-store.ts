@@ -6,14 +6,16 @@
  */
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import type { SessionSummary } from '../shared/ipc-channels';
 import type { SessionHeader, AgentMessage, ReplayMessage } from '../shared/rpc-types';
+// §4.2：omp 18.1.3 起会话根由 getSessionsDir() 决定（OMP_HOME 生效），GUI 扫盘必须用同一套解析，
+// 不能硬编码 ~/.omp/agent/sessions——否则设置了 OMP_HOME 的机器侧栏扫不到会话。
+import { ompAgentDir } from '../shared/omp-paths';
 
 function sessionsRoot(): string {
-  return path.join(os.homedir(), '.omp', 'agent', 'sessions');
+  return path.join(ompAgentDir(), 'sessions');
 }
 
 /** 读文件前 64KB，返回其中的 SessionHeader（type:"session" 的那一行）。

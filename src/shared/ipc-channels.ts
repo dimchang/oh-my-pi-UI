@@ -109,6 +109,10 @@ export const IPC = {
   WecomSave: 'wecom:save', // (cfg: WecomBridgeConfig) => Promise<WecomBridgeStatus> — 保存配置并按需重连
   WecomTest: 'wecom:test', // () => Promise<{ ok: boolean; message: string }> — 立即连一次验证凭证
   WecomChanged: 'wecom:changed', // (status: WecomBridgeStatus) — main → renderer：连接/绑定状态变化
+  FeishuGet: 'feishu:get', // () => Promise<WecomBridgeStatus> — 飞书桥状态 + 配置快照
+  FeishuSave: 'feishu:save', // (cfg: WecomBridgeConfig) => Promise<WecomBridgeStatus> — 保存配置并按需重连
+  FeishuTest: 'feishu:test', // (appId, appSecret) => Promise<{ ok, message }> — 立即连一次验证凭证
+  FeishuChanged: 'feishu:changed', // (status: WecomBridgeStatus) — main → renderer：连接/绑定状态变化
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -459,6 +463,16 @@ export interface OmpModelDefinition {
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
+  /** omp 18.2.x：模型能力/输入模态（如 ['text','image']）——丢失会导致 GUI 不识别图片能力 */
+  input?: string[];
+  reasoning?: boolean;
+  /** 思考档位声明（ThinkingPicker 依赖 efforts 过滤可选档位；丢失 → 全档位可选 + 切高自动弹回） */
+  thinking?: { mode?: string; efforts?: string[]; requiresEffort?: boolean; [k: string]: unknown };
+  /** omp 18.1.18+/18.2.1：wire 兼容开关（schema 校验收紧，类型错误直接拒绝）。GUI 只透传不解释 */
+  compat?: { stripImageInput?: boolean; supportsConfigurationUpdate?: boolean; [k: string]: unknown };
+  /** omp 18.2.10：自定义模型遵循 provider 级 transport（pi-native 走原生网关） */
+  transport?: string;
+  cost?: Record<string, unknown>;
   // issue 90: 用显式 extra 字段收集未知字段，替代过度宽松的 [k:string]:unknown 索引签名
   // （索引签名会让所有属性访问退化为 unknown 且无法捕获 typo）
   extra?: Record<string, unknown>;
@@ -475,10 +489,15 @@ export interface OmpProviderConfig {
   apiKey?: string;
   /** 鉴权方式：apiKey（默认）/ none / oauth */
   auth?: 'apiKey' | 'none' | 'oauth';
-  /** 自动发现模型：openai-models-list = GET {baseUrl}/models */
-  discovery?: { type: string; [k: string]: unknown };
+  /** 自动发现模型：openai-models-list = GET {baseUrl}/models。
+   *  omp 18.1.0：新增 injectV1（模型端点带版本前缀的 OpenAI 兼容网关） */
+  discovery?: { type: string; injectV1?: boolean; [k: string]: unknown };
   /** 手动声明的模型列表（可选，与 discovery 二选一或并存） */
   models?: OmpModelDefinition[];
+  /** omp 18.2.10：provider 级 transport（pi-native 走原生网关） */
+  transport?: string;
+  /** omp 18.2.x：provider 级兼容开关（GUI 只透传不解释） */
+  compat?: Record<string, unknown>;
   // issue 90: 未知字段收进显式 extra，替代宽松索引签名（写回时展开）
   extra?: Record<string, unknown>;
 }
@@ -551,6 +570,12 @@ export interface OmpApi {
   testWecom(botId: string, secret: string): Promise<{ ok: boolean; message: string }>;
   /** 桥状态变化推送（连接建立/断开、绑定变化、回合起止） */
   onWecomChanged(cb: (status: WecomBridgeStatus) => void): () => void;
+
+  // 飞书桥（feishu bridge）—— 配置结构与企微同构，凭证字段语义为 App ID / App Secret
+  getFeishuStatus(): Promise<WecomBridgeStatus>;
+  saveFeishuConfig(cfg: WecomBridgeConfig): Promise<WecomBridgeStatus>;
+  testFeishu(appId: string, appSecret: string): Promise<{ ok: boolean; message: string }>;
+  onFeishuChanged(cb: (status: WecomBridgeStatus) => void): () => void;
 
   // M5: 工作空间
   getWorkspaces(): Promise<WorkspacesLoadResult>;

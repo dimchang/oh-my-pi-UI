@@ -2163,6 +2163,21 @@ body {
   line-height: 1.7;
   text-align: center;
 }
+
+/* ====== 企微桥（wecom）设置页 ====== */
+.wecom-conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: hsl(var(--text-400));
+}
+.wecom-conn-dot.on {
+  background: hsl(142 60% 45%);
+  box-shadow: 0 0 6px hsl(142 60% 45% / 0.6);
+}
+.wecom-conn-dot.off {
+  background: hsl(0 0% 55%);
+}
 .hook-empty code { background: hsl(var(--bg-200)); padding: 1px 5px; border-radius: 4px; }
 .hook-empty a { color: var(--accent-main-000); cursor: pointer; }
 .hook-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }

@@ -34,7 +34,11 @@ export class FrameRouter {
     return new Promise<RpcResponse<T>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`rpc timeout: ${withId.type}`));
+        // omp 18.1.3+（§2.4）：/skill:* 等 prompt 先应答后派发，但 provider 压力大时
+        // 仍可能超时。超时 ≠ 被拒绝——回合可能仍在运行，文案里点明，避免用户重发导致
+        // 双回合。仅回合类命令适用（审查 P3-B）：get_state 等查询超时没有"仍在运行"语义。
+        const turnCommand = withId.type === 'prompt' || withId.type === 'steer' || withId.type === 'follow_up';
+        reject(new Error(`rpc timeout: ${withId.type}${turnCommand ? '（超时；回合可能仍在运行，请勿重复发送）' : ''}`));
       }, timeoutMs);
       // issue 4: 重复 id 静默覆盖 pending 会丢失旧 promise，先 reject 旧的
       const existing = this.pending.get(id);

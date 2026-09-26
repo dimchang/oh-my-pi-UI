@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState } from 'react';
 import { useApp } from '../store';
+import { SettingsWecom, SettingsFeishu } from './SettingsWecom';
 import { SettingsModelConfig } from './SettingsModelConfig';
 import { SettingsHooks } from './SettingsHooks';
 import { SettingsContext } from './SettingsContext';
@@ -12,10 +13,12 @@ import type { AppearanceConfig } from '../../shared/ipc-channels';
 import { builtinThemes } from '../themes';
 import { Icon, type IconName } from './Icon';
 
-const TABS: Array<{ key: 'system' | 'agent' | 'context' | 'model'; icon: IconName; label: string }> = [
+const TABS: Array<{ key: 'system' | 'agent' | 'wecom' | 'feishu' | 'context' | 'model'; icon: IconName; label: string }> = [
   { key: 'system', icon: 'cog', label: '系统配置' },
   { key: 'context', icon: 'file', label: '全局上下文' },
   { key: 'agent', icon: 'robot', label: '智能体设置' },
+  { key: 'wecom', icon: 'send', label: '企微桥' },
+  { key: 'feishu', icon: 'send', label: '飞书桥' },
   { key: 'model', icon: 'pkg', label: '模型配置' },
 ];
 
@@ -83,6 +86,8 @@ export const SettingsPanel: React.FC = () => {
             {tab === 'system' && <SystemConfigTab />}
             {tab === 'context' && <SettingsContext />}
             {tab === 'agent' && <SettingsHooks />}
+            {tab === 'wecom' && <SettingsWecom />}
+            {tab === 'feishu' && <SettingsFeishu />}
             {tab === 'model' && <SettingsModelConfig />}
           </div>
         </div>

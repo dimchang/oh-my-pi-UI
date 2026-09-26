@@ -5,6 +5,8 @@ import { Icon } from './Icon';
 export const StatusBar: React.FC = () => {
   const usage = useApp((s) => s.contextUsage);
   const stats = useApp((s) => s.sessionStats);
+  // omp 18.2.1+ get_state：生成吞吐（tok/s），refreshState 填充，这里仅展示
+  const tps = useApp((s) => s.tokensPerSecond);
   // 当前会话的模型 / 思考档位（refreshState 已填充，这里仅展示）
   const model = useApp((s) => s.model);
   const thinking = useApp((s) => s.thinkingLevel);
@@ -49,6 +51,9 @@ export const StatusBar: React.FC = () => {
         <span className="status-item" style={{ color: usage.percent > 80 ? 'var(--yellow)' : undefined }}>
           窗口: {usage.tokens.toLocaleString()} / {(usage.contextWindow / 1000).toFixed(0)}k ({usage.percent.toFixed(1)}%)
         </span>
+      )}
+      {tps !== undefined && Number.isFinite(tps) && tps > 0 && (
+        <span className="status-item">{tps.toFixed(1)} tok/s</span>
       )}
     </div>
   );

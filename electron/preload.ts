@@ -4,6 +4,8 @@
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun, type WecomBridgeConfig, type WecomBridgeStatus } from '../src/shared/ipc-channels';
+// 审查 P1 修复：下方 api 签名引用了这三个类型，缺导入会让 typecheck 全程红着
+import type { RpcCommand, OmpFrame, ModelInfo } from '../src/shared/rpc-types';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const listener = (_e: IpcRendererEvent, payload: T) => cb(payload);
@@ -77,6 +79,11 @@ const api: OmpApi = {
   saveWecomConfig: (cfg) => ipcRenderer.invoke(IPC.WecomSave, cfg),
   testWecom: (botId, secret) => ipcRenderer.invoke(IPC.WecomTest, botId, secret),
   onWecomChanged: (cb) => subscribe<WecomBridgeStatus>(IPC.WecomChanged, cb),
+  // 飞书桥（feishu bridge）
+  getFeishuStatus: () => ipcRenderer.invoke(IPC.FeishuGet),
+  saveFeishuConfig: (cfg) => ipcRenderer.invoke(IPC.FeishuSave, cfg),
+  testFeishu: (appId, appSecret) => ipcRenderer.invoke(IPC.FeishuTest, appId, appSecret),
+  onFeishuChanged: (cb) => subscribe<WecomBridgeStatus>(IPC.FeishuChanged, cb),
 
   // 自定义标题栏窗口控制（Windows frameless 模式）
   minimizeWindow: () => ipcRenderer.invoke(IPC.WindowMinimize),

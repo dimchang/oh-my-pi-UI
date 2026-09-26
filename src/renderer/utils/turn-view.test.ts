@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { ChatMessage, MessagePart } from '../store';
 import {
   groupTurns,
+  stabilizeTurns,
   splitTurnParts,
   computeTurnStats,
   formatTurnSummary,
@@ -57,6 +58,55 @@ describe('groupTurns', () => {
     expect(turns).toHaveLength(1);
     expect(turns[0]!.user).toBeUndefined();
     expect(turns[0]!.asst).toHaveLength(2);
+  });
+});
+
+describe('stabilizeTurns（2026-09-27 流式卡死修复）', () => {
+  it('流式更新（仅流式回合内消息被替换）→ 未变化回合复用旧对象，流式回合换新', () => {
+    const u1 = user('q1');
+    const a1 = asst('r');
+    const prev = stabilizeTurns([], groupTurns([u1, a1]));
+    const u2 = user('q2');
+    const a2 = asst('t');
+    const mid = stabilizeTurns(prev, groupTurns([u1, a1, u2, a2]));
+    expect(mid[0]).toBe(prev[0]); // 回合1 未变化 → 复用（memo 生效的前提是同一引用）
+    // 模拟 message_update：只替换流式消息的引用（store 里 buf[i] = {...m, ...}）
+    const a2b = { ...a2, parts: [...a2.parts] };
+    const next = stabilizeTurns(mid, groupTurns([u1, a1, u2, a2b]));
+    expect(next).toHaveLength(2);
+    expect(next[0]).toBe(mid[0]);     // 未变化回合复用
+    expect(next[1]).not.toBe(mid[1]); // 流式回合换新身份
+  });
+
+  it('新回合追加（新用户消息）→ 旧回合引用保持，新回合是新对象', () => {
+    const u1 = user('q1');
+    const a1 = asst('r');
+    const prev = stabilizeTurns([], groupTurns([u1, a1]));
+    const u2 = user('q2');
+    const next = stabilizeTurns(prev, groupTurns([u1, a1, u2]));
+    expect(next).toHaveLength(2);
+    expect(next[0]).toBe(prev[0]);
+    expect(next[1]).not.toBe(prev[0]);
+    expect(next[1]!.user).toBe(u2);
+  });
+
+  it('会话整体切换（引用全变）→ 全部重建，不误复用', () => {
+    const prev = stabilizeTurns([], groupTurns([user('a'), asst('r')]));
+    const next = stabilizeTurns(prev, groupTurns([user('b'), asst('r')]));
+    expect(next).toHaveLength(1);
+    expect(next[0]).not.toBe(prev[0]);
+    expect(next[0]!.user!.id).not.toBe(prev[0]!.user!.id);
+  });
+
+  it('回合内新增 assistant 消息（agent 步进）→ 该回合换新，其余复用', () => {
+    const u = user('q');
+    const m1 = asst('t');
+    const prev = stabilizeTurns([], groupTurns([u, m1]));
+    const m2 = asst('x');
+    const next = stabilizeTurns(prev, groupTurns([u, m1, m2]));
+    expect(next).toHaveLength(1);
+    expect(next[0]).not.toBe(prev[0]);
+    expect(next[0]!.asst).toHaveLength(2);
   });
 });
 

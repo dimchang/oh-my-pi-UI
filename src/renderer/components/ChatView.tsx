@@ -11,6 +11,8 @@ import {
   formatTurnSummary,
   groupTurns,
   splitTurnParts,
+  stabilizeTurns,
+  type Turn,
 } from '../utils/turn-view';
 
 /** 单条消息附件芯片：图片懒加载缩略图（进入视口才请求 data URL），文件走原芯片。
@@ -287,6 +289,41 @@ const MessageItem = React.memo(function MessageItem({ msg }: { msg: ChatMessage 
   );
 });
 
+/** 流式期间的高频值节流（2026-09-27 卡死修复 Fix B）：
+ *  value 高频变化时最多每 intervalMs 提交一次渲染值（trailing 保证最终值落地）；
+ *  intervalMs<=0 时立即透传。用于流式回复的 markdown 重解析节流——长回复逐 token
+ *  增长时全量重解析是 O(n²) 累积成本，节流到 ~3Hz 后单帧 commit 从 170ms 级降一个量级。 */
+function useThrottledValue<T>(value: T, intervalMs: number): T {
+  const [rendered, setRendered] = useState<T>(value);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const lastAtRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (intervalMs <= 0) {
+      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+      lastAtRef.current = 0;
+      setRendered(value);
+      return;
+    }
+    const flush = () => {
+      timerRef.current = null;
+      lastAtRef.current = Date.now();
+      setRendered(valueRef.current);
+    };
+    const elapsed = Date.now() - lastAtRef.current;
+    if (elapsed >= intervalMs) {
+      flush();
+    } else if (timerRef.current === null) {
+      timerRef.current = setTimeout(flush, intervalMs - elapsed);
+    }
+  }, [value, intervalMs]);
+  useEffect(() => () => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+  }, []);
+  return rendered;
+}
+
 /** 一个回合的 assistant 部分 —— 用户视角的「一个回答」。
  *
  *  渲染结构严格为：**一行**「思考过程」折叠条 → 详细最终回复。
@@ -296,6 +333,10 @@ const AssistantTurn = React.memo(function AssistantTurn({ msgs }: { msgs: ChatMe
   const first = msgs[0]!;
   const streaming = msgs.some((m) => m.streaming);
   const { folded, reply } = splitTurnParts(msgs, streaming);
+  // Fix B：流式期间 reply 的 markdown 全量重解析按 300ms 节流（光标等轻量更新仍每帧）；
+  // streaming 结束的瞬间用原始 reply 立即渲染最终文本（interval=0 透传）。
+  const throttledReply = useThrottledValue(reply, streaming ? 300 : 0);
+  const shownReply = streaming ? throttledReply : reply;
   const summary = formatTurnSummary(computeTurnStats(msgs));
   const error = msgs.find((m) => m.error)?.error;
   // 折叠体内大回合可达数百个 ToolCard —— 折叠状态下不挂载（`<details>` 的 children 仍会进 DOM），
@@ -332,7 +373,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ msgs }: { msgs: ChatMe
             )}
           </details>
         )}
-        <TextParts parts={reply} />
+        <TextParts parts={shownReply} />
         {streaming && <span style={{ color: 'var(--text-faint)' }}>▍</span>}
       </div>
     </div>
@@ -387,7 +428,15 @@ export const ChatView: React.FC = () => {
   const loadMoreLockRef = useRef(false);
   const total = messages.length;
   // 全量回合（消息 → 一问一答回合视图）。窗口在「回合空间」滑动，渲染时切片。
-  const allTurns = useMemo(() => groupTurns(messages), [messages]);
+  // stabilizeTurns（2026-09-27 流式卡死修复）：messages 每帧换新引用时按成员引用
+  // 复用旧 Turn 对象，让 AssistantTurn 的 memo 生效——流式期间只有内容真正变化的
+  // 回合重渲，其余 29 个回合（各含 markdown 重解析）整体跳过。
+  const prevTurnsRef = useRef<Turn[]>([]);
+  const allTurns = useMemo(() => {
+    const next = stabilizeTurns(prevTurnsRef.current, groupTurns(messages));
+    prevTurnsRef.current = next;
+    return next;
+  }, [messages]);
   const turnCount = allTurns.length;
   /** 消息下标 → 回合下标映射（Minimap / scrollToMessage 按消息索引跳转时换算窗口位置）。 */
   const turnIndexOfMsg = useMemo(() => {

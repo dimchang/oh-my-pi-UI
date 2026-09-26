@@ -204,6 +204,8 @@ interface AppState {
   model?: ModelInfo;
   thinkingLevel?: ThinkingLevel;
   contextUsage?: ContextUsage;
+  /** omp 18.2.1+ get_state：生成吞吐（tok/s），状态栏展示用 */
+  tokensPerSecond?: number;
   sessionId?: string;
   slashCommands: SlashCommand[];
   /** 已安装技能（技能页网格）：来自主进程扫描（含已停用项），enabled 反映 config.yml */
@@ -254,9 +256,9 @@ interface AppState {
   /** 配置页是否打开（全屏 overlay） */
   settingsOpen: boolean;
   /** 配置页左侧当前选中标签 */
-  settingsTab: 'system' | 'agent' | 'context' | 'model';
+  settingsTab: 'system' | 'agent' | 'context' | 'model' | 'wecom' | 'feishu';
   setSettingsOpen(v: boolean): void;
-  setSettingsTab(tab: 'system' | 'agent' | 'context' | 'model'): void;
+  setSettingsTab(tab: 'system' | 'agent' | 'context' | 'model' | 'wecom' | 'feishu'): void;
   /** 模型启用白名单（key = `${provider}/${modelId}`）。
    *  undefined/空 = 未配置 → ModelPicker 显示全部；非空 = 只显示白名单内的。 */
   enabledModels?: string[];
@@ -352,6 +354,8 @@ interface AppState {
   removeLastModelKey(sessionPath: string): void;
   /** 清除某会话的侧栏状态点标记（选中查看 / 删除会话时调用）。 */
   clearSessionStatus(sessionPath: string): void;
+  /** 标记某会话出错（红点 + sessionErrors）：omp 18.2.1+ 写盘失败等致命 error notice 用（§2.3）。 */
+  markSessionError(sessionPath: string, message: string): void;
   /** tempKey→realPath 迁移时同步迁移侧栏状态点标记（同 migrateLastModelKey 语义）。 */
   migrateSessionStatus(from: string, to: string): void;
   /** 新增/更新工作空间。**不改变当前选中** —— 「发现/更新一个工作区」与「聚焦它」是两件事
@@ -1023,6 +1027,13 @@ export const useApp = create<AppState>((set, get) => ({
       delete unreadSessions[sessionPath];
       delete sessionErrors[sessionPath];
       return { unreadSessions, sessionErrors };
+    }),
+
+  markSessionError: (sessionPath, message) =>
+    set((s) => {
+      // 幂等：同会话重复出错不覆盖首条（首条通常是根因）
+      if (s.sessionErrors[sessionPath]) return s;
+      return { sessionErrors: { ...s.sessionErrors, [sessionPath]: message } };
     }),
 
   migrateSessionStatus: (from, to) =>

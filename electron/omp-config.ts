@@ -16,19 +16,16 @@
  */
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { parseDocument, Document, YAMLMap } from 'yaml';
 import type { OmpModelsConfig, OmpProviderConfig } from '../src/shared/ipc-channels';
+import { ompAgentDir } from '../src/shared/omp-paths';
 
-/** omp agent 配置目录（与 omp getAgentDir() 一致：$OMP_HOME/agent 或 ~/.omp/agent） */
-export function getAgentDir(): string {
-  const base = process.env.OMP_HOME && process.env.OMP_HOME.trim()
-    ? process.env.OMP_HOME
-    : path.join(os.homedir(), '.omp');
-  return path.join(base, 'agent');
-}
+/** omp agent 配置目录（与 omp getAgentDir() 一致：$OMP_HOME/agent 或 ~/.omp/agent）。
+ *  实现已抽到 src/shared/omp-paths.ts（§4.2：session-store 必须用同一套解析），
+ *  此处保留兼容别名，既有 import 点（main.ts / omp-skills.ts）无需改动。 */
+export const getAgentDir = ompAgentDir;
 
 async function fileExists(p: string): Promise<boolean> {
   try { await fs.promises.access(p); return true; } catch { return false; }

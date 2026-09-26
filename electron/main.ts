@@ -32,6 +32,7 @@ import { readModelsConfig, writeProvider, deleteProvider, getAgentDir } from './
 import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './omp-skills';
 import { loadAutomations, saveAutomations, recordAutomationRun, startAutomationTicker } from './automations';
 import { WecomBridge } from './wecom-bridge';
+import { FeishuBridge } from './feishu-bridge';
 import { IPC, type WecomBridgeConfig, type FileEntry, type WorkspacesFile, type WorkspacesLoadResult, type ApprovalMode, type OmpProviderConfig, type HookFileConfig, type HookFileInfo, type CustomCssConfig, type PastedImageResult, type ImageDataUrlResult, type AutomationsFile, type AutomationRun } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
@@ -89,6 +90,7 @@ let mainWindow: BrowserWindow | null = null;
 let pool: OmpProcessPool | null = null;
 let appQuitting = false;
 let wecomBridge: WecomBridge | null = null;
+let feishuBridge: FeishuBridge | null = null;
 
 const WORKSPACES_FILE = path.join(app.getPath('userData'), 'workspaces.json');
 
@@ -525,6 +527,35 @@ function registerIpc(): void {
       setTimeout(() => { probe.stop(); resolve({ ok: false, message: '连接超时（15s），请检查 BotID/Secret 与网络' }); }, 15_000);
     });
   });
+  // 飞书桥（feishu bridge）：与企微 handler 同构，凭证换 appId/appSecret
+  ipcMain.handle(IPC.FeishuGet, async () => feishuBridge?.status() ?? null);
+  ipcMain.handle(IPC.FeishuSave, async (_e, cfg: WecomBridgeConfig) => {
+    if (!feishuBridge) throw new Error('bridge not initialized');
+    return await feishuBridge.saveConfig(cfg);
+  });
+  ipcMain.handle(IPC.FeishuTest, async (_e, botId: string, secret: string) => {
+    // 用临时 WSClient 连一次验证凭证；飞书长连接握手成功即视为有效
+    if (!botId || !secret) return { ok: false, message: 'App ID 与 App Secret 不能为空' };
+    const { WSClient, EventDispatcher, LoggerLevel } = await import('@larksuiteoapi/node-sdk');
+    return await new Promise<{ ok: boolean; message: string }>((resolve) => {
+      let done = false;
+      const finish = (ok: boolean, message: string) => {
+        if (done) return;
+        done = true;
+        probe.close({ force: true });
+        resolve({ ok, message });
+      };
+      const probe = new WSClient({
+        appId: botId,
+        appSecret: secret,
+        loggerLevel: LoggerLevel.warn,
+        onReady: () => finish(true, '连接成功，凭证有效'),
+        onError: (e) => finish(false, e instanceof Error ? e.message : String(e)),
+      });
+      void probe.start({ eventDispatcher: new EventDispatcher({}) }).catch((e) => finish(false, e instanceof Error ? e.message : String(e)));
+      setTimeout(() => finish(false, '连接超时（15s），请检查 App ID/App Secret、应用是否发布、长连接模式是否开启'), 15_000);
+    });
+  });
 
   ipcMain.handle(IPC.GetOmpInfo, async () => ({ path: ompPath, version: ompVersion || 'unknown', agentDir: getAgentDir() }));
 
@@ -924,22 +955,33 @@ app.whenReady().then(() => {
       if (fr.type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
         pool?.pin(sessionPath);
       }
-      // 企微桥订阅帧流（流式增量 + agent_end 终态）
+      // 消息桥订阅帧流（流式增量 + agent_end 终态）
       wecomBridge?.handleFrame(sessionPath, frame as Record<string, unknown>);
+      feishuBridge?.handleFrame(sessionPath, frame as Record<string, unknown>);
       sendToRenderer(IPC.RpcEvent, { ...(frame as object), __sessionPath: sessionPath });
     },
     onReady: (sessionPath) => sendToRenderer(IPC.RpcReady, sessionPath),
-    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); wecomBridge?.handleProcessExit(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
+    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); wecomBridge?.handleProcessExit(sessionPath); feishuBridge?.handleProcessExit(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
+    // 审查 P1 修复（6e76c57 曾删掉此行）：PoolEvents.onStderr 是必填且 omp-pool 无条件调用，
+    // 缺失时任何 stderr（parse-error / spawn-error / backpressure / omp-exit 提示…）都会
+    // TypeError 崩主进程。渲染层 App.tsx 仍订阅此通道（pushStderr），恢复转发即恢复原功能。
+    onStderr: (sessionPath, line) => sendToRenderer(IPC.OmpStderr, { sessionPath, line }),
     onLog: (line) => { /* pool 内部日志（如 LRU 淘汰），静默 */ },
   });
 
-  // 企微桥：主进程常驻（渲染层最小化/关闭都不影响），帧流经 pool onFrame 喂入。
+  // 消息桥（企微 + 飞书）：主进程常驻（渲染层最小化/关闭都不影响），帧流经 pool onFrame 喂入。
   // 默认 cwd = 配置值或第一个工作空间；钩子参数与 OmpAcquire 同源。
   wecomBridge = new WecomBridge();
+  feishuBridge = new FeishuBridge();
   void (async () => {
     try {
       const wf = await loadWorkspacesFile();
       const firstCwd = wf.workspaces[0]?.cwd ?? path.join(os.homedir(), 'Desktop');
+      // 桥配置里的 cwd 若为空，落到第一个工作空间（保存时固化）
+      const ensureCwd = async (bridge: WecomBridge | FeishuBridge) => {
+        const cfg = await bridge.core.loadConfig();
+        if (!cfg.cwd && firstCwd) await bridge.core.saveConfig({ ...cfg, cwd: firstCwd });
+      };
       await wecomBridge!.init({
         pool: pool!,
         resolveHooks: async () => {
@@ -947,19 +989,25 @@ app.whenReady().then(() => {
           return resolveHookArgs(w.hooks, undefined);
         },
         defaultCwd: firstCwd,
-        defaultApprovalMode: 'write',
         onStatusChange: (status) => sendToRenderer(IPC.WecomChanged, status),
         log: (line) => appendDiag(line),
+        channelLabel: 'wecom',
       });
-      // 桥配置里的 cwd 若为空，落到第一个工作空间（保存时固化）
-      const cfgCwd = (await wecomBridge!.loadConfig()).cwd;
-      if (!cfgCwd && firstCwd) {
-        const cfg = await wecomBridge!.loadConfig();
-        cfg.cwd = firstCwd;
-        await wecomBridge!.saveConfig(cfg);
-      }
+      await ensureCwd(wecomBridge!);
+      await feishuBridge!.init({
+        pool: pool!,
+        resolveHooks: async () => {
+          const w = await loadWorkspacesFile();
+          return resolveHookArgs(w.hooks, undefined);
+        },
+        defaultCwd: firstCwd,
+        onStatusChange: (status) => sendToRenderer(IPC.FeishuChanged, status),
+        log: (line) => appendDiag(line),
+        channelLabel: 'feishu',
+      });
+      await ensureCwd(feishuBridge!);
     } catch (e) {
-      appendDiag(`[wecom] init failed: ${e instanceof Error ? e.message : String(e)}`);
+      appendDiag(`[bridge] init failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   })();
 
@@ -1027,12 +1075,14 @@ function showAboutDialog(): void {
 app.on('window-all-closed', () => {
   appQuitting = true;
   wecomBridge?.dispose();
+  feishuBridge?.dispose();
   pool?.killAll();
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('before-quit', () => {
   appQuitting = true;
   wecomBridge?.dispose();
+  feishuBridge?.dispose();
   pool?.killAll();
 });
 

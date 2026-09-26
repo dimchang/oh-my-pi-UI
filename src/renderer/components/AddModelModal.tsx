@@ -25,7 +25,8 @@ import { rpc } from '../rpc-client';
 import { modelKey } from '../utils/path-key';
 import { reloadCurrentSession } from '../utils/reload-session';
 import type { ModelInfo } from '../../shared/rpc-types';
-import type { OmpProviderConfig } from '../../shared/ipc-channels';
+import type { OmpProviderConfig, OmpModelDefinition } from '../../shared/ipc-channels';
+import { mergeDiscoveredModels } from '../../shared/model-merge';
 
 // ---------------------------------------------------------------------------
 // 内置 provider 预设（来自 OMP 17.x 源码：pi-ai registry + pi-catalog descriptors）
@@ -249,31 +250,46 @@ export const AddModelModal: React.FC<Props> = ({
     [manualIds],
   );
 
-  /** 构建要写入 models.yml 的 provider 配置 */
+  /** 构建要写入 models.yml 的 provider 配置。
+   *  omp 18.1.0→18.3.2（§3 P0）：provider/model 级新增字段（transport、compat.*、
+   *  thinking、input 等）必须透传，不能只写表单字段——否则编辑保存一次就把
+   *  手工配置抹掉。existingConfig 由 readModelsConfig 返回，运行时对象含 yml
+   *  全部键（含类型未声明的），spread 原样带入，表单可编辑字段在其后覆盖。 */
   const buildConfig = useCallback((): OmpProviderConfig => {
-    const cfg: OmpProviderConfig = {
-      baseUrl: baseUrl.trim(),
-      api,
-    };
+    const { extra: prevExtra, ...prev } = (existingConfig ?? {}) as OmpProviderConfig;
+    const cfg: OmpProviderConfig = { ...prevExtra, ...prev, baseUrl: baseUrl.trim(), api };
+    // 显示名：清空 = 删除
     if (name.trim()) cfg.name = name.trim();
+    else delete cfg.name;
+    // apiKey：填新值 = 覆盖；编辑模式留空 = 保留原值（prev.apiKey 已随 spread 带入，
+    // writeProvider 另有回填兜底）；添加模式留空且非免 Key 类型 = 显式 auth=none
     if (apiKey.trim()) {
       cfg.apiKey = apiKey.trim();
-    } else if (!NO_KEY_NEEDED.has(api)) {
-      // 添加模式：用户没填 apiKey 且不是 no-key 类型 → 显式标 auth=none
-      // 编辑模式：保留原 apiKey（prepopulate 故意清空，避免明文显示；用户重新填入才覆盖）
-      if (!isEditMode) cfg.auth = 'none';
+    } else if (!NO_KEY_NEEDED.has(api) && !isEditMode) {
+      cfg.auth = 'none';
+      delete cfg.apiKey;
     }
-    // 手动指定的模型 ID → 写为静态 models 条目
+    // 手动指定的模型 ID → 写为静态 models 条目（合并 yml 里同 id 旧条目的未知字段）
     if (parsedManualIds.length > 0) {
-      cfg.models = parsedManualIds.map((id) => ({ id }));
+      cfg.models = parsedManualIds.map((id) => {
+        const prevModel = (prev.models ?? []).find((pm) => pm.id === id);
+        const { extra: pmExtra, ...pmRest } = (prevModel ?? {}) as OmpModelDefinition;
+        return { ...(pmExtra ?? {}), ...pmRest, id };
+      });
     }
     // 没有手动 ID 且 API 类型支持发现 → 加 discovery 配置让 omp 自动拉取
+    // （保留旧 discovery 里手工写的 injectV1 等字段）。同时**删除**旧 models——
+    // 与旧版语义一致（审查 P2-A）：models 与 discovery 并存时 omp 侧合并优先级
+    // 未验证，陈旧手填条目可能盖住发现结果。onFinish 的并集合并负责"不丢配置"。
     const discovery = DISCOVERY_BY_API[api];
     if (discovery && parsedManualIds.length === 0) {
-      cfg.discovery = { type: discovery };
+      cfg.discovery = { type: discovery, ...(prev.discovery ?? {}) };
+      delete cfg.models;
+    } else if (parsedManualIds.length > 0) {
+      delete cfg.discovery; // 与旧行为一致：手填 ID 时不保留 discovery
     }
     return cfg;
-  }, [baseUrl, api, name, apiKey, parsedManualIds, isEditMode]);
+  }, [baseUrl, api, name, apiKey, parsedManualIds, isEditMode, existingConfig]);
 
   /** 写 models.yml + 重载当前会话进程。
    *  omp 的 ModelRegistry 只在进程启动时加载 models.yml，已在线进程看不到新 provider，
@@ -436,11 +452,10 @@ export const AddModelModal: React.FC<Props> = ({
         const pidVal = pid.trim();
         const existing = yml.providers?.[pidVal];
         if (existing && existing.discovery) {
-          const explicitModels = discovered.map((m) => ({
-            id: m.id,
-            name: m.name,
-            contextWindow: m.contextWindow,
-          }));
+          // §3 P0：写死 discovery 结果时与 yml 旧条目合并（同 id 保留 thinking/input/
+          // compat 等字段 + 并集保留未发现的旧模型），实现抽在 shared/model-merge.ts，
+          // 与 omp-config 往返测试共用同一份生产代码（审查 P2-B/P2-C）。
+          const explicitModels = mergeDiscoveredModels(existing.models, discovered);
           const newCfg: OmpProviderConfig = { ...existing, models: explicitModels };
           delete (newCfg as Partial<OmpProviderConfig>).discovery;
           await window.omp.writeOmpProvider(pidVal, newCfg);

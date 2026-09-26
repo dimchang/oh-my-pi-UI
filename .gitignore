@@ -62,6 +62,14 @@ preview-*.html
 # ===== One-off research / design doc (root, throwaway) =====
 minimap-density-scrollbar.md
 
+# ===== One-off analysis / plan docs (root, throwaway) =====
+/*plan*.md
+*plan.md
+*issue.md
+*_review.md
+OMP-UPDATE-IA.MD
+omp-*.html
+
 # ===== Runtime temp dir (omp stderr logs, etc.) =====
 .temp/
 

@@ -49,6 +49,10 @@ export interface OmpProcessEvents {
  * 策略：尽可能把所有涉及 I/O 编码的运行时环境变量都切到 UTF-8。
  * 注意：这只能"建议"子进程使用 UTF-8，最终效果取决于 omp 内部如何
  * spawn 子 shell 以及如何解码其 stdout。彻底修复需上游 omp 配合。
+ *
+ * omp 18.2.1+：上游已修复"shell/PTY 输出从 UTF-8 回退到系统 ANSI 码页"问题
+ * （中文区域回退 GBK）。本注入与之可能交互：待实测 §5.2 三条命令后决定去留；
+ * 实测无冲突前保留注入（17.x 乱码治理成果，勿轻易回退）。
  */
 function utf8Env(): NodeJS.ProcessEnv {
   return {
@@ -140,6 +144,12 @@ export class OmpProcess {
   private restartReject: ((err: Error) => void) | null = null;
   /** restart() 进行中时保存其 resolve：新进程 ready 后一次性兑现，不修改共享的 events.onReady（issue 26）。 */
   private restartResolve: (() => void) | null = null;
+  /** 自然退出时在 'exit' 记录的退出码，'close'（stdio 全关）后再交给 handleExit（§2.2 排空）。 */
+  private exitCode: number | null = null;
+  /** exit→close 的有界兜底计时器（孙进程继承 stdio 时 close 可能被无限拖延，P3-A）。 */
+  private closeFallbackTimer: NodeJS.Timeout | null = null;
+  /** stdin 高水位沿触发标记：进入记一次，drain 后重置（P2-D 防逐帧刷屏）。 */
+  private stdinBackpressure = false;
 
   constructor(
     private opts: OmpProcessOptions,
@@ -232,6 +242,13 @@ export class OmpProcess {
   async start(): Promise<void> {
     if (this.child) return;
 
+    // omp 18.2.1+：--resume/--continue 与 --no-session 组合会直接报错
+    // （"--resume requires session persistence"），不再静默降级。启动前显式失败，
+    // 避免表现为"进程秒退"的黑盒（§4.1）。
+    if (this.opts.noSession && (this.opts.resumeSession || this.opts.continueSession)) {
+      throw new Error('--no-session 不能与 -r/-c 组合（omp 18.2.1+ 直接报错）');
+    }
+
     const args = ['--mode', 'rpc-ui', '--approval-mode', this.opts.approvalMode ?? 'write'];
     if (this.opts.noSession) args.push('--no-session');
     if (this.opts.resumeSession) args.push('-r', this.opts.resumeSession);
@@ -309,8 +326,38 @@ export class OmpProcess {
       this.events.onStderr(`[stdin-error] ${err.message}`);
     });
 
-    this.child.on('exit', this.handleExit);
+    // stdin 排空恢复 → 重置高水位沿触发标记（P2-D）
+    this.child.stdin.on('drain', () => {
+      this.stdinBackpressure = false;
+    });
+
+    // omp 18.2.1+：RPC 输出对慢消费者溢出到临时磁盘，并在**退出前排空最终响应**。
+    // 'exit' 只代表进程终止，stdio 管道里可能还有最后一帧（写盘失败的终态 notice、
+    // prompt_result 等）；收尾统一延迟到 'close'（stdio 全部关闭、readline 读完），
+    // 保证最后一帧不丢（§2.2）。kill() 路径仍立即回收（排空无意义），见 kill()。
+    // 防御：重置上一进程可能残留的退出码，避免误报。
+    this.exitCode = null;
+    this.child.on('exit', this.handleProcessExit);
+    this.child.on('close', this.handleProcessClose);
   }
+
+  /** 'exit' 仅记录退出码；真正收尾等 'close'（§2.2 排空）。类属性以便 kill() 按引用摘除。
+   *  兜底（审查 P3-A）：Node 保证 close 在 exit 后到达，但若孙进程继承了 stdio 管道，
+   *  close 理论上可能被无限拖延 → onExit/cleanup 永不执行。1s 内 close 未到则强制收尾
+   *  （探针实测 0ms，此为防御性的有界兜底）。 */
+  private handleProcessExit = (code: number | null): void => {
+    this.exitCode = code;
+    if (this.closeFallbackTimer) clearTimeout(this.closeFallbackTimer);
+    this.closeFallbackTimer = setTimeout(() => {
+      this.closeFallbackTimer = null;
+      this.handleExit(this.exitCode ?? code);
+    }, 1000);
+  };
+
+  private handleProcessClose = (code: number | null): void => {
+    if (this.closeFallbackTimer) { clearTimeout(this.closeFallbackTimer); this.closeFallbackTimer = null; }
+    this.handleExit(this.exitCode ?? code);
+  };
 
   private handleExit = (code: number | null): void => {
     // restart() 进行中，新 omp 在 ready 之前就死了 → 立即拒绝 restart Promise
@@ -322,19 +369,34 @@ export class OmpProcess {
       rj(new Error(`omp exited during restart (code=${code})`));
       return;
     }
+    // §5.1：非 0 退出且 omp 18.2.1 前的机器常见"找不到 bash.exe 秒退"。给一条
+    // 可操作提示，避免渲染层陷入自愈循环却无从排查。
+    // 包 try/catch（审查 P1）：提示绝不阻断后面的 onExit/cleanup——那两句若不执行，
+    // 会话不会被标记离线、自愈不启动、child/readline/日志流全泄漏。
+    if (code !== 0 && code !== null) {
+      try {
+        this.events.onStderr(`[omp-exit] 退出码 ${code}：若秒退请检查 omp 环境（如 \`omp --version\` 是否可用、Git/ bash 是否安装）`);
+      } catch { /* stderr 出口异常不阻断收尾 */ }
+    }
     this.events.onExit(code);
     this.cleanup();
   };
 
-  /** 写一帧命令到 stdin（自动补换行）。不暴露 end()。 */
+  /** 写一帧命令到 stdin（自动补换行）。不暴露 end()。
+   *  §2.2：与 omp 18.2.1 的"慢读者溢出磁盘"互补，这里治理"写得快"——
+   *  stdin 高水位时记录（沿触发：进入记一次、drain 恢复后重置），避免逐帧刷屏。 */
   write(cmd: RpcCommand): void {
     if (!this.child || !this.child.stdin.writable) {
       throw new Error('omp process not running');
     }
     // 带错误回调：写入失败（管道断裂）时记入 stderr 日志而非抛出 unhandled 'error'（issue 25）
-    this.child.stdin.write(JSON.stringify(cmd) + '\n', (err) => {
+    const ok = this.child.stdin.write(JSON.stringify(cmd) + '\n', (err) => {
       if (err) this.events.onStderr(`[stdin-write-error] ${err.message}`);
     });
+    if (!ok && !this.stdinBackpressure) {
+      this.stdinBackpressure = true;
+      this.events.onStderr('[stdin-backpressure] stdin 进入高水位，帧已入内部缓冲排队（恢复时不再逐条提示）');
+    }
   }
 
   kill(sync = false): void {
@@ -345,12 +407,14 @@ export class OmpProcess {
       this.pendingKillTimer = null;
     }
     if (victim && victim.pid) {
-      // 换掉旧进程的 exit handler：旧进程退出是预期内的，仅 clean，不触发 onExit。
+      // 换掉旧进程的 exit/close handler：旧进程退出是预期内的，仅 clean，不触发 onExit。
       // 用 handler 替换而非共享标记，避免「旧进程退出标记被新进程误读」的竞态。
-      victim.removeListener('exit', this.handleExit);
+      victim.removeListener('exit', this.handleProcessExit);
+      victim.removeListener('close', this.handleProcessClose);
       // 旧进程退出：kill() 已 cleanup()；此后新进程可能已 start()，
       // 这里不能调 cleanup()（否则会 null 掉新进程的 child/rl）。
       victim.on('exit', () => { /* 旧进程：所有资源已在 kill().cleanup() 释放 */ });
+      victim.on('close', () => { /* 旧进程：同上 */ });
       // 树杀整棵进程（Windows 下 omp.exe 是 bun shim，真 agent 是子进程 bun.exe）。
       // sync=true 用于 app 退出路径（需同步等进程真死透，异步计时器等不到）。
       killProcessTree(victim.pid, sync);
@@ -359,6 +423,12 @@ export class OmpProcess {
   }
 
   private cleanup(): void {
+    // 兜底计时器随收尾一并清理（kill 路径尤其重要：旧进程的定时器不能触发到新进程上）
+    if (this.closeFallbackTimer) {
+      clearTimeout(this.closeFallbackTimer);
+      this.closeFallbackTimer = null;
+    }
+    this.stdinBackpressure = false;
     // issue 9：先 flush stderrDecoder，把增量解码器里残留的未完整多字节序列吐出，
     // 避免进程被杀时丢失最后几字节解码输出。
     if (this.stderrDecoder) {

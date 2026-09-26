@@ -35,6 +35,35 @@ export function groupTurns(msgs: ChatMessage[]): Turn[] {
   return turns;
 }
 
+/** 回合对象身份稳定化（2026-09-27 流式卡死修复）。
+ *
+ *  背景：流式期间 store 的 messages 数组每帧换新引用，groupTurns 每次都产出**全新**
+ *  Turn/asst 数组 → AssistantTurn 的 React.memo 浅比较每帧全部失效 → 窗口内 30 个
+ *  回合的 markdown 每帧全量重解析（实测单次 commit 161~175ms，~5fps 帧流即把主线程
+ *  打满，UI 卡死 312s——session 01a0c9ac，详见 .workbuddy/memory/2026-09-27.md）。
+ *
+ *  做法：按「同下标成员引用全等」复用旧 Turn 对象。消息只会尾部追加/流式中最后一帧
+ *  被替换，同下标对齐安全；只有成员真正变化的回合换新身份，其余回合 memo 命中被跳过。
+ *  会话整体切换（引用全变）时自然全部重建，行为不变。 */
+export function stabilizeTurns(prev: Turn[], next: Turn[]): Turn[] {
+  const out: Turn[] = new Array(next.length);
+  for (let i = 0; i < next.length; i++) {
+    const p = prev[i];
+    const t = next[i]!;
+    if (
+      p
+      && p.user === t.user
+      && p.asst.length === t.asst.length
+      && p.asst.every((m, k) => m === t.asst[k])
+    ) {
+      out[i] = p;
+    } else {
+      out[i] = t;
+    }
+  }
+  return out;
+}
+
 /** 回合聚合统计（摘要行用）。
  *  注意 totalTokens 是**单次请求的上下文总量**（input + cacheRead + output），逐条累加会
  *  重复计数出天文数字（实测 483 条消息的回合累加得 23,391,974 —— 无意义）；
