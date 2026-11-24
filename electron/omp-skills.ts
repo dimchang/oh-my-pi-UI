@@ -108,12 +108,20 @@ async function loadConfigDoc(file: string): Promise<Document> {
 async function writeConfigDoc(file: string, doc: Document): Promise<void> {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${randomUUID()}`;
-  await fs.promises.writeFile(tmp, doc.toString(), 'utf8');
-  await fs.promises.rename(tmp, file);
+  try {
+    await fs.promises.writeFile(tmp, doc.toString(), 'utf8');
+    await fs.promises.rename(tmp, file);
+  } catch (e) {
+    // 写入/rename 失败（Windows 上目标被占用时常见 EPERM）：清掉临时文件，避免在配置目录堆积垃圾
+    await fs.promises.unlink(tmp).catch(() => undefined);
+    throw e;
+  }
 }
 
 /** 解析 SKILL.md：front-matter（--- 块）与正文分离 */
 function parseSkillMd(raw: string): { metadata: Record<string, unknown>; body: string } {
+  // 去掉 UTF-8 BOM（Windows 记事本等保存的文件），否则 ^--- 匹配不上，front-matter 整体被当正文
+  raw = raw.replace(/^\uFEFF/, '');
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
   if (!m) return { metadata: {}, body: raw };
   let metadata: Record<string, unknown> = {};
@@ -138,7 +146,9 @@ async function scanSkillDirs(customDirs: string[]): Promise<Map<string, { dir: s
       continue; // 根不存在 → 跳过
     }
     for (const e of entries) {
-      if (!e.isDirectory()) continue;
+      // 符号链接 / junction 形式安装的技能目录 Dirent 报告为 symlink（isDirectory()=false），
+      // 也要纳入（下面的 SKILL.md 检查会跟随链接；findAllSkillDirs 同样跟随链接）
+      if (!e.isDirectory() && !e.isSymbolicLink()) continue;
       const dir = path.join(root, e.name);
       if (!(await fileExists(path.join(dir, 'SKILL.md')))) continue;
       if (!out.has(e.name)) out.set(e.name, { dir, source: path.basename(root) });
@@ -250,7 +260,10 @@ export async function uninstallSkill(name: string): Promise<{ ok: boolean; moved
       if (!underRoot) {
         return { ok: false, moved: [], error: `拒绝卸载非技能目录: ${dir}` };
       }
-      const dest = path.join(trashDir, path.basename(target));
+      // 同名技能可能存在于多个根，basename 都是技能名：后续副本加序号，
+      // 否则 rename 到 trash 里已存在的同名非空目录会失败（ENOTEMPTY/EPERM），卸载半途中止
+      const base = path.basename(target);
+      const dest = path.join(trashDir, moved.length === 0 ? base : `${base}-${moved.length}`);
       await fs.promises.rename(target, dest);
       moved.push(dest);
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractDiff } from './DiffView';
+import { extractDiff, extractChangeSummary } from './DiffView';
 
 describe('extractDiff', () => {
   it('returns null for null/undefined', () => {
@@ -89,5 +89,31 @@ describe('extractDiff', () => {
     const nestedDiff = '@@ -1 +1 @@\n-nested\n+nested';
     const result = { diff: directDiff, result: { diff: nestedDiff } };
     expect(extractDiff(result)).toBe(directDiff);
+  });
+
+  it('extracts diff from omp edit result details', () => {
+    const diffText = ' 1|keep\n-2|old\n+2|new';
+    const result = {
+      content: [{ type: 'text', text: 'Successfully replaced 1 block in a.ts' }],
+      details: { diff: diffText, firstChangedLine: 2 },
+    };
+    expect(extractDiff(result)).toBe(diffText);
+  });
+});
+
+describe('extractChangeSummary', () => {
+  it('summarizes file-changing tools', () => {
+    const summary = extractChangeSummary(
+      { content: [{ type: 'text', text: 'Successfully wrote 12 bytes' }] },
+      'write',
+      { path: 'src/a.ts' },
+    );
+    expect(summary).toBe('--- /dev/null\n+++ src/a.ts\n+Successfully wrote 12 bytes');
+  });
+
+  it('ignores read-only tools', () => {
+    const result = { content: [{ type: 'text', text: 'file contents\nline 2' }] };
+    expect(extractChangeSummary(result, 'read', { path: 'src/a.ts' })).toBeNull();
+    expect(extractChangeSummary('total 0', 'bash', { command: 'ls' })).toBeNull();
   });
 });

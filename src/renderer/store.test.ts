@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { useApp, connTone, connDetail, sessionDotStatus, shouldHealStuckStreaming, shouldHealFromDisk, shouldClearStaleRetry, RETRY_WORK_FRAME_TYPES, RETRY_STALE_MS } from './store';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { useApp, connTone, connDetail, sessionDotStatus, shouldHealStuckStreaming, shouldHealFromDisk, shouldClearStaleRetry, resolveDesiredSessionModel, RETRY_WORK_FRAME_TYPES, RETRY_STALE_MS, hexToHslTriplet } from './store';
 import type { ToolPart } from './store';
 
 const SP = 'D:/proj';
@@ -204,6 +204,19 @@ describe('subagents', () => {
     expect(useApp.getState().subagents).toEqual([]);
     expect(useApp.getState().subagentsAt).toBe(0);
   });
+
+  it('同批派发的同前缀兄弟（Review 与 Review-UI）不会被当成改名占位淘汰', () => {
+    ev({ type: 'tool_execution_start', toolCallId: 'c1', toolName: 'task', intent: '审查', args: { tasks: [{ name: 'Review' }, { name: 'Review-UI' }] } });
+    ev({
+      type: 'tool_execution_update',
+      toolCallId: 'c1',
+      toolName: 'task',
+      partialResult: { content: [], details: { progress: [{ id: 'Review', status: 'running' }, { id: 'Review-UI', status: 'running' }] } },
+    });
+    const jobs = useApp.getState().subagents;
+    expect(jobs.map((j) => j.id)).toEqual(['Review', 'Review-UI']);
+    expect(jobs[0]).toMatchObject({ status: 'running', intent: '审查' });
+  });
 });
 
 describe('tool partial 文本', () => {
@@ -215,6 +228,26 @@ describe('tool partial 文本', () => {
     // content 是累积语义 → 直接替换而非拼接
     ev({ type: 'tool_execution_update', toolCallId: 'b', toolName: 'bash', partialResult: { content: [{ type: 'text', text: 'tick1\ntick2\n' }], details: {} } });
     expect(tools()[0]?.partial).toBe('tick1\ntick2\n');
+  });
+
+  it('工具帧只替换含该工具卡的消息，其余消息保持原引用（回合 memo 依赖引用稳定）', () => {
+    ev({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    ev({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '上一回合' }] } });
+    useApp.getState().appendUserMessage('下一问', undefined, SP);
+    ev({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    ev({ type: 'tool_execution_start', toolCallId: 'b', toolName: 'bash' });
+    for (const frame of [
+      { type: 'tool_execution_update', toolCallId: 'b', toolName: 'bash', partialResult: { content: [{ type: 'text', text: 'x' }] } },
+      { type: 'tool_execution_end', toolCallId: 'b', toolName: 'bash', result: 'ok' },
+    ]) {
+      const before = useApp.getState().messages;
+      ev(frame);
+      const after = useApp.getState().messages;
+      expect(after[0]).toBe(before[0]);
+      expect(after[1]).toBe(before[1]);
+      expect(after[2]).not.toBe(before[2]);
+    }
+    expect(tools()[0]).toMatchObject({ status: 'done', partial: 'x', result: 'ok' });
   });
 });
 
@@ -316,6 +349,24 @@ describe('回复不显示三道防线', () => {
   it('防线1负例：user 消息不兜底（本地已建，omp 回显再追加会重复）', () => {
     ev({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } });
     expect(useApp.getState().messages).toHaveLength(0);
+  });
+
+  it('user 回显只认对应的本地气泡：消息桥投的 prompt / steer 越过排队消息时不改写别的气泡', () => {
+    const userTexts = () => useApp.getState().messages
+      .filter((m) => m.role === 'user')
+      .map((m) => m.parts.map((p) => ('text' in p ? p.text : '')).join(''));
+    useApp.getState().appendUserMessage('问题一', undefined, SP);
+    ev({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: '问题一\n\nAttached files (absolute paths, read them as needed):\n- D:/a.txt' }] } });
+    expect(userTexts()).toEqual(['问题一\n\nAttached files (absolute paths, read them as needed):\n- D:/a.txt']);
+    // 消息桥（企业微信/飞书）直接投给进程的 prompt：本地无气泡，不得改写「问题一」
+    ev({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: '来自企业微信的问题' }] } });
+    expect(userTexts()[0]).toContain('问题一');
+    // 先排队 B、再引导 C：omp 先送达 C、后送达 B，各自只更新自己的气泡
+    useApp.getState().appendUserMessage('B', { queued: true }, SP);
+    useApp.getState().appendUserMessage('C', { steered: true }, SP);
+    ev({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'C' }] } });
+    ev({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'B' }] } });
+    expect(userTexts().slice(1)).toEqual(['B', 'C']);
   });
 
   it('防线2：agent_end 时 messages 落后于 sessionsMap → 强制同步（自愈）', () => {
@@ -600,6 +651,34 @@ describe('sessionDotStatus stalled（运行中但静默）', () => {
   });
 });
 
+// 0.5.40：omp 进程崩溃中断 → 侧栏红点（用户要求从「运行中」橙点改为红点）。
+// crashInterrupted 是 crash-interrupt.ts 的运行时标记，用户重发/发新消息后由 store 清除。
+describe('sessionDotStatus crashInterrupted（进程崩溃中断 → 红点）', () => {
+  const now = 100 * 60 * 1000;
+  const crashed = { [SP]: { at: now, source: 'exit' as const } };
+  const snap = (o: Record<string, unknown> = {}, withCrash = true) => ({
+    procStateMap: { [SP]: { status: 'online', isStreaming: true, isAborting: false, lastFrameAt: now, ...o } } as never,
+    unreadSessions: { [SP]: true },
+    sessionErrors: {},
+    uiQueue: [],
+    ...(withCrash ? { crashInterrupted: crashed } : {}),
+  });
+
+  it('崩溃中断覆盖 streaming 橙点', () => {
+    expect(sessionDotStatus(SP, snap(), now)).toBe('red');
+  });
+
+  it('崩溃中断覆盖 stalled 灰橙点与未读绿点', () => {
+    expect(sessionDotStatus(SP, snap({ lastFrameAt: now - 11 * 60 * 1000 }), now)).toBe('red');
+    expect(sessionDotStatus(SP, { ...snap({ isStreaming: false }), procStateMap: {} }, now)).toBe('red');
+  });
+
+  it('未标记崩溃时维持原逻辑（不误报红点）', () => {
+    expect(sessionDotStatus(SP, snap({}, false), now)).toBe('orange');
+    expect(sessionDotStatus(SP, { ...snap({}, false), procStateMap: {} }, now)).toBe('green');
+  });
+});
+
 // 2026-09-17「重试中 (1/10)… 常亮」修复：omp 的 auto_retry_end 不保证送达
 // （成功路径被 IX(e)/#s>0 两道门挡住就直接 return；失败路径多处只在 #s>1 时补发）。
 // 复现：session 01a0ab4b-66c0-750d-b8e0-0e3a01775714 断网触发重试，网络恢复后同一回合
@@ -688,5 +767,316 @@ describe('重试气泡终结（auto_retry_end 丢失兜底）', () => {
     expect(RETRY_WORK_FRAME_TYPES.has('message_end')).toBe(false);
     expect(RETRY_WORK_FRAME_TYPES.has('agent_end')).toBe(false);
     expect(RETRY_WORK_FRAME_TYPES.has('auto_retry_start')).toBe(false);
+  });
+});
+
+// 每会话草稿（2026-10-25）：输入框文字/附件按 sessionPath 隔离，切会话不串。
+describe('每会话草稿', () => {
+  const A = 'D:/proj/sess-a.jsonl';
+  const B = 'D:/proj/sess-b.jsonl';
+
+  beforeEach(() => {
+    useApp.setState({ composerDrafts: {}, currentSessionPath: A });
+  });
+
+  it('两个会话的草稿互不影响', () => {
+    const st = useApp.getState();
+    st.setComposerText(A, '给 A 的任务');
+    st.setComposerText(B, '给 B 的任务');
+    expect(useApp.getState().composerDrafts[A]!.text).toBe('给 A 的任务');
+    expect(useApp.getState().composerDrafts[B]!.text).toBe('给 B 的任务');
+    // 清空 A 不影响 B
+    useApp.getState().clearComposerDraft(A);
+    expect(useApp.getState().composerDrafts[A]).toBeUndefined();
+    expect(useApp.getState().composerDrafts[B]!.text).toBe('给 B 的任务');
+  });
+
+  it('写文本不清掉该会话已选附件，反之亦然', () => {
+    const st = useApp.getState();
+    st.setComposerAttachments(A, [{ path: 'D:/proj/a.png', name: 'a.png', kind: 'image' }]);
+    useApp.getState().setComposerText(A, '带图的任务');
+    expect(useApp.getState().composerDrafts[A]!.attachments).toHaveLength(1);
+    expect(useApp.getState().composerDrafts[A]!.text).toBe('带图的任务');
+  });
+
+  it('migrateComposerDraft：tempKey → realPath 草稿跟随；目标已有草稿时以目标为准', () => {
+    const st = useApp.getState();
+    st.setComposerText('__new_t1', 'temp 草稿');
+    useApp.getState().migrateComposerDraft('__new_t1', A);
+    expect(useApp.getState().composerDrafts['__new_t1']).toBeUndefined();
+    expect(useApp.getState().composerDrafts[A]!.text).toBe('temp 草稿');
+
+    st.setComposerText('__new_t2', '旧');
+    useApp.getState().setComposerText(A, '新');
+    useApp.getState().migrateComposerDraft('__new_t2', A);
+    expect(useApp.getState().composerDrafts[A]!.text).toBe('新');
+  });
+});
+
+// 进程重起后的模型恢复取值（2026-10-25「会话1模型被改成别的会话刚选的模型」修复）。
+describe('resolveDesiredSessionModel', () => {
+  const glm = { provider: 'openrouter', id: 'z-ai/glm-5.3-flash' };
+  const deepseek = { provider: 'deepseek', id: 'deepseek-chat' };
+  const real = 'D:/proj/sess-a.jsonl';
+
+  it('有 per-session 记录 → 用记录，即便全局 lastModel 是别的', () => {
+    expect(resolveDesiredSessionModel(real, { [real]: deepseek }, glm)).toEqual(deepseek);
+  });
+
+  it('无记录的老会话 → undefined（绝不回退全局，避免覆盖 omp 从会话文件恢复的模型）', () => {
+    expect(resolveDesiredSessionModel(real, {}, glm)).toBeUndefined();
+  });
+
+  it('无记录的新会话（tempKey）→ 回退全局 lastModel（新开会话跟最后一次模型走）', () => {
+    expect(resolveDesiredSessionModel('__new_abc', {}, glm)).toEqual(glm);
+  });
+
+  it('新会话也没有全局记录时 → undefined（omp 用 config 默认模型）', () => {
+    expect(resolveDesiredSessionModel('__new_abc', {}, undefined)).toBeUndefined();
+  });
+});
+
+// sessionModels 展示层快照：切会话时按会话回显，避免显示上一个会话的模型。
+describe('sessionModels 快照', () => {
+  const A = 'D:/proj/sess-a.jsonl';
+  const B = 'D:/proj/sess-b.jsonl';
+  const glm = { provider: 'openrouter', id: 'z-ai/glm-5.3-flash' };
+  const deepseek = { provider: 'deepseek', id: 'deepseek-chat' };
+
+  beforeEach(() => {
+    useApp.setState({ sessionModels: {}, lastModelMap: {}, lastModel: undefined });
+  });
+
+  it('setSessionModel 只影响该会话', () => {
+    useApp.getState().setSessionModel(A, deepseek);
+    useApp.getState().setSessionModel(B, glm);
+    expect(useApp.getState().sessionModels[A]).toEqual(deepseek);
+    expect(useApp.getState().sessionModels[B]).toEqual(glm);
+  });
+
+  it('tempKey 迁移时快照跟随；删除会话时清理', () => {
+    useApp.getState().setSessionModel('__new_x', deepseek);
+    useApp.getState().migrateLastModelKey('__new_x', A);
+    expect(useApp.getState().sessionModels['__new_x']).toBeUndefined();
+    expect(useApp.getState().sessionModels[A]).toEqual(deepseek);
+    useApp.getState().removeLastModelKey(A);
+    expect(useApp.getState().sessionModels[A]).toBeUndefined();
+  });
+});
+
+// 新会话身份与侧栏去重（2026-10-25）：omp 在 spawn 后就分配真实 sessionFile（文件稍后才建），
+// 于是「假占位 `__new_x`」与「它自己的真文件」曾在侧栏同时出现，并且继续对话时又裂出第三个 id。
+describe('tempKey → 真实 sessionFile 绑定', () => {
+  const REAL = 'D:/sessions/2026-10-25T04-10-46-541Z_01a17140.jsonl';
+  const OTHER = 'D:/sessions/2026-10-25T04-13-16-919Z_01a17143.jsonl';
+  const TEMP = '__new_6d4f45dc';
+
+  beforeEach(() => {
+    useApp.setState({
+      tempRealPath: {}, pendingLocalSessions: {}, uncommittedSessions: {},
+      sessions: [], sessionsMap: {}, procStateMap: {}, currentSessionPath: undefined,
+      composerDrafts: {},
+    });
+  });
+
+  it('bindTempRealPath：忽略非 tempKey 与仍是 tempKey 的值，同一真文件只绑一个', () => {
+    const st = useApp.getState();
+    st.bindTempRealPath('D:/x.jsonl', REAL);           // 非 tempKey → 忽略
+    st.bindTempRealPath(TEMP, '__new_other');          // 还是假 key → 忽略
+    st.bindTempRealPath(TEMP, REAL);
+    expect(useApp.getState().tempRealPath[TEMP]).toBe(REAL);
+    // 另一个 tempKey 想绑同一个真文件 → 不允许
+    st.bindTempRealPath('__new_second', REAL);
+    expect(useApp.getState().tempRealPath['__new_second']).toBeUndefined();
+  });
+
+  it('setSessions 隐藏被绑定过的真实条目（避免"假占位 + 真文件"两条）', () => {
+    const st = useApp.getState();
+    st.upsertSessionPlaceholder(TEMP, 'D:/proj');
+    st.bindTempRealPath(TEMP, REAL);
+    useApp.getState().setSessions([
+      { path: REAL, id: REAL, cwd: 'D:/proj', title: 'a', mtime: 2, cwdExists: true },
+      { path: OTHER, id: OTHER, cwd: 'D:/proj', title: 'b', mtime: 1, cwdExists: true },
+    ]);
+    const paths = useApp.getState().sessions.map((x) => x.path);
+    expect(paths).toContain(TEMP);          // 占位在
+    expect(paths).toContain(OTHER);         // 别的会话正常显示
+    expect(paths).not.toContain(REAL);      // 自己的真文件被占位挡住，不重复
+  });
+
+  it('绑定解除后真实条目恢复显示（temp 占位由 rekey 负责移除，不是这里）', () => {
+    const st = useApp.getState();
+    st.upsertSessionPlaceholder(TEMP, 'D:/proj');
+    st.bindTempRealPath(TEMP, REAL);
+    useApp.getState().setSessions([{ path: REAL, id: REAL, cwd: 'D:/proj', title: 'a', mtime: 2, cwdExists: true }]);
+    expect(useApp.getState().sessions.map((x) => x.path)).toEqual([TEMP]);
+    useApp.getState().unbindTempRealPath(TEMP);
+    useApp.getState().setSessions([{ path: REAL, id: REAL, cwd: 'D:/proj', title: 'a', mtime: 2, cwdExists: true }]);
+    // 解绑后真实条目重新可见（temp 占位仍留着——真实迁移时由 applySessionRekey 移除）
+    expect(useApp.getState().sessions.map((x) => x.path)).toContain(REAL);
+  });
+
+  it('uncommitted 会话在扫盘看不到时也留在侧栏（.jsonl 要等首条消息才创建）', () => {
+    const st = useApp.getState();
+    st.markUncommitted(REAL);
+    st.upsertSessionPlaceholder(REAL, 'D:/proj');
+    // 扫盘为空（文件还没创建）
+    useApp.getState().setSessions([]);
+    expect(useApp.getState().sessions.map((x) => x.path)).toEqual([REAL]);
+    // 提交过消息 → 不再靠 uncommitted 保留；pending 过期后交给扫盘
+    useApp.getState().commitSession(REAL);
+    useApp.setState({ pendingLocalSessions: {} });
+    useApp.getState().setSessions([]);
+    expect(useApp.getState().sessions).toEqual([]);
+  });
+
+  it('pendingLocalSessions 过期后不再保留（防陈旧条目滞留）', () => {
+    const st = useApp.getState();
+    st.markPendingLocalSession(REAL, -1); // 已过期
+    useApp.getState().setSessions([]);    // 但 sessions 里本来也没有它
+    expect(useApp.getState().sessions).toEqual([]);
+    // 未过期 + 条目存在 → 保留
+    useApp.getState().upsertSessionPlaceholder(OTHER, 'D:/proj');
+    useApp.getState().commitSession(OTHER);
+    useApp.getState().markPendingLocalSession(OTHER, 60_000);
+    useApp.getState().setSessions([]);
+    expect(useApp.getState().sessions.map((x) => x.path)).toEqual([OTHER]);
+  });
+
+  it('migrateUncommitted：换 key 时标记跟随（新建会话 spawn 后换成真实 id）', () => {
+    const st = useApp.getState();
+    st.markUncommitted(TEMP);
+    useApp.getState().migrateUncommitted(TEMP, REAL);
+    expect(useApp.getState().uncommittedSessions[TEMP]).toBeUndefined();
+    expect(useApp.getState().uncommittedSessions[REAL]).toBe(true);
+  });
+});
+
+// 删除墓碑（2026-10-25）：右键删除后扫盘可能把旧条目带回来（文件删除是异步的 /
+// 进程退出前 flush），表现为"删不掉"。
+describe('已删除会话的墓碑', () => {
+  const REAL = 'D:/sessions/x_01a1715d.jsonl';
+  const row = { path: REAL, id: REAL, cwd: 'D:/proj', title: 't', mtime: 1, cwdExists: true };
+
+  beforeEach(() => {
+    useApp.setState({
+      suppressedSessions: {}, uncommittedSessions: {}, pendingLocalSessions: {},
+      sessions: [], sessionsMap: {}, procStateMap: {}, currentSessionPath: undefined, composerDrafts: {},
+    });
+  });
+
+  it('墓碑有效期内：扫盘扫到也不显示（即使 uncommitted 还留着）', () => {
+    useApp.getState().markUncommitted(REAL);
+    useApp.getState().upsertSessionPlaceholder(REAL, 'D:/proj');
+    useApp.getState().suppressSession(REAL, 60_000);
+    useApp.getState().setSessions([row]);
+    expect(useApp.getState().sessions).toEqual([]);
+  });
+
+  it('墓碑过期后恢复正常显示', () => {
+    useApp.getState().suppressSession(REAL, -1); // 已过期
+    useApp.getState().setSessions([row]);
+    expect(useApp.getState().sessions.map((x) => x.path)).toEqual([REAL]);
+    // 过期项会被顺手清理掉，不留垃圾
+    expect(useApp.getState().suppressedSessions[REAL]).toBeUndefined();
+  });
+});
+
+describe('切会话清压缩提示', () => {
+  it('切走后原会话的 auto_compaction_end 不再生效 → 切会话时必须清掉，否则新会话常亮「压缩中」', () => {
+    ev({ type: 'auto_compaction_start' });
+    expect(useApp.getState().isCompacting).toBe(true);
+    useApp.getState().setCurrentSessionPath('D:/proj/other.jsonl');
+    ev({ type: 'auto_compaction_end' }); // 原会话（已非显示）的结束帧
+    expect(useApp.getState().isCompacting).toBe(false);
+    expect(useApp.getState().compactionInfo).toBe('');
+  });
+});
+
+// 多进程：每会话一进程，setOmpExited 只能影响当前显示会话（onReady 对任意会话都会调 setOmpExited(null)）
+describe('setOmpExited（多进程隔离）', () => {
+  const BG = 'D:/proj/bg-session.jsonl';
+  beforeEach(() => {
+    useApp.setState({
+      currentSessionPath: SP,
+      ompExited: false,
+      isStreaming: true,
+      isAborting: false,
+      procStateMap: {
+        [SP]: { status: 'online', isStreaming: true, isAborting: false },
+        [BG]: { status: 'online', isStreaming: true, isAborting: false },
+      },
+    });
+  });
+
+  it('别的会话进程 ready（code=null）不清掉当前会话仍在进行的流式标志', () => {
+    useApp.getState().setOmpExited(null);
+    expect(useApp.getState().ompExited).toBeNull();
+    expect(useApp.getState().isStreaming).toBe(true);
+  });
+
+  it('当前会话进程退出只重置该会话，后台会话的进程状态不受影响', () => {
+    useApp.getState().setOmpExited(1);
+    const s = useApp.getState();
+    expect(s.ompExited).toBe(1);
+    expect(s.isStreaming).toBe(false);
+    expect(s.procStateMap[SP]).toMatchObject({ status: 'offline', isStreaming: false });
+    expect(s.procStateMap[BG]).toMatchObject({ status: 'online', isStreaming: true });
+  });
+});
+
+describe('loadSessionMessages', () => {
+  const A = 'D:/proj/a.jsonl';
+  const B = 'D:/proj/b.jsonl';
+  const g = globalThis as { window?: unknown };
+  let prevWindow: unknown;
+  const resolvers = new Map<string, (msgs: unknown[]) => void>();
+
+  beforeEach(() => {
+    prevWindow = g.window;
+    resolvers.clear();
+    g.window = {
+      omp: {
+        readSessionMessages: (p: string) => new Promise((r) => { resolvers.set(p, r); }),
+        saveWorkspaces: () => Promise.resolve(),
+      },
+    };
+    useApp.setState({ currentSessionPath: A, messages: [], sessionsMap: {}, procStateMap: {} });
+  });
+  afterEach(() => {
+    g.window = prevWindow;
+  });
+
+  it('别的会话的读盘不会让当前会话的读盘结果被丢弃', async () => {
+    useApp.getState().loadSessionMessages(A);
+    useApp.getState().loadSessionMessages(B); // 如看门狗对后台会话的 healFromDisk
+    await vi.waitFor(() => expect(resolvers.has(A) && resolvers.has(B)).toBe(true));
+    resolvers.get(A)!([{ role: 'user', content: [{ type: 'text', text: 'hi A' }] }]);
+    resolvers.get(B)!([{ role: 'user', content: [{ type: 'text', text: 'hi B' }] }]);
+    await vi.waitFor(() => expect(useApp.getState().sessionsMap[B]).toHaveLength(1));
+    await vi.waitFor(() => expect(useApp.getState().messages).toHaveLength(1));
+    expect(useApp.getState().sessionsMap[A]).toHaveLength(1);
+  });
+
+  it('同一会话的旧读盘结果仍被新一次加载取代', async () => {
+    useApp.getState().loadSessionMessages(A);
+    await vi.waitFor(() => expect(resolvers.has(A)).toBe(true));
+    const first = resolvers.get(A)!;
+    resolvers.delete(A);
+    useApp.getState().loadSessionMessages(A);
+    await vi.waitFor(() => expect(resolvers.has(A)).toBe(true));
+    resolvers.get(A)!([{ role: 'user', content: [{ type: 'text', text: 'new' }] }, { role: 'user', content: [{ type: 'text', text: 'new2' }] }]);
+    await vi.waitFor(() => expect(useApp.getState().messages).toHaveLength(2));
+    first([{ role: 'user', content: [{ type: 'text', text: 'old' }] }]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(useApp.getState().messages).toHaveLength(2);
+  });
+});
+
+describe('hexToHslTriplet', () => {
+  it('把自定义强调色 hex 转成 styles.css --accent-* 需要的 HSL 分量', () => {
+    expect(hexToHslTriplet('#0a84ff')).toBe('210 100% 52%');
+    expect(hexToHslTriplet('#fff')).toBe('0 0% 100%');
+    expect(hexToHslTriplet('red')).toBeNull();
   });
 });

@@ -71,6 +71,9 @@ export const SettingsHooks: React.FC = () => {
         if (h.path !== path) return h;
         const cur = h.enabledUnits && h.enabledUnits.length ? h.enabledUnits : h.units.map((u) => u.name);
         const nextUnits = on ? [...new Set([...cur, unitName])] : cur.filter((n) => n !== unitName);
+        // enabledUnits 为空数组 = 「全部启用」（此处与主进程 resolveHookArgs 同语义）：
+        // 取消最后一个单元若写成 [] 会反而把所有单元重新启用 → 改为停用整个文件，保留原勾选
+        if (nextUnits.length === 0) return { ...h, enabled: false };
         return { ...h, enabledUnits: nextUnits };
       }),
     );

@@ -42,10 +42,12 @@ export interface BridgeIncomingMessage {
 export interface ChatTransport {
   /** 当前是否在线（status().connected 用） */
   readonly connected: boolean;
-  /** 发一条「关联消息」的即时回复（错误提示等短消息；飞书=reply，企微=text respond） */
+  /** 发一条「关联消息」的即时回复（错误提示等短消息；飞书=reply，企微=一帧即收尾的 stream） */
   respondText(reqId: string, content: string): Promise<void>;
   /** 流式刷新（仅 supportsStream 的渠道真正实现；飞书空实现） */
   respondStream(reqId: string, streamId: string, content: string, finish: boolean): Promise<void>;
+  /** 主动推送到会话（不依赖 reqId；流式窗口过期后的终稿走这里） */
+  pushText(chatKey: string, chatType: 'single' | 'group', content: string): Promise<void>;
 }
 
 export interface BridgeConfig {
@@ -72,6 +74,7 @@ export interface BridgeDeps {
 /** chatKey → 进行中的流式回合 */
 interface ActiveTurn {
   chatKey: string;
+  chatType: 'single' | 'group';
   sessionPath: string;
   reqId: string;
   streamId: string;
@@ -83,6 +86,20 @@ interface ActiveTurn {
   finished: boolean;
   /** 渠道是否支持流式（不支持时 text 只累积，agent_end 一次性发） */
   supportsStream: boolean;
+  /** 已有中间帧在途（等回执）：期间的刷新合并为一次，回执后补发最新全文 */
+  streamInflight: boolean;
+  flushPending: boolean;
+  /** 流式窗口将尽已提前收尾 stream：此后继续累积，终稿改走 pushText */
+  streamClosed: boolean;
+}
+
+/** 取尾部 n 个 UTF-16 单元，不从代理对中间切开（孤立低代理会变乱码/被服务端拒收）。 */
+export function tailChars(s: string, n: number): string {
+  if (s.length <= n) return s;
+  let start = s.length - n;
+  const c = s.charCodeAt(start);
+  if (c >= 0xdc00 && c <= 0xdfff) start += 1;
+  return s.slice(start);
 }
 
 export function bridgeConfigFile(name: string): string {
@@ -130,6 +147,8 @@ export class ChatBridgeCore {
   private cfg: BridgeConfig;
   private deps: BridgeDeps | null = null;
   private active = new Map<string, ActiveTurn>();
+  /** chatKey → 该聊天的消息处理链：同一聊天串行处理（首条消息建会话期间第二条到达会重复 autoBind） */
+  private chatQueues = new Map<string, Promise<void>>();
   /** 磁盘缓存（mtime 失效） */
   private cfgCache: { mtimeMs: number; data: BridgeConfig } | null = null;
   /** 10 分钟流式窗口（渠道可覆盖；0 = 不限） */
@@ -168,6 +187,9 @@ export class ChatBridgeCore {
   }
 
   async saveConfig(cfg: BridgeConfig): Promise<BridgeConfig> {
+    // 渲染层拿不到 secret（status 不下发），表单留空提交 = 沿用已存凭证；
+    // 否则改个注入模式/停用一下就把 secret 清空、桥随即断开且重启后无法再连
+    if (!cfg.secret && cfg.botId && cfg.botId === this.cfg.botId) cfg.secret = this.cfg.secret;
     // 绑定去重（同 chatKey 只留最新）
     const seen = new Set<string>();
     cfg.bindings = (cfg.bindings ?? []).filter((b) => {
@@ -212,7 +234,25 @@ export class ChatBridgeCore {
 
   // ---- 消息入口（渠道 client 的 onMessage 转到这里）----
 
-  async handleMessage(msg: BridgeIncomingMessage): Promise<void> {
+  /** 按 chatKey 排队串行处理；永不 reject（渠道侧都是 `void handleMessage()`）。 */
+  handleMessage(msg: BridgeIncomingMessage): Promise<void> {
+    const key = msg.chatKey;
+    const prev = this.chatQueues.get(key) ?? Promise.resolve();
+    const next = prev
+      .then(() => this.processMessage(msg))
+      .catch(async (e) => {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        this.deps?.log(`[${this.deps.channelLabel}] handle message failed: ${errMsg}`);
+        await this.safeRespond(msg.reqId, `处理失败：${errMsg}`);
+      });
+    this.chatQueues.set(key, next);
+    void next.then(() => {
+      if (this.chatQueues.get(key) === next) this.chatQueues.delete(key);
+    });
+    return next;
+  }
+
+  private async processMessage(msg: BridgeIncomingMessage): Promise<void> {
     const deps = this.deps;
     const transport = this.transport;
     if (!deps || !transport) return;
@@ -231,7 +271,9 @@ export class ChatBridgeCore {
       return;
     }
 
-    const turn = this.active.get(msg.chatKey);
+    // 回合属于别的会话（/bind 换绑后）不能当「进行中」：否则 steer 投给新会话、帧却按旧会话匹配，输出全丢
+    const existingTurn = this.active.get(msg.chatKey);
+    const turn = existingTurn && existingTurn.sessionPath === sessionPath ? existingTurn : undefined;
     try {
       const cmd = turn
         ? (this.cfg.injectMode === 'followUp'
@@ -242,8 +284,9 @@ export class ChatBridgeCore {
       if (!turn) this.startTurn(msg.chatKey, sessionPath, msg);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      // 进程离线（LRU 淘汰/退出）→ 重新拉起再投
-      if (/not online|spawn|exited|timeout/i.test(errMsg)) {
+      // 进程离线（LRU 淘汰/退出）→ 重新拉起再投。
+      // 不含 rpc timeout：进程仍在线，acquire 是 no-op，重发 prompt 只会造成双回合
+      if (/not online|not running|spawn|exited|evicted/i.test(errMsg)) {
         try {
           const cwd = this.cfg.cwd || deps.defaultCwd;
           const hooks = await deps.resolveHooks();
@@ -265,14 +308,15 @@ export class ChatBridgeCore {
     const deps = this.deps!;
     const tempKey = this.tempPrefix + randomUUID();
     const cwd = this.cfg.cwd || deps.defaultCwd;
-    const hooks = await deps.resolveHooks();
     try {
+      const hooks = await deps.resolveHooks();
       await deps.pool.acquireNew(tempKey, cwd, this.cfg.approvalMode, undefined, hooks);
       this.cfg.bindings.push({
         chatKey: msg.chatKey,
         sessionPath: tempKey,
         chatType: msg.chatType,
-        title: firstText.slice(0, 30),
+        // 按码点截断，避免把 emoji 等代理对切成孤立代理
+        title: Array.from(firstText).slice(0, 30).join(''),
         createdAt: Date.now(),
       });
       await this.saveConfig(this.cfg);
@@ -325,6 +369,7 @@ export class ChatBridgeCore {
         const turn = this.active.get(msg.chatKey);
         if (turn) this.finishTurn(turn, turn.text || '（已重置）');
         this.active.delete(msg.chatKey);
+        this.emitStatus();
         await this.safeRespond(msg.reqId, '已重置当前聊天的桥接状态。');
         return;
       }
@@ -375,6 +420,7 @@ export class ChatBridgeCore {
     if (old) this.finishTurn(old, old.text || '（被新消息接管）');
     const turn: ActiveTurn = {
       chatKey,
+      chatType: msg.chatType,
       sessionPath,
       reqId: msg.reqId,
       streamId: randomUUID(),
@@ -384,11 +430,12 @@ export class ChatBridgeCore {
       flushTimer: null,
       finished: false,
       supportsStream: msg.supportsStream && this.transportSupportsStream,
+      streamInflight: false,
+      flushPending: false,
+      streamClosed: false,
     };
     this.active.set(chatKey, turn);
-    if (turn.supportsStream) {
-      void this.transport?.respondStream(turn.reqId, turn.streamId, '…', false).catch(() => undefined);
-    }
+    if (turn.supportsStream) this.sendStreamFrame(turn, '…');
     this.emitStatus();
   }
 
@@ -420,12 +467,15 @@ export class ChatBridgeCore {
       return;
     }
     if (type === 'notice') {
-      const n = frame as { message?: string };
-      if (typeof n.message === 'string' && n.message) {
+      const n = frame as { message?: string; level?: string };
+      // 只有 error 级通知（如会话写盘失败）才终止回合：info/warning 通知（含每次启动都会刷的
+      // xd:// MCP 挂载通知）不代表回合结束，在这里收尾会截断回答、丢掉后续全部输出
+      if (n.level === 'error' && typeof n.message === 'string' && n.message && !/^xd:\/\//i.test(n.message)) {
         const turn = this.findTurn(sessionPath);
         if (turn) {
           this.finishTurn(turn, `${turn.text}\n\n---\n⚠ ${n.message}`);
           this.active.delete(turn.chatKey);
+          this.emitStatus();
         }
       }
       return;
@@ -437,6 +487,7 @@ export class ChatBridgeCore {
       if (m?.stopReason === 'error') {
         this.finishTurn(turn, `${turn.text}\n\n---\n⚠ 生成出错`.trim());
         this.active.delete(turn.chatKey);
+        this.emitStatus();
       }
       return;
     }
@@ -491,7 +542,7 @@ export class ChatBridgeCore {
   }
 
   private scheduleFlush(turn: ActiveTurn): void {
-    if (!turn.supportsStream) return; // 非流式渠道：只累积，agent_end 一次发
+    if (!turn.supportsStream || turn.streamClosed) return; // 非流式渠道/stream 已提前收尾：只累积
     const now = Date.now();
     if (now - turn.lastFlushAt >= STREAM_FLUSH_MS) {
       this.flush(turn);
@@ -504,18 +555,48 @@ export class ChatBridgeCore {
     }, STREAM_FLUSH_MS - (now - turn.lastFlushAt));
   }
 
-  private flush(turn: ActiveTurn): void {
-    turn.lastFlushAt = Date.now();
-    // 流式窗口将尽 → 兜底收尾（0 = 不限窗口的渠道跳过）
-    if (this.streamWindowMs > 0 && Date.now() - turn.startedAt > this.streamWindowMs) {
-      this.finishTurn(turn, turn.text || '（超时）');
-      return;
-    }
-    const content = turn.text.slice(-STREAM_MAX_CHARS) || '…';
-    void this.transport?.respondStream(turn.reqId, turn.streamId, content, false).catch(() => undefined);
+  private streamExpired(turn: ActiveTurn): boolean {
+    return this.streamWindowMs > 0 && Date.now() - turn.startedAt > this.streamWindowMs;
   }
 
-  /** 回合收尾：流式渠道 finish=true；非流式渠道在这里发终稿。 */
+  private flush(turn: ActiveTurn): void {
+    turn.lastFlushAt = Date.now();
+    if (turn.finished || turn.streamClosed) return;
+    // 流式窗口将尽 → 先收尾 stream（0 = 不限窗口的渠道跳过）。回合本身不结束：
+    // 继续累积，agent_end 时终稿走 pushText（否则窗口后的输出——通常就是最终答案——全丢）
+    if (this.streamExpired(turn)) {
+      turn.streamClosed = true;
+      const note = '\n\n（已超出流式回复时限，完整结果将在完成后另行发送）';
+      const content = tailChars(turn.text, STREAM_MAX_CHARS - note.length) + note;
+      void this.transport?.respondStream(turn.reqId, turn.streamId, content, true).catch(() => undefined);
+      return;
+    }
+    this.sendStreamFrame(turn, tailChars(turn.text, STREAM_MAX_CHARS) || '…');
+  }
+
+  /** 发一帧中间流式内容。同一回合最多一帧在途：在途期间的刷新合并，回执后补发最新全文
+   *  （不等回执连发会在慢网络下无限积压，收尾帧被拖到窗口之外）。 */
+  private sendStreamFrame(turn: ActiveTurn, content: string): void {
+    if (turn.streamInflight) {
+      turn.flushPending = true;
+      return;
+    }
+    const transport = this.transport;
+    if (!transport) return;
+    turn.streamInflight = true;
+    void transport
+      .respondStream(turn.reqId, turn.streamId, content, false)
+      .catch(() => undefined)
+      .then(() => {
+        turn.streamInflight = false;
+        if (turn.flushPending && !turn.finished && !turn.streamClosed) {
+          turn.flushPending = false;
+          this.flush(turn);
+        }
+      });
+  }
+
+  /** 回合收尾：流式渠道 finish=true；非流式渠道在这里发终稿；流式窗口已过则主动推送终稿。 */
   finishTurn(turn: ActiveTurn, finalText: string): void {
     if (turn.finished) return;
     turn.finished = true;
@@ -523,14 +604,20 @@ export class ChatBridgeCore {
       clearTimeout(turn.flushTimer);
       turn.flushTimer = null;
     }
-    const content = finalText.slice(-STREAM_MAX_CHARS);
-    if (turn.supportsStream) {
-      void this.transport?.respondStream(turn.reqId, turn.streamId, content, true).catch(() => {
+    const transport = this.transport;
+    if (!transport) return;
+    const content = tailChars(finalText, STREAM_MAX_CHARS);
+    if (turn.supportsStream && (turn.streamClosed || this.streamExpired(turn))) {
+      void transport.pushText(turn.chatKey, turn.chatType, content).catch((e) => {
+        this.deps?.log(`[${this.deps.channelLabel}] push final failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    } else if (turn.supportsStream) {
+      void transport.respondStream(turn.reqId, turn.streamId, content, true).catch(() => {
         // 流式收尾失败：文本兜底
-        void this.transport?.respondText(turn.reqId, content).catch(() => undefined);
+        void transport.respondText(turn.reqId, content).catch(() => undefined);
       });
     } else {
-      void this.transport?.respondText(turn.reqId, content).catch(() => undefined);
+      void transport.respondText(turn.reqId, content).catch(() => undefined);
     }
   }
 

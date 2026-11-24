@@ -1,6 +1,7 @@
 import { spawn, execSync } from 'child_process';
 import * as path from 'path';
 import * as readline from 'readline';
+import { fileURLToPath } from 'url';
 function resolveOmp() {
   if (process.env.OMP_PATH) return process.env.OMP_PATH;
   try {
@@ -12,7 +13,8 @@ function resolveOmp() {
   }
 }
 const OMP = resolveOmp();
-const CWD = process.env.OMP_CWD || path.resolve(__dirname, '..');
+// ESM（.mjs）里没有 __dirname，需由 import.meta.url 推导
+const CWD = process.env.OMP_CWD || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const child = spawn(OMP, ['--mode','rpc-ui','--approval-mode','write'], { cwd: CWD, stdio:['pipe','pipe','pipe'], env:{...process.env, NO_COLOR:'1'} });
 child.stderr.on('data', ()=>{});
 const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });

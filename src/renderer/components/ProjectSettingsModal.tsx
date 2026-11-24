@@ -49,7 +49,10 @@ export const ProjectSettingsModal: React.FC<{
 }> = ({ ws, onClose }) => {
   const [activeSlot, setActiveSlot] = useState<FileSlot>(SLOTS[0]!);
   const [contents, setContents] = useState<Record<string, string>>({});
-  const [draft, setDraft] = useState('');
+  // 按文件分别保存草稿：切换文件 tab 不丢未保存的编辑（未编辑过的文件回退到磁盘内容）
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draft = drafts[activeSlot.key] ?? contents[activeSlot.key] ?? '';
+  const setDraft = (v: string) => setDrafts((prev) => ({ ...prev, [activeSlot.key]: v }));
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -66,17 +69,15 @@ export const ProjectSettingsModal: React.FC<{
       const map: Record<string, string> = {};
       SLOTS.forEach((s, i) => { map[s.key] = results[i] ?? ''; });
       setContents(map);
-      setDraft(map[activeSlot.key] ?? '');
+      setDrafts({});
       setLoaded(true);
     });
     return () => { cancelled = true; };
   }, [dirPath]);
 
-  // 切换 tab 时同步草稿
   const switchSlot = useCallback((slot: FileSlot) => {
     setActiveSlot(slot);
-    setDraft(contents[slot.key] ?? '');
-  }, [contents]);
+  }, []);
 
   const handleSave = async () => {
     setSaving(true);
@@ -144,6 +145,7 @@ export const ProjectSettingsModal: React.FC<{
             <textarea
               className="proj-editor"
               value={loaded ? draft : '加载中…'}
+              readOnly={!loaded}
               onChange={(e) => setDraft(e.target.value)}
               placeholder={`在此编辑 ${activeSlot.label} 内容…\n留空保存 = 删除该文件（恢复默认行为）`}
               spellCheck={false}

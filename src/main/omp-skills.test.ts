@@ -91,4 +91,41 @@ describe('uninstallSkill', () => {
       // noop
     }
   });
+
+  it('同名技能存在于多个根：全部移入 trash，不会因 trash 内同名目录冲突而半途失败', async () => {
+    const a = path.join(tmpRoot, '.agents', 'skills', 'dup');
+    const b = path.join(tmpRoot, '.claude', 'skills', 'dup');
+    for (const d of [a, b]) {
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, 'SKILL.md'), '---\nname: dup\n---\n', 'utf8');
+    }
+    const res = await uninstallSkill('dup');
+    expect(res.error).toBeUndefined();
+    expect(res.ok).toBe(true);
+    expect(res.moved).toHaveLength(2);
+    expect(fs.existsSync(a)).toBe(false);
+    expect(fs.existsSync(b)).toBe(false);
+    expect((await readSkillConfig()).ignoredSkills).toContain('dup');
+  });
+});
+
+describe('listSkills 扫描边界', () => {
+  it('符号链接 / junction 形式安装的技能目录也能被列出', async () => {
+    const real = path.join(tmpRoot, 'repo-skills', 'linked');
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, 'SKILL.md'), '---\nname: linked\ndescription: via link\n---\n', 'utf8');
+    const root = path.join(tmpRoot, '.codex', 'skills');
+    fs.mkdirSync(root, { recursive: true });
+    fs.symlinkSync(real, path.join(root, 'linked'), 'junction');
+    const list = await listSkills();
+    expect(list.find((s) => s.name === 'linked')?.description).toBe('via link');
+  });
+
+  it('带 UTF-8 BOM 的 SKILL.md 也能解析 front-matter', async () => {
+    const d = path.join(tmpRoot, '.agents', 'skills', 'bom');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'SKILL.md'), '\uFEFF---\nname: bom\ndescription: has bom\n---\n# Body\n', 'utf8');
+    const list = await listSkills();
+    expect(list.find((s) => s.name === 'bom')?.description).toBe('has bom');
+  });
 });

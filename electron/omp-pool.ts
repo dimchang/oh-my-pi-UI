@@ -34,10 +34,18 @@ export interface PoolEvents {
   onExit(sessionPath: string, code: number | null): void;
   onStderr(sessionPath: string, line: string): void;
   onLog(line: string): void;
+  /** renameKey 时 newKey 下原有的另一个进程被回收（不推 onExit，渲染层已接管 newKey 的状态）。
+   *  消息桥据此收尾挂在被回收进程上的回合，否则该回合会错收迁移过来的会话的输出。 */
+  onReplaced?(sessionPath: string): void;
 }
 
 const DEFAULT_MAX_POOL = 5;
 const SPAWN_TIMEOUT_MS = 30_000;
+
+/** 尚未落盘的临时会话 key：渲染层新建（__new_）与企微/飞书桥自动建会话（__wecom_/__feishu_）。 */
+function isTempKey(key: string): boolean {
+  return /^__(new|wecom|feishu)_/.test(key);
+}
 
 /** 比较两组 hook 路径是否等价（忽略顺序与重复）。 */
 function hooksEqual(a: string[] | undefined, b: string[] | undefined): boolean {
@@ -52,28 +60,36 @@ export class OmpProcessPool {
   private entries = new Map<string, PoolEntry>();
   /** 同一 sessionPath 正在 spawn 时复用同一个 Promise，避免重复拉起。 */
   private spawning = new Map<string, Promise<PoolEntry>>();
-  /** 有未应答 UI 请求（工具确认 / 选择 / 输入弹窗等）的会话 → refcount。
+  /** 有未应答 UI 请求（工具确认 / 选择 / 输入弹窗等）的会话 → 未应答请求 id 集合。
    *  LRU 淘汰时跳过 pinned 会话，避免杀掉"正在等用户确认"的进程
-   *  （那种进程不输出帧，lastActiveAt 很旧，会被误判为最闲而被淘汰）。 */
-  private pinned = new Map<string, number>();
+   *  （那种进程不输出帧，lastActiveAt 很旧，会被误判为最闲而被淘汰）。
+   *  按请求 id 记账而非 refcount：被 omp cancel 撤销的请求不会再有应答，必须能按 id 单独释放；
+   *  重复/未知 id 的释放为 no-op，不会误减其他请求的 pin。 */
+  private pinned = new Map<string, Set<string>>();
   /** tempKey → 该会话已落盘的真实 .jsonl 路径（omp get_state.sessionFile）。
    *  acquire(tempKey) 在进程死掉后重拉时用它带 -r 续接，杜绝对 tempKey 全新
   spawn 裂出第二个会话（2026-09-14 bet_zp 事故：进程被杀后 ensureOnline(tempKey)
   spawn 出 01a0a048，与 01a0a046 内容分裂）。renameKey 时同步清除。 */
   private tempSessionFiles = new Map<string, string>();
+  /** spawning 中的 entry → 中止其 spawn Promise 的回调。evict/killAll 时立即 reject，
+   *  否则等待方要挂到 30s 超时，且超时回调按 key 淘汰会误伤同 key 后来新建的 entry。 */
+  private spawnAborts = new WeakMap<PoolEntry, (err: Error) => void>();
 
-  /** 标记某会话有未应答 UI 请求（防止被 LRU 淘汰）。可重复调用（refcount）。 */
-  pin(sessionPath: string): void {
-    this.pinned.set(sessionPath, (this.pinned.get(sessionPath) ?? 0) + 1);
+  /** 标记某会话有一个未应答 UI 请求（防止被 LRU 淘汰）。 */
+  pin(sessionPath: string, requestId: string): void {
+    let ids = this.pinned.get(sessionPath);
+    if (!ids) {
+      ids = new Set();
+      this.pinned.set(sessionPath, ids);
+    }
+    ids.add(requestId);
   }
-  /** 解除一个 UI 请求的 pin（应答后调用）。refcount 归零才真正释放。
-   *  幂等：若已不在 pinned 表中（已被 onExit 释放过），直接忽略，避免计数 -1（issue 23）。 */
-  unpin(sessionPath: string): void {
-    const cur = this.pinned.get(sessionPath);
-    if (cur === undefined) return; // 已释放（如进程已退出）→ 幂等 no-op
-    const n = cur - 1;
-    if (n <= 0) this.pinned.delete(sessionPath);
-    else this.pinned.set(sessionPath, n);
+  /** 解除一个 UI 请求的 pin（应答或被 cancel 后调用）。该会话所有请求都释放才真正解除。
+   *  幂等：未知 id / 已释放（如进程已退出）直接忽略（issue 23）。 */
+  unpin(sessionPath: string, requestId: string): void {
+    const ids = this.pinned.get(sessionPath);
+    if (!ids || !ids.delete(requestId)) return;
+    if (ids.size === 0) this.pinned.delete(sessionPath);
   }
 
   constructor(
@@ -122,7 +138,7 @@ export class OmpProcessPool {
    *  - 已 online → 直接返回（更新 lastActiveAt）。
    *  - 池满 → 先 LRU 淘汰最久未活跃的 idle 进程。
    *  - spawn 带 -c：resume 该 sessionPath 的历史（用户切回旧会话续接）。 */
-  async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'write', hooks?: string[]): Promise<PoolEntry> {
+  async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'yolo', hooks?: string[]): Promise<PoolEntry> {
     const existing = this.entries.get(sessionPath);
     if (existing && existing.status === 'online') {
       // hook 配置变更后必须重起进程，否则老进程不带新 --hook（issue: 导入钩子后不生效）。
@@ -148,13 +164,13 @@ export class OmpProcessPool {
     // （tempSessionFiles 有记忆）→ 同样带 -r 续接，而不是全新 spawn 出第二个 .jsonl。
     // resume 判定已下移到 spawnEntry 内部用异步 stat 完成（issue 7），这里不再同步 existsSync，
     // 以保证容量检查 → spawning 注册之间不插入 await（维持 issue 1 的并发安全）。
-    const knownFile = sessionPath.startsWith('__new_') ? this.tempSessionFiles.get(sessionPath) : undefined;
+    const knownFile = isTempKey(sessionPath) ? this.tempSessionFiles.get(sessionPath) : undefined;
     const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, knownFile, undefined, hooks);
     this.spawning.set(sessionPath, p);
     try {
       return await p;
     } finally {
-      this.spawning.delete(sessionPath);
+      if (this.spawning.get(sessionPath) === p) this.spawning.delete(sessionPath);
     }
   }
 
@@ -162,7 +178,7 @@ export class OmpProcessPool {
    *  解析真实 path 再 renameKey(tempKey, realPath)。tempKey 用临时占位。
    *  systemPrompt 非空时通过 --append-system-prompt 注入到该新会话。
    *  hooks 非空时逐个通过 --hook=<path> 注入（全局钩子）。 */
-  async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'write', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
+  async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'yolo', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
     const pending = this.spawning.get(tempKey);
     if (pending) return pending;
     if (this.inflightCount() >= this.maxPool) {
@@ -175,7 +191,7 @@ export class OmpProcessPool {
     try {
       return await p;
     } finally {
-      this.spawning.delete(tempKey);
+      if (this.spawning.get(tempKey) === p) this.spawning.delete(tempKey);
     }
   }
 
@@ -184,6 +200,20 @@ export class OmpProcessPool {
     if (oldKey === newKey) return this.entries.get(oldKey);
     const e = this.entries.get(oldKey);
     if (!e) return undefined;
+    const clash = this.entries.get(newKey);
+    if (clash && clash !== e) {
+      // newKey 下已有另一个进程（如迁移前用户从侧栏又打开了同一真实会话）：直接覆盖会让它
+      // 变成池外孤儿进程（killAll 杀不到、与迁移后的进程同写一个 .jsonl），先静默回收。
+      // 不推 onExit：渲染层已把 newKey 的状态换成迁移过来的会话。
+      this.events.onLog(`[pool] renameKey replaces existing entry for ${newKey}`);
+      clash.status = 'evicted';
+      this.spawnAborts.get(clash)?.(new Error(`omp spawn aborted (replaced by renameKey) for ${newKey}`));
+      clash.router.rejectAll('replaced by renameKey');
+      try { clash.proc.kill(); } catch { /* noop */ }
+      this.pinned.delete(newKey);
+      this.entries.delete(newKey);
+      this.events.onReplaced?.(newKey);
+    }
     this.entries.delete(oldKey);
     e.sessionPath = newKey;
     this.entries.set(newKey, e);
@@ -222,6 +252,9 @@ export class OmpProcessPool {
     if (!e) return;
     this.pinned.delete(sessionPath); // 释放可能的 pin（被显式 evict 的会话不再受保护）
     e.status = 'evicted';
+    // 仍在 spawning（proc 可能尚未创建，kill 无效）：立即 reject 其 spawn Promise；
+    // spawnEntry 的异步流程看到 status='evicted' 后不再拉起 / 会补杀进程。
+    this.spawnAborts.get(e)?.(new Error(`omp spawn aborted (evicted) for ${sessionPath}`));
     e.router.rejectAll('evicted by pool');
     try { e.proc.kill(); } catch { /* noop */ }
     this.entries.delete(sessionPath);
@@ -254,11 +287,13 @@ export class OmpProcessPool {
   killAll(): void {
     for (const e of this.entries.values()) {
       e.status = 'evicted';
+      this.spawnAborts.get(e)?.(new Error('app quitting'));
       e.router.rejectAll('app quitting');
       try { e.proc.kill(true); } catch { /* noop */ }
     }
     this.entries.clear();
     this.spawning.clear();
+    this.pinned.clear();
   }
 
   private spawnEntry(
@@ -281,7 +316,9 @@ export class OmpProcessPool {
       const timeout = setTimeout(() => {
         if (!settled) {
           settled = true;
-          this.evict(sessionPath);
+          // 只淘汰本次 spawn 自己的 entry：按初始 key 淘汰可能误伤同 key 后来新建的 entry。
+          const own = ctx.entry;
+          if (own && this.entries.get(own.sessionPath) === own) this.evict(own.sessionPath);
           reject(new Error(`omp spawn timeout (${SPAWN_TIMEOUT_MS}ms) for ${sessionPath}`));
         }
       }, SPAWN_TIMEOUT_MS);
@@ -306,6 +343,14 @@ export class OmpProcessPool {
         status: 'spawning',
       };
       ctx.entry = entry;
+      /** 期间是否已被 evict/killAll（用函数读取，避免 TS 把 await 前的判断窄化延续到 await 之后）。 */
+      const isEvicted = (): boolean => entry.status === 'evicted';
+      this.spawnAborts.set(entry, (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(err);
+      });
       // 同步注册 spawning entry（issue 1 并发安全：必须在任意 await 之前完成，
       // 保证并发 acquire 能通过 inflightCount 互相感知，不会同时越过容量上限）。
       this.entries.set(sessionPath, entry);
@@ -343,6 +388,8 @@ export class OmpProcessPool {
               resolvedResume = undefined;
             }
           }
+          // 异步 stat 期间可能已被 evict/killAll：不再拉起进程，否则成为池外孤儿进程。
+          if (isEvicted()) return;
           const proc = new OmpProcess(
             { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession: resolvedResume, systemPrompt, hooks },
             {
@@ -359,11 +406,11 @@ export class OmpProcessPool {
                 // temp 会话：ready 后立即记下 omp 分配的真实落盘路径（spawn 时即已定，
                 // 首条消息后开始流式写入）。之后进程若被杀/淘汰，acquire(tempKey)
                 // 凭这条记忆带 -r 续接，不会全新 spawn 裂出第二个会话。
-                if (sessionPath.startsWith('__new_')) {
+                if (isTempKey(sessionPath)) {
                   const key = sessionPath;
                   void ctx.router!.send({ type: 'get_state' }, 10_000).then((r) => {
                     const sf = (r.data as { sessionFile?: unknown } | undefined)?.sessionFile;
-                    if (r.success && typeof sf === 'string' && sf && !sf.startsWith('__new_')) {
+                    if (r.success && typeof sf === 'string' && sf && !isTempKey(sf)) {
                       // entry 可能已被 renameKey 迁走：只在仍是原 temp key 时记录
                       if (ctx.entry && ctx.entry.sessionPath === key) this.tempSessionFiles.set(key, sf);
                     }
@@ -372,12 +419,18 @@ export class OmpProcessPool {
               },
               onFrame: (frame) => ctx.router?.dispatch(frame),
               onExit: (code) => {
-                if (ctx.entry) {
-                  ctx.entry.status = 'evicted';
+                const key = currentSessionKey();
+                // 只清理仍登记在池中的本 entry：同 key 下可能已是后来新建的 entry，不能误删 / 误报。
+                const isCurrent = !!ctx.entry && this.entries.get(key) === ctx.entry;
+                if (ctx.entry) ctx.entry.status = 'evicted';
+                if (isCurrent) {
                   // 进程退出（无论就绪前还是之后）都必须从 entries 移除，否则会残留
                   // status='evicted' 的僵尸 entry（issue 77）。注意用 entry 当前的
                   // sessionPath（renameKey 后已更新），确保删对 key。
-                  this.entries.delete(ctx.entry.sessionPath);
+                  this.entries.delete(key);
+                  // 进程已死，其未应答 UI 请求随之失效：整体释放 pin（与 evict 一致）。
+                  // main.ts 的 unpin 只减 1，refcount>1 时会残留，同 key 重拉的新进程将永远被视为 pinned。
+                  this.pinned.delete(key);
                 }
                 ctx.router?.rejectAll(`omp exited (code=${code})`);
                 if (!settled) {
@@ -385,7 +438,7 @@ export class OmpProcessPool {
                   clearTimeout(timeout);
                   reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
                 }
-                this.events.onExit(currentSessionKey(), code);
+                if (isCurrent) this.events.onExit(key, code);
               },
               onStderr: (line) => this.events.onStderr(currentSessionKey(), line),
             },
@@ -394,6 +447,8 @@ export class OmpProcessPool {
           entry.proc = proc;
           // issue 7：start() 已改为 async（内部 mkdir 异步），这里 await。
           await proc.start();
+          // start() 内部 await 期间被 evict/killAll 时 proc.kill() 是 no-op（子进程尚未创建），这里补杀。
+          if (isEvicted()) proc.kill();
         } catch (e) {
           if (!settled) {
             settled = true;

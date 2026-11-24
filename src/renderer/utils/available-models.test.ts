@@ -5,6 +5,7 @@
  * 而不是把残缺的 RPC 结果原样展示（UI 全部 0/0）。
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { mergeModelFields, mergeProviderScoped } from './available-models';
 
 const getAvailableModels = vi.fn();
 
@@ -62,8 +63,9 @@ describe('fetchAvailableModels 合并链路', () => {
     const { fetchAvailableModels } = await loadFresh();
     const res = await fetchAvailableModels('s1');
     expect(fetched).toEqual(['pull']); // 缺失 provider 触发了直拉
+    // 顺序规则：本次新鲜结果（RPC → 直拉补齐）在前，yml 显式 models 在后
     expect(res.models.map((m: { provider: string; id: string }) => `${m.provider}/${m.id}`))
-      .toEqual(['builtin/gpt', 'gemini/gemini-a', 'deepseek/deepseek-v4-flash']);
+      .toEqual(['builtin/gpt', 'deepseek/deepseek-v4-flash', 'gemini/gemini-a']);
     expect(res.fallback).toBe(false);
   });
 
@@ -110,5 +112,92 @@ describe('fetchAvailableModels 合并链路', () => {
     const res = await fetchAvailableModels('s1', { cacheOnly: true });
     expect(rpcCalls).toBe(0);
     expect(res.models.map((m: { provider: string }) => m.provider).sort()).toEqual(['cache', 'gemini']);
+  });
+});
+
+describe('mergeProviderScoped — 幽灵模型淘汰', () => {
+  it('上游删掉的 id 会消失（缓存 60 条 vs 上游 49 条的真实场景）', () => {
+    const cached = [
+      { provider: 'LocalWBAPI', id: 'cn:hy4free', name: 'Hy4' },
+      { provider: 'LocalWBAPI', id: 'cn:hy4-preview-dev', name: 'Hy4 preview' },
+      { provider: 'LocalWBAPI', id: 'cn:glm-5.1', name: 'GLM-5.1' },
+    ];
+    const fresh = [
+      { provider: 'LocalWBAPI', id: 'cn:hy4free', name: 'Hy4' },
+      { provider: 'LocalWBAPI', id: 'cn:hy4std', name: 'Hy4' },
+    ];
+    const out = mergeProviderScoped(cached, fresh);
+    expect(out.map((m) => m.id)).toEqual(['cn:hy4free', 'cn:hy4std']);
+  });
+
+  it('本次没拿到数据的 provider → 旧缓存原样保留（403/超时不误删）', () => {
+    const cached = [
+      { provider: 'openrouter', id: 'a/b', name: 'AB' },
+      { provider: 'xiaomi', id: 'mimo', name: 'MiMo' },
+    ];
+    const fresh = [{ provider: 'LocalWBAPI', id: 'cn:auto', name: 'Auto' }];
+    const out = mergeProviderScoped(cached, fresh);
+    expect(out.map((m) => `${m.provider}/${m.id}`))
+      .toEqual(['LocalWBAPI/cn:auto', 'openrouter/a/b', 'xiaomi/mimo']);
+  });
+
+  it('yml 显式 models 只做并集，不替换同 provider 的其它模型', () => {
+    const fresh = [
+      { provider: 'deepseek', id: 'm1' },
+      { provider: 'deepseek', id: 'm2' },
+    ];
+    const extra = [{ provider: 'deepseek', id: 'm3', name: 'M3' }];
+    const out = mergeProviderScoped([], fresh, extra);
+    expect(out.map((m) => m.id)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('prune=true：权威目录里没有、yml 也没声明的 provider → 淘汰（删除提供商后不残留）', () => {
+    const cached = [
+      { provider: 'deleted-provider', id: 'x' },
+      { provider: 'LocalWBAPI', id: 'cn:auto' },
+    ];
+    const fresh = [{ provider: 'LocalWBAPI', id: 'cn:auto' }];
+    const out = mergeProviderScoped(cached, fresh, [], { pruneMissingProviders: true });
+    expect(out.map((m) => `${m.provider}/${m.id}`)).toEqual(['LocalWBAPI/cn:auto']);
+  });
+
+  it('prune=true 但 provider 在 yml 里声明过（只配了 discovery）→ 保留缓存', () => {
+    const cached = [{ provider: 'gemini-balancer', id: 'g1' }];
+    const out = mergeProviderScoped(cached, [{ provider: 'other', id: 'o1' }], [], {
+      pruneMissingProviders: true,
+      keepProviders: ['gemini-balancer'],
+    });
+    expect(out.map((m) => `${m.provider}/${m.id}`)).toEqual(['other/o1', 'gemini-balancer/g1']);
+  });
+});
+
+describe('mergeModelFields — 信息只增不减', () => {
+  it('新结果 name 只是 id 占位时，沿用旧的真名 / ctx / 倍率', () => {
+    const prev = {
+      provider: 'LocalWBAPI', id: 'cn:hy4free', name: 'Hy4',
+      contextWindow: 960000, maxTokens: 64000, credits: 'x0.00',
+    };
+    // omp RPC 形态：name === id，且不带 credits
+    const fresh = { provider: 'LocalWBAPI', id: 'cn:hy4free', name: 'cn:hy4free', contextWindow: 960000 };
+    const out = mergeModelFields(fresh, prev);
+    expect(out.name).toBe('Hy4');
+    expect(out.contextWindow).toBe(960000);
+    expect(out.maxTokens).toBe(64000);
+    expect(out.credits).toBe('x0.00');
+  });
+
+  it('新结果带了真名 → 覆盖旧名（不固执保留缓存）', () => {
+    const prev = { provider: 'p', id: 'x', name: 'x', contextWindow: 8000 };
+    const fresh = { provider: 'p', id: 'x', name: 'X Model', contextWindow: 32000 };
+    expect(mergeModelFields(fresh, prev).name).toBe('X Model');
+    expect(mergeModelFields(fresh, prev).contextWindow).toBe(32000);
+  });
+
+  it('新结果缺 ctx → 保留旧值，不写成 0/undefined 覆盖', () => {
+    const prev = { provider: 'p', id: 'x', name: 'X', contextWindow: 192000, credits: 'x0.29' };
+    const fresh = { provider: 'p', id: 'x', name: 'X' };
+    const out = mergeModelFields(fresh, prev);
+    expect(out.contextWindow).toBe(192000);
+    expect(out.credits).toBe('x0.29');
   });
 });

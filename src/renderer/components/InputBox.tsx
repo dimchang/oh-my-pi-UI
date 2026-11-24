@@ -69,6 +69,9 @@ const ConnStatusPill: React.FC = () => {
   );
 };
 
+/** 空附件数组常量：store 无草稿时返回同一引用，避免每次 selector 求值产生新数组导致重渲染风暴。 */
+const EMPTY_ATTACHMENTS: Attachment[] = [];
+
 export const InputBox: React.FC<{
   onSend: (text: string, attachments?: Attachment[]) => void;
   onGuide: (text: string, attachments?: Attachment[]) => void;
@@ -76,7 +79,31 @@ export const InputBox: React.FC<{
   onAbort: () => void;
   onChangeApprovalMode: (mode: ApprovalMode) => void;
 }> = ({ onSend, onGuide, onQueue, onAbort, onChangeApprovalMode }) => {
-  const [draft, setDraft] = useState('');
+  // 草稿（文本 + 待发附件）**按会话隔离**，存在 store 里而不是组件本地 state：
+  // InputBox 在整个应用生命周期只挂载一次，本地 state 会在切会话时把 A 会话没发出去的文字
+  // 带进 B 会话（2026-10-25 bug）。sessionPath 为 key，切回 A 时原样恢复。
+  const sessionPath = useApp((s) => s.currentSessionPath ?? '');
+  const draft = useApp((s) => (sessionPath ? s.composerDrafts[sessionPath]?.text ?? '' : ''));
+  const attachments = useApp((s) =>
+    sessionPath ? s.composerDrafts[sessionPath]?.attachments : undefined,
+  ) ?? EMPTY_ATTACHMENTS;
+  const setDraft = React.useCallback((v: string) => {
+    // 写入点一律取 store 里的当前会话指针（事件触发时用户看到的就是它），
+    // 不用闭包里的 sessionPath —— 避免切会话瞬间的写串。
+    const sp = useApp.getState().currentSessionPath;
+    if (sp) useApp.getState().setComposerText(sp, v);
+  }, []);
+  const setAttachments = React.useCallback(
+    (updater: Attachment[] | ((prev: Attachment[]) => Attachment[])) => {
+      const st = useApp.getState();
+      const sp = st.currentSessionPath;
+      if (!sp) return;
+      const prev = st.composerDrafts[sp]?.attachments ?? EMPTY_ATTACHMENTS;
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      st.setComposerAttachments(sp, next);
+    },
+    [],
+  );
   const [selIdx, setSelIdx] = useState(0);
   const [focused, setFocused] = useState(false);
   const isStreaming = useApp((s) => s.isStreaming);
@@ -89,7 +116,6 @@ export const InputBox: React.FC<{
   // Shift+Enter 自动取反
   const inputBehavior = useApp((s) => s.inputBehavior ?? 'guide');
   const cwd = useApp((s) => s.currentWorkspace()?.cwd ?? '');
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // 拖拽高亮状态：dragDepth 计数器避免子元素触发 dragleave 导致高亮闪烁/误复位
   const dragDepthRef = useRef(0);
@@ -97,21 +123,15 @@ export const InputBox: React.FC<{
   // 提交防重复：onSend 把状态切到 streaming 有一帧延迟，期间按两次 Enter 会重复发送
   const submittingRef = useRef(false);
 
-  // 一次性输入回填（分叉等场景）：draftInput 非空时填入 textarea 并立即消费
+  // 一次性输入回填（分叉等场景）：draftInput 非空时填入 textarea 并立即消费。
+  // 高度由 useEffect([draft]) 的 autoGrow 统一处理，这里只负责 focus。
   useEffect(() => {
     if (draftInput !== undefined && draftInput !== '') {
       setDraft(draftInput);
       setDraftInput(''); // consume — 置空避免重复填入
-      requestAnimationFrame(() => {
-        const ta = taRef.current;
-        if (ta) {
-          ta.style.height = 'auto';
-          ta.style.height = Math.min(ta.scrollHeight, 320) + 'px';
-          ta.focus();
-        }
-      });
+      requestAnimationFrame(() => taRef.current?.focus());
     }
-  }, [draftInput, setDraftInput]);
+  }, [draftInput, setDraftInput, setDraft]);
 
   // 兜底：用户输入 / 但命令列表为空时，主动拉取一次（防止 onReady 时拉取失败导致永远无命令）
   const cmdFetchedRef = useRef(false);
@@ -151,13 +171,22 @@ export const InputBox: React.FC<{
     return { q, list };
   }, [draft, slashCommands, focused]);
 
-  const autoGrow = () => {
+  // 输入框动态高度：初始 2 行，随内容向上扩展；上限 = min(12 行, 屏幕高度 1/3)，超出后内部滚动
+  const maxInputHeight = () => {
+    const lineH = 21; // 14px 字号 × 1.5 行高，与 styles.css 保持一致
+    return Math.min(lineH * 12, Math.floor(window.innerHeight / 3));
+  };  const autoGrow = () => {
     const ta = taRef.current;
-    if (ta) {
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 320) + 'px';
-    }
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, maxInputHeight()) + 'px';
   };
+  // 高度跟随 draft 值驱动（而非 onChange 里同步测量）：effect 执行时 React 已把新值写入 DOM，
+  // scrollHeight 测量准确。修复 onChange 时序 bug——整段粘贴/回填长文本时输入框不扩展。
+  // 副作用：提交清空 draft 后也走这里，自动缩回初始 2 行。
+  useEffect(() => {
+    autoGrow();
+  }, [draft]);
 
   // 附件：从文件选择框添加（项目内或任意外部文件），按路径去重
   const onPickFiles = async () => {
@@ -204,13 +233,15 @@ export const InputBox: React.FC<{
     const imageItems = Array.from(items).filter((it) => it.type.startsWith('image/'));
     if (imageItems.length === 0) return;
     e.preventDefault(); // 同步拦截，避免图片被塞进文本框
+    // DataTransferItem 只在事件同步派发期间可读：首个 await 之后 getAsFile() 返回 null、
+    // type 变空串，必须先同步取出全部文件与类型（否则多图只存第一张、扩展名恒为 png）
+    const files = imageItems.map((it) => ({ blob: it.getAsFile(), type: it.type }));
     const MAX = 10 * 1024 * 1024;
-    for (const item of imageItems) {
-      const blob = item.getAsFile();
+    for (const { blob, type } of files) {
       if (!blob) continue;
       if (blob.size > MAX) { console.warn('粘贴的图片超过 10MB，已忽略'); continue; }
       const buf = await blob.arrayBuffer();
-      const ext = (item.type.split('/')[1] || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const ext = (type.split('/')[1] || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
       await addImageAttachment(buf, ext);
     }
   };
@@ -256,7 +287,8 @@ export const InputBox: React.FC<{
    */
   const submit = (modeOverride?: 'send' | 'guide' | 'queue') => {
     const text = draft.trim();
-    if (!text || !ready || isAborting || submittingRef.current) return;
+    // 纯附件（正文为空）也允许发送，与发送按钮的 hasInput 判定一致
+    if ((!text && attachments.length === 0) || !ready || isAborting || submittingRef.current) return;
     // P0-2 双保险（2026-09-14）：新建会话 spawn 在途期间冻结输入，防止消息在指针
     // 切换的任何遗漏时序分支里被投给旧会话。草稿保留在输入框，稍后可直接重发。
     if (useApp.getState().creatingSession) {
@@ -272,9 +304,9 @@ export const InputBox: React.FC<{
       mode = inputBehavior;
     }
     submittingRef.current = true;
-    setDraft('');
-    setAttachments([]); // 清空待发送附件（已随消息一并发出）
-    requestAnimationFrame(autoGrow);
+    // 清空的是**本会话**草稿（已随消息一并发出）；其它会话的草稿不受影响
+    const spAtSubmit = useApp.getState().currentSessionPath;
+    if (spAtSubmit) useApp.getState().clearComposerDraft(spAtSubmit);
     if (mode === 'guide') onGuide(text, attachments);
     else if (mode === 'queue') onQueue(text, attachments);
     else onSend(text, attachments);
@@ -283,6 +315,8 @@ export const InputBox: React.FC<{
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 输入法组字中（中文输入法按 Enter 上屏 / Esc 取消组字）不能触发发送、补全或中止
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (slashMatch && slashMatch.list.length > 0) {
       if (e.key === 'ArrowDown') { e.preventDefault(); setSelIdx((i) => (i + 1) % slashMatch.list.length); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); setSelIdx((i) => (i - 1 + slashMatch.list.length) % slashMatch.list.length); return; }
@@ -297,7 +331,6 @@ export const InputBox: React.FC<{
           } else {
             // 无参数命令：补全后直接提交
             setDraft('');
-            requestAnimationFrame(autoGrow);
             onSend('/' + c.name);
           }
         }
@@ -349,7 +382,6 @@ export const InputBox: React.FC<{
                     taRef.current?.focus();
                   } else {
                     setDraft('');
-                    requestAnimationFrame(autoGrow);
                     onSend('/' + c.name);
                   }
                 }}
@@ -380,7 +412,7 @@ export const InputBox: React.FC<{
             rows={2}
             value={draft}
             placeholder={placeholder}
-            onChange={(e) => { setDraft(e.target.value); setSelIdx(0); autoGrow(); }}
+            onChange={(e) => { setDraft(e.target.value); setSelIdx(0); }}
             onFocus={() => {
               setFocused(true);
               // 仅浏览会话时进程未拉起：聚焦输入框即表示要开始对话，按需懒拉起

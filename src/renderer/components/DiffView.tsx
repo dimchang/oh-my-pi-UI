@@ -39,14 +39,16 @@ export function extractDiff(
         }
       }
     }
-    // 三级：嵌套 result/output/data
-    for (const key of ['result', 'output', 'data']) {
+    // 三级：嵌套 result/output/data/details（omp 的 edit 工具把 diff 放在 result.details.diff）
+    for (const key of ['result', 'output', 'data', 'details']) {
       const nested = extractDiff(r[key], depth + 1, visited);
       if (nested) return nested;
     }
   }
   return null;
 }
+
+const FILE_CHANGE_TOOLS = new Set(['write', 'edit', 'ast_edit', 'multiedit', 'multi_edit', 'apply_patch']);
 
 /**
  * 从 Write/Edit 工具的 result + args 中提取变更摘要。
@@ -59,6 +61,8 @@ export function extractChangeSummary(
   args: unknown,
 ): string | null {
   if (!result) return null;
+  // 只对改文件的工具生成摘要：read/bash/grep 等的输出不是"变更"，不能进 Diff 面板
+  if (!FILE_CHANGE_TOOLS.has(toolName.toLowerCase())) return null;
 
   // 尝试从各种 result 形态中提取文本摘要
   let summaryText: string | null = null;

@@ -77,6 +77,14 @@ describe('writeProvider apiKey 保留语义', () => {
     expect(cfg.providers?.other?.apiKey).toBe('sk-other');
     expect(cfg.providers?.other?.baseUrl).toBe('https://example.com/v1');
   });
+
+  it('原子写 rename 失败时不在配置目录残留 .tmp- 临时文件', async () => {
+    const yml = path.join(agentDir, 'models.yml');
+    fs.rmSync(yml, { force: true });
+    fs.mkdirSync(yml); // 目标被同名目录占住 → rename 必然失败
+    await expect(writeProvider('x', { baseUrl: 'https://e.com', api: 'openai-completions', apiKey: 'k' })).rejects.toThrow();
+    expect(fs.readdirSync(agentDir).filter((f) => f.includes('.tmp-'))).toEqual([]);
+  });
 });
 
 describe('models.yml 往返保留（omp 18.1.0→18.3.2 §3 P0）', () => {

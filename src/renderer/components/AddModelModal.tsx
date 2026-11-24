@@ -23,6 +23,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 import { modelKey } from '../utils/path-key';
+import { modelDisplayNames } from '../utils/model-display';
 import { reloadCurrentSession } from '../utils/reload-session';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpProviderConfig, OmpModelDefinition } from '../../shared/ipc-channels';
@@ -40,6 +41,8 @@ interface ProviderPreset {
   authUrl?: string;
   hint: string;
   cat: 'popular' | 'chinese' | 'local' | 'other';
+  /** 本地服务（api 需 Key 的协议但服务端不校验）：API Key 可留空，保存为 auth: none */
+  keyOptional?: boolean;
 }
 
 const PRESET_GROUPS: { label: string; cat: ProviderPreset['cat']; items: ProviderPreset[] }[] = [
@@ -84,8 +87,8 @@ const PRESET_GROUPS: { label: string; cat: ProviderPreset['cat']; items: Provide
     cat: 'local',
     items: [
       { id: 'ollama', name: 'Ollama (本地)', baseUrl: 'http://127.0.0.1:11434', api: 'ollama-chat', authUrl: '', hint: '（本地服务可留空）', cat: 'local' },
-      { id: 'lm-studio', name: 'LM Studio', baseUrl: 'http://127.0.0.1:1234/v1', api: 'openai-completions', authUrl: '', hint: '（本地服务可留空）', cat: 'local' },
-      { id: 'vllm', name: 'vLLM', baseUrl: 'http://127.0.0.1:8000/v1', api: 'openai-completions', authUrl: '', hint: '（本地服务可留空）', cat: 'local' },
+      { id: 'lm-studio', name: 'LM Studio', baseUrl: 'http://127.0.0.1:1234/v1', api: 'openai-completions', authUrl: '', hint: '（本地服务可留空）', cat: 'local', keyOptional: true },
+      { id: 'vllm', name: 'vLLM', baseUrl: 'http://127.0.0.1:8000/v1', api: 'openai-completions', authUrl: '', hint: '（本地服务可留空）', cat: 'local', keyOptional: true },
       { id: 'llama-cpp', name: 'llama.cpp', baseUrl: 'http://127.0.0.1:8080', api: 'ollama-chat', authUrl: '', hint: '（本地服务可留空）', cat: 'local' },
       { id: 'ollama-cloud', name: 'Ollama Cloud', baseUrl: 'https://cloud.ollama.com', api: 'ollama-chat', authUrl: '', hint: '...', cat: 'local' },
     ],
@@ -101,7 +104,7 @@ const PRESET_GROUPS: { label: string; cat: ProviderPreset['cat']; items: Provide
       { id: 'perplexity', name: 'Perplexity', baseUrl: 'https://api.perplexity.ai', api: 'openai-completions', authUrl: '', hint: 'ppl-...', cat: 'other' },
       { id: 'vercel-ai-gateway', name: 'Vercel AI Gateway', baseUrl: 'https://gateway.vercel.sh/v1', api: 'openai-completions', authUrl: '', hint: '...', cat: 'other' },
       { id: 'cloudflare-ai-gateway', name: 'Cloudflare AI Gateway', baseUrl: 'https://gateway.ai.cloudflare.com/v1', api: 'openai-completions', authUrl: '', hint: '...', cat: 'other' },
-      { id: 'litellm', name: 'LiteLLM Proxy', baseUrl: 'http://127.0.0.1:4000/v1', api: 'openai-completions', authUrl: '', hint: '（本地代理可留空）', cat: 'other' },
+      { id: 'litellm', name: 'LiteLLM Proxy', baseUrl: 'http://127.0.0.1:4000/v1', api: 'openai-completions', authUrl: '', hint: '（本地代理可留空）', cat: 'other', keyOptional: true },
       { id: 'kilo', name: 'Kilo Gateway', baseUrl: 'https://kilo.run/v1', api: 'openai-completions', authUrl: '', hint: '...', cat: 'other' },
       { id: 'zenmux', name: 'ZenMux', baseUrl: 'https://api.zenmux.app/v1', api: 'openai-completions', authUrl: '', hint: '...', cat: 'other' },
       { id: 'umans', name: 'Umans AI', baseUrl: 'https://api.code.umans.ai', api: 'anthropic-messages', authUrl: '', hint: '...', cat: 'other' },
@@ -170,14 +173,29 @@ export const AddModelModal: React.FC<Props> = ({
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [polling, setPolling] = useState(false);
   const pollTimer = useRef<number | null>(null);
+  /** 轮询代次：新一轮轮询 / 卸载时递增，旧轮询链的在途回调据此作废（不再 setState、不再续排定时器） */
+  const pollGen = useRef(0);
   /** 记住第 1 步填的手动模型 ID（跨步传递） */
   const savedManualIdsRef = useRef<string[]>([]);
   /** 写盘时跳过了进程重载（temp 会话 / 正在生成中）→ 第 2 步自动发现不可用，需针对性提示 */
   const [skippedRestart, setSkippedRestart] = useState(false);
 
   useEffect(() => () => {
+    pollGen.current++;
     if (pollTimer.current) window.clearTimeout(pollTimer.current);
   }, []);
+
+  // Esc 只关本弹窗（与 ✕ / 遮罩一致：写盘/重启进行中不关）。捕获阶段拦截并阻止传播，
+  // 否则 SettingsPanel 的 window 级 Esc 监听会把整个设置页连同本弹窗一起关掉（绕过 busy 保护）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      if (!busy) onClose();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [busy, onClose]);
 
   // 编辑模式：挂载时 prepopulate 表单字段（issue 156：允许修改自定义/omp 内置 provider 的 baseUrl、API Key 等）
   useEffect(() => {
@@ -238,8 +256,11 @@ export const AddModelModal: React.FC<Props> = ({
   }, []);
 
   const pidValid = /^[a-zA-Z0-9_-]+$/.test(pid);
+  /** API Key 可留空：免 Key 协议，或所选预设是本地服务（如 LM Studio / vLLM，hint 标注「可留空」） */
+  const keyOptional = NO_KEY_NEEDED.has(api)
+    || (selectedPreset !== null && selectedPreset !== 'custom' && !!selectedPreset.keyOptional);
   // Bedrock/Azure/Vertex 等 provider 不需要 baseUrl；编辑模式 apiKey 留空保留原值，也算合法（issue 156）。
-  const apiKeyOk = apiKey.trim().length > 0 || NO_KEY_NEEDED.has(api) || isEditMode;
+  const apiKeyOk = apiKey.trim().length > 0 || keyOptional || isEditMode;
   const canSave = pidValid && (baseUrl.trim().length > 0 || NO_KEY_NEEDED.has(api)) && apiKeyOk;
   /** 用户是否填了手动模型 ID */
   const hasManualIds = manualIds.split(/[,\s]+/).some((s) => s.trim().length > 0);
@@ -265,6 +286,8 @@ export const AddModelModal: React.FC<Props> = ({
     // writeProvider 另有回填兜底）；添加模式留空且非免 Key 类型 = 显式 auth=none
     if (apiKey.trim()) {
       cfg.apiKey = apiKey.trim();
+      // 旧配置是 auth=none（无 Key）时填了新 Key：必须去掉 none，否则 omp 不会带上这个 Key
+      if (cfg.auth === 'none') delete cfg.auth;
     } else if (!NO_KEY_NEEDED.has(api) && !isEditMode) {
       cfg.auth = 'none';
       delete cfg.apiKey;
@@ -302,7 +325,8 @@ export const AddModelModal: React.FC<Props> = ({
   }, [pid]);
 
   /** 轮询 getAvailableModels 获取新 provider 的模型 */
-  const pollModels = useCallback((providerId: string, attempt = 0) => {
+  const pollModels = useCallback((providerId: string, attempt = 0, gen?: number) => {
+    const myGen = gen ?? ++pollGen.current;
     // 重新 poll 前清掉旧定时器，避免重复点击产生并发轮询链
     if (pollTimer.current) {
       window.clearTimeout(pollTimer.current);
@@ -310,7 +334,9 @@ export const AddModelModal: React.FC<Props> = ({
     }
     setPolling(true);
     const sp = useApp.getState().currentSessionPath ?? '';
+    const stale = () => myGen !== pollGen.current;
     const commit = (list: ModelInfo[]): boolean => {
+      if (stale()) return true;
       if (list.length > 0) {
         setDiscovered(list);
         setChecked(new Set(list.map((m) => modelKey(m))));
@@ -320,8 +346,9 @@ export const AddModelModal: React.FC<Props> = ({
       return false;
     };
     const retry = () => {
+      if (stale()) return;
       if (attempt < 6) {
-        pollTimer.current = window.setTimeout(() => pollModels(providerId, attempt + 1), 1500);
+        pollTimer.current = window.setTimeout(() => pollModels(providerId, attempt + 1, myGen), 1500);
       } else {
         setPolling(false);
       }
@@ -356,18 +383,17 @@ export const AddModelModal: React.FC<Props> = ({
       setSkippedRestart(!restarted);
       setBusy('');
       setStep(2);
-      // 如果有手动 ID，先作为 fallback 放进 discovered
-      if (parsedManualIds.length > 0) {
-        const pidVal = pid.trim();
-        const manualModels: ModelInfo[] = parsedManualIds.map((id) => ({
-          provider: pidVal,
-          id,
-          name: id,
-        }));
-        setDiscovered(manualModels);
-        setChecked(new Set(manualModels.map((m) => modelKey(m))));
-      }
-      pollModels(pid.trim());
+      // 如果有手动 ID，先作为 fallback 放进 discovered；没有则清空上一轮的结果
+      // （「上一步」改 pid/配置后重试时，旧列表会被误当成新 provider 的模型写入白名单/models.yml）
+      const pidVal = pid.trim();
+      const manualModels: ModelInfo[] = parsedManualIds.map((id) => ({
+        provider: pidVal,
+        id,
+        name: id,
+      }));
+      setDiscovered(manualModels);
+      setChecked(new Set(manualModels.map((m) => modelKey(m))));
+      pollModels(pidVal);
     } catch (e) {
       setBusy('');
       setError(e instanceof Error ? e.message : String(e));
@@ -480,6 +506,9 @@ export const AddModelModal: React.FC<Props> = ({
     () => discovered.length > 0 && discovered.every((m) => checked.has(modelKey(m))),
     [discovered, checked],
   );
+
+  // 同名消歧：同一 provider 下 name 重复（Hy3 ×4 / Hy4 preview ×3）时追加短 id
+  const displayNames = useMemo(() => modelDisplayNames(discovered), [discovered]);
 
   /** 打开获取 API Key 的链接 */
   const openAuthUrl = useCallback((url: string) => {
@@ -649,7 +678,7 @@ export const AddModelModal: React.FC<Props> = ({
 
                 <label className="form-field">
                   <span className="form-label">
-                    API Key {NO_KEY_NEEDED.has(api) ? '（可留空）' : '*'}
+                    API Key {keyOptional ? '（可留空）' : '*'}
                   </span>
                   <div className="form-input-group">
                     <input
@@ -775,7 +804,9 @@ export const AddModelModal: React.FC<Props> = ({
                           checked={checked.has(key)}
                           onChange={() => toggleCheck(key)}
                         />
-                        <span className="provider-model-name">{m.name ?? m.id}</span>
+                        <span className="provider-model-name">
+                          {displayNames.get(m.id) ?? m.name ?? m.id}
+                        </span>
                       </label>
                     );
                   })}

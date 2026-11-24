@@ -66,6 +66,11 @@ describe('computeNextRunAt / 有效期', () => {
   it('endOfDay 边界：validUntil 当天 23:59:59.999 仍有效', () => {
     expect(endOfDay('2026-09-21')).toBe(L(2026, 9, 21, 23, 59, 59) + 999);
   });
+  it('单次任务同样受有效期约束：计划时刻晚于截止日 → null', () => {
+    const s: AutomationSchedule = { kind: 'once', at: '2026-09-25T09:00' };
+    expect(computeNextRunAt(s, L(2026, 9, 21, 10), '2026-09-21')).toBeNull();
+    expect(computeNextRunAt(s, L(2026, 9, 21, 10), '2026-09-25')).toBe(L(2026, 9, 25, 9));
+  });
 });
 
 describe('describeSchedule / describeNextRun', () => {
@@ -86,5 +91,10 @@ describe('describeSchedule / describeNextRun', () => {
     expect(describeNextRun({ enabled: true, schedule: { kind: 'once', at: '2026-09-21T20:59:45' } }, L(2026, 9, 21, 20, 59, 30))).toBe('即将执行');
     expect(describeNextRun({ enabled: true, schedule: { kind: 'daily', time: '06:30' } }, now)).toBe('10 小时 30 分后执行');
     expect(describeNextRun({ enabled: true, schedule: { kind: 'monthly', day: 1, time: '06:00' } }, now)).toBe('9 天后执行');
+  });
+  it('临近整点的取整不出现「60 分」', () => {
+    const now = L(2026, 9, 21, 20, 0, 15); // 距 21:00 为 59 分 45 秒；距 23:00 为 2 小时 59 分 45 秒
+    expect(describeNextRun({ enabled: true, schedule: { kind: 'daily', time: '21:00' } }, now)).toBe('1 小时后执行');
+    expect(describeNextRun({ enabled: true, schedule: { kind: 'daily', time: '23:00' } }, now)).toBe('3 小时后执行');
   });
 });

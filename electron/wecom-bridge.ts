@@ -20,6 +20,18 @@ export const WECOM_TEMP_PREFIX = '__wecom_';
 /** 企微流式消息 10 分钟硬窗口，提前 30s 兜底收尾 */
 const STREAM_WINDOW_MS = 10 * 60 * 1000 - 30_000;
 
+/** core 识别的桥命令（与 chat-bridge-core handleCommand 一致） */
+const COMMAND_RE = /(^|\s)(\/(?:bind|unbind|new|sessions|reset|status|steer|followup)(?:\s|$)[\s\S]*)$/;
+
+/** 企微群聊 content 里直接带显示名 @（如「@机器人 /bind 1」），不剥掉命令就识别不到。
+ *  只在 @ 开头、且后面跟着已知命令时剥离，避免误伤正文里的路径（/etc/...）。 */
+export function stripLeadingMention(text: string): string {
+  const t = text.trim();
+  if (!/^[@＠]/.test(t)) return t;
+  const m = COMMAND_RE.exec(t);
+  return m?.[2] ? m[2].trim() : t;
+}
+
 export type { WecomBridgeConfig, WecomBridgeStatus };
 
 export class WecomBridge {
@@ -36,14 +48,23 @@ export class WecomBridge {
     this.deps = deps;
     // transport 通过闭包引用 this.client：connect/saveConfig 重建 client 后自动跟随。
     // getter 的 this 不能用于对象字面量，统一用 bridgeSelf 闭包。
+    // 方法必须是 async：client 为 null（已停用/dispose）时要返回 rejected promise，
+    // 不能同步抛——core 的 finishTurn 是 `void transport.x().catch()`，同步异常会穿出
+    // dispose()/saveConfig()（退出时主进程报错且跳过 pool.killAll）。
     const bridgeSelf = this;
+    const client = (): WecomClient => {
+      if (!bridgeSelf.client) throw new Error('wecom: not connected');
+      return bridgeSelf.client;
+    };
     const transport = {
       get connected(): boolean {
         return bridgeSelf.client?.connected ?? false;
       },
-      respondText: (reqId: string, content: string) => bridgeSelf.client!.respondText(reqId, content),
-      respondStream: (reqId: string, streamId: string, content: string, finish: boolean) =>
-        bridgeSelf.client!.respondStream(reqId, streamId, content, finish),
+      respondText: async (reqId: string, content: string) => client().respondText(reqId, content),
+      respondStream: async (reqId: string, streamId: string, content: string, finish: boolean) =>
+        client().respondStream(reqId, streamId, content, finish),
+      pushText: async (chatKey: string, chatType: 'single' | 'group', content: string) =>
+        client().sendMarkdown(chatKey, chatType === 'group' ? 2 : 1, content),
     };
     const cfg = await this.core.init(deps, transport, /* supportsStream */ true);
     if (cfg.enabled && cfg.botId && cfg.secret) {
@@ -74,7 +95,7 @@ export class WecomBridge {
           msgid: msg.msgid,
           chatKey: msg.chatKey,
           chatType: msg.chattype,
-          text: msg.text,
+          text: msg.chattype === 'group' ? stripLeadingMention(msg.text) : msg.text,
           supportsStream: true,
         });
       },

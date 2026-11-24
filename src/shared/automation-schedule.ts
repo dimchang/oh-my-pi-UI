@@ -3,7 +3,7 @@
  *
  * 时间语义（全部本地时区）：
  *  - computeNextRunAt(schedule, base, validUntil)：返回「严格晚于 base」的下一次计划时刻。
- *    主进程传 base = task.lastRunAt（从未执行传 0）→ 返回值 ≤ now 即「到期该触发」；
+ *    主进程传 base = task.lastRunAt（从未执行传 task.createdAt）→ 返回值 ≤ now 即「到期该触发」；
  *    渲染层传 base = Date.now() → 返回值必为未来时刻，用于「X小时后执行」显示。
  *  - 每次执行通过推进 lastRunAt「扣账」：同一时刻绝不触发两次（断电重启后也不会补发多天前的）。
  */
@@ -57,6 +57,7 @@ export function computeNextRunAt(
       if (!schedule.at) return null;
       const at = new Date(schedule.at).getTime();
       if (!Number.isFinite(at)) return null;
+      if (validUntilEnd !== null && at > validUntilEnd) return null;
       return at > base ? at : null;
     }
     case 'daily': {
@@ -147,10 +148,12 @@ export function describeNextRun(task: { enabled: boolean; schedule: AutomationSc
   if (next === null) return '已过期';
   const diff = next - now;
   if (diff < 60_000) return '即将执行';
-  if (diff < 60 * 60_000) return `${Math.round(diff / 60_000)} 分钟后执行`;
+  // 先整体取整到分钟再拆时/分，避免 59.5 分被各自四舍五入成「60 分钟」「2 小时 60 分」
+  const totalMin = Math.round(diff / 60_000);
+  if (totalMin < 60) return `${totalMin} 分钟后执行`;
   if (diff < 24 * 60 * 60_000) {
-    const h = Math.floor(diff / (60 * 60_000));
-    const m = Math.round((diff % (60 * 60_000)) / 60_000);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
     return m > 0 ? `${h} 小时 ${m} 分后执行` : `${h} 小时后执行`;
   }
   return `${Math.round(diff / DAY_MS)} 天后执行`;

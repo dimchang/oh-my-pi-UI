@@ -3,17 +3,17 @@ import { useApp } from '../store';
 import type { ApprovalMode } from '../../shared/ipc-channels';
 
 /** 权限模式选项（对应 omp `--approval-mode` 三档）。
- *  - yolo：全自动，不弹窗（信任任务时用）。
- *  - write：默认，读/写自动，仅执行类（bash/浏览器/ssh/task）弹窗。
+ *  - yolo：全自动，不弹窗（默认；仅信任的任务使用）。
+ *  - write：读/写自动，仅执行类（bash/浏览器/ssh/task）弹窗。
  *  - always-ask：每次工具调用都弹窗确认。 */
 const MODES: { value: ApprovalMode; label: string; desc: string }[] = [
-  { value: 'yolo', label: 'YOLO · 全自动', desc: '自动批准所有工具调用，不弹窗（仅信任的任务使用）' },
-  { value: 'write', label: 'Write · 默认', desc: '读/写自动执行，仅执行类（bash/浏览器/ssh 等）弹窗' },
+  { value: 'yolo', label: 'YOLO · 全自动（默认）', desc: '自动批准所有工具调用（含 bash 等执行类），不弹窗' },
+  { value: 'write', label: 'Write', desc: '读/写自动执行，仅执行类（bash/浏览器/ssh 等）弹窗' },
   { value: 'always-ask', label: 'Always Ask · 每次询问', desc: '每次工具调用都弹窗确认' },
 ];
 
 export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void }> = ({ onChange }) => {
-  const mode = useApp((s) => s.currentWorkspace()?.approvalMode ?? 'write');
+  const mode = useApp((s) => s.currentWorkspace()?.approvalMode ?? 'yolo');
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -25,7 +25,7 @@ export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void
     return () => document.removeEventListener('mousedown', onDoc);
   }, []);
 
-  const current = MODES.find((m) => m.value === mode) ?? MODES[1] ?? MODES[0]!;
+  const current = MODES.find((m) => m.value === mode) ?? MODES[0]!;
 
   const pick = (m: ApprovalMode) => {
     setOpen(false);
@@ -35,7 +35,11 @@ export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void
 
   return (
     <div className="model-picker" ref={ref}>
-      <button className="btn" onClick={() => setOpen((o) => !o)} title="权限模式（按工作空间生效）">
+      <button
+        className="btn"
+        onClick={() => setOpen((o) => !o)}
+        title="权限模式（按工作空间持久化）。切换后：会话空闲则立即重启进程生效；正在生成时先询问。"
+      >
         权限: {current.label.split(' · ')[0] ?? current.label} ▾
       </button>
       {open && (

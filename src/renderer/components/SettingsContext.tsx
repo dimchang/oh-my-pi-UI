@@ -36,7 +36,10 @@ const GLOBAL_SLOTS: GlobalSlot[] = [
 export const SettingsContext: React.FC = () => {
   const [activeSlot, setActiveSlot] = useState<GlobalSlot>(GLOBAL_SLOTS[0]!);
   const [contents, setContents] = useState<Record<string, string>>({});
-  const [draft, setDraft] = useState('');
+  // 按文件分别保存草稿：切换 AGENTS.md / RULES.md 不丢未保存的编辑（未编辑过的文件回退到磁盘内容）
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draft = drafts[activeSlot.key] ?? contents[activeSlot.key] ?? '';
+  const setDraft = (v: string) => setDrafts((prev) => ({ ...prev, [activeSlot.key]: v }));
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [agentDir, setAgentDir] = useState('');
@@ -60,7 +63,7 @@ export const SettingsContext: React.FC = () => {
       const map: Record<string, string> = {};
       GLOBAL_SLOTS.forEach((s, i) => { map[s.key] = results[i] ?? ''; });
       setContents(map);
-      setDraft(map[activeSlot.key] ?? '');
+      setDrafts({});
       setLoaded(true);
     });
     return () => { cancelled = true; };
@@ -68,8 +71,7 @@ export const SettingsContext: React.FC = () => {
 
   const switchSlot = useCallback((slot: GlobalSlot) => {
     setActiveSlot(slot);
-    setDraft(contents[slot.key] ?? '');
-  }, [contents]);
+  }, []);
 
   const handleSave = async () => {
     if (!agentDir) return;
@@ -122,6 +124,7 @@ export const SettingsContext: React.FC = () => {
       <textarea
         className="ctx-editor"
         value={loaded ? draft : '加载中…'}
+        readOnly={!loaded}
         onChange={(e) => setDraft(e.target.value)}
         placeholder={`在此编辑全局 ${activeSlot.label} 内容…\n留空保存 = 删除该文件`}
         spellCheck={false}

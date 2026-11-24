@@ -8,6 +8,7 @@
 
 import type { ModelInfo } from './rpc-types';
 import type { OmpModelDefinition } from './ipc-channels';
+import { planThinkingRepair } from './model-thinking';
 
 /**
  * 合并规则（omp 18.1.0→18.3.2 升级适配 §3）：
@@ -38,6 +39,21 @@ export function mergeDiscoveredModels(
     if (m.input) merged.input = [...m.input];
     if (m.reasoning !== undefined) merged.reasoning = m.reasoning;
     if (m.cost) merged.cost = { ...m.cost };
+    // 上游声明支持思考、但 omp 运行时没给档位（自定义 provider 的普遍情况：
+    // discovery 只按 id 猜能力）→ 顺手写进 yml，用户新增/编辑 provider 后即可用思考档位，
+    // 不必事后逐个点「修复思考能力」。
+    if (merged.reasoning !== true || (merged.thinking?.efforts?.length ?? 0) === 0) {
+      const plan = planThinkingRepair(m);
+      if (plan) {
+        merged.reasoning = true;
+        merged.thinking = {
+          ...(merged.thinking ?? {}),
+          mode: 'effort',
+          efforts: [...plan.efforts],
+          defaultLevel: plan.defaultLevel,
+        };
+      }
+    }
     return merged;
   });
   // 并集：未被本次发现的旧模型原样保留

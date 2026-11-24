@@ -130,12 +130,15 @@ export interface RpcCommandBase {
  *  Buffer.from(data,'base64') 会把前缀一并解码（'/' 是合法 base64 字符），
  *  得到损坏字节，导致 blob 入库为垃圾、vision 描述失败、inspect_image 无法识别
  *  （实证 session 019fc31c）。发送前用 stripDataUrlPrefix（src/renderer/utils/image-data-url.ts）去掉前缀。
- *  path 为绝对文件路径时 OMP 自行读文件内联（等同原生），仅作 data 读取失败的兜底。 */
+ *  path 字段 0.5.27 起已停用：omp 18.3.2 的 rpc 层对 {type:'image',path} 不加载文件、
+ *  直接透传进 content，请求构建时在图片处理缓存键处崩（"undefined is not an object
+ *  (evaluating 'e.data.length')"，实证 session 01a10c7a）。图片必须内联 data（裸 base64），
+ *  读取失败就跳过（collectImageRefs 的 onSkipped），绝不发 path 形式。 */
 export interface RpcImage {
   type: 'image';
   /** 图片内容：裸 base64（不带 data: 前缀），OMP 据此内联为 {type:'image'} 块并触发 vision 路由 */
   data?: string;
-  /** 绝对文件路径，OMP 自行读文件内联 */
+  /** ⚠️ 已停用（omp 18.3.2 对 path 形式会崩 e.data.length），勿再使用 */
   path?: string;
   /** 图片 MIME，必须提供（image/png、image/jpeg、image/webp…），OMP 据此识别类型 */
   mimeType: string;
@@ -396,6 +399,16 @@ export interface ModelInfo {
   maxTokens?: number;
   input?: string[];
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** 上游 /v1/models 的计费倍率字符串，如 "x0.00"/"x0.29"（workbuddy 网关私有字段）。
+   *  仅用于 UI 展示（"免费"/"x0.29"）；非标准 OpenAI 字段，缺失即 undefined，不做默认值兜底。 */
+  credits?: string;
+  /** 上游 /v1/models 声明的思考能力（supports_reasoning / only_reasoning）。
+   *  **只反映上游说法**，与 omp 运行时结论 `reasoning` 分开存：omp 的 discovery 不解析
+   *  这两个字段，会把自定义 provider 的思考模型标成 reasoning:false，
+   *  导致 set_thinking_level 永远被 clamp 回 off。修复动作靠这对字段做依据。 */
+  upstreamReasoning?: boolean;
+  /** 上游声明的可用思考档位（reasoning_supported_efforts），用于写 models.yml 的 thinking.efforts */
+  upstreamEfforts?: ThinkingLevel[];
   /** 实测：{mode:'effort', efforts:['minimal','low','medium','high']}。
    *  efforts 是该模型实际支持的 thinking 档位——UI 只应让用户选这些，
    *  否则 omp 会 clamp 回有效值（表现为"切高档自动弹回"）。 */

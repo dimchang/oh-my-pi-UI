@@ -24,8 +24,8 @@ export async function reloadCurrentSession(): Promise<boolean> {
   const st = useApp.getState();
   const sp = st.currentSessionPath;
 
-  // temp 新会话（__new_）尚未落盘，无法用 -r 续接，跳过重载
-  if (!sp || sp.startsWith('__new_')) return false;
+  // 未落盘新会话（__new_ 或已 adopt 真实 id 但尚未发消息的 uncommittedSessions），无法用 -r 续接，跳过重载
+  if (!sp || sp.startsWith('__new_') || st.uncommittedSessions[sp]) return false;
   // 正在生成中不打断（evict 会杀掉进行中的 agent run）
   if (st.procStateMap[sp]?.isStreaming) return false;
 
@@ -34,7 +34,7 @@ export async function reloadCurrentSession(): Promise<boolean> {
   if (!cwd) return false;
 
   const approvalMode =
-    st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(cwd))?.approvalMode ?? 'write';
+    st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(cwd))?.approvalMode ?? 'yolo';
 
   // 杀旧进程（onExit 会短暂置 offline，onReady 恢复），新进程重读 models.yml
   await rpc.release(sp);

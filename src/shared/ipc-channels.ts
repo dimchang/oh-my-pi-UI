@@ -56,6 +56,8 @@ export const IPC = {
   WindowClose: 'window:close', // () => Promise<void>
   WindowIsMaximized: 'window:is-maximized', // () => Promise<boolean>
   WindowMaximizedChange: 'window:maximized-change', // (isMaximized: boolean)
+  // 任务栏闪动提醒（0.5.23）：有待应答请求且窗口未聚焦 → flashFrame(true)；聚焦/处理完 → flashFrame(false)
+  WindowFlash: 'window:flash', // (flash: boolean) => Promise<void>
 
   // 自定义标题栏菜单动作（需要主进程配合的项）
   MenuReload: 'menu:reload', // () => Promise<void>
@@ -204,8 +206,8 @@ export interface SessionTailInfo {
 }
 
 /** omp 权限模式（对应启动参数 `--approval-mode`，spawn 时生效）。
- *  - yolo：所有工具调用自动批准，不弹窗（信任任务时用）。
- *  - write：读/写工具自动执行，仅执行类（bash/浏览器/ssh/task）弹窗确认（默认）。
+ *  - yolo：所有工具调用自动批准，不弹窗（默认）。
+ *  - write：读/写工具自动执行，仅执行类（bash/浏览器/ssh/task）弹窗确认。
  *  - always-ask：每次工具调用都弹窗确认。 */
 export type ApprovalMode = 'yolo' | 'write' | 'always-ask';
 
@@ -221,7 +223,7 @@ export interface Workspace {
   collapsed: boolean;
   /** 创建时间（ms） */
   createdAt: number;
-  /** 该工作空间使用的 omp 权限模式（不填则默认 'write'）。切换工作空间时随之生效。 */
+  /** 该工作空间使用的 omp 权限模式（不填则默认 'yolo'）。切换工作空间时随之生效。 */
   approvalMode?: ApprovalMode;
 }
 
@@ -616,6 +618,8 @@ export interface OmpApi {
   closeWindow(): Promise<void>;
   isWindowMaximized(): Promise<boolean>;
   onWindowMaximizedChange(cb: (isMaximized: boolean) => void): () => void;
+  /** 任务栏闪动（需要用户介入提醒，0.5.23）。Windows 上 true 持续闪动到窗口聚焦，false 立即停止 */
+  flashWindow(flash: boolean): Promise<void>;
 
   // 自定义标题栏菜单动作
   menuReload(): Promise<void>;

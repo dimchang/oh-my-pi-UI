@@ -196,6 +196,10 @@ const LinkContextMenu: React.FC<{ url: string; x: number; y: number; onClose: ()
   );
 };
 
+/** grep / glob 结果行：纯路径，或 path:line[:content]。路径段后不允许直接跟正文——
+ *  否则任何以字母/数字/`-` 开头的普通句子、列表项都会被误判成路径行。 */
+const PATH_LINE_RE = /^(?:[A-Za-z]:)?[\w.\-\/\\]+(?::\d+(?::.*)?)?$/;
+
 /** 判断一段文本是否像是原始文件/代码内容（而非普通 markdown 正文）。
  *  用于把模型直接贴出的文件内容（如 JSDoc 注释、源码、grep 结果）按 <pre> 渲染，
  *  避免 `*` 行被解释成 markdown 列表、同时启用默认折叠。 */
@@ -206,13 +210,13 @@ function looksLikeFileContent(text: string): boolean {
   const nonEmpty = lines.filter((l) => l.trim() !== '');
   if (nonEmpty.length < 2) return false;
   const first = nonEmpty[0]!.trim();
-  // 常见源码/注释开头
-  if (/^(\/\*\*?|\/\/|#|import\b|export\b|function\b|class\b|const\b|let\b|var\b|package\b|using\b|module\b|<\?xml|^[\[\{])/.test(first)) {
+  // 常见源码/注释开头（`#` 排除 markdown 标题 `# xx` / `## xx`）
+  if (/^(\/\*\*?|\/\/|#(?!#*\s)|import\b|export\b|function\b|class\b|const\b|let\b|var\b|package\b|using\b|module\b|<\?xml|^[\[\{])/.test(first)) {
     return true;
   }
   // grep / glob 结果行：path[:line:content] 或纯路径
-  if (/^[\w.\-\/\\\\]+(:\d+:)?.+/.test(first)) {
-    const pathLike = nonEmpty.filter((l) => /^[\w.\-\/\\\\]+(:\d+:)?.+/.test(l.trim()));
+  if (PATH_LINE_RE.test(first)) {
+    const pathLike = nonEmpty.filter((l) => PATH_LINE_RE.test(l.trim()));
     if (pathLike.length / nonEmpty.length > 0.7) return true;
   }
   return false;
@@ -405,6 +409,7 @@ const EmptyHeader: React.FC = () => (
 export const ChatView: React.FC = () => {
   const messages = useApp((s) => s.messages);
   const currentSessionPath = useApp((s) => s.currentSessionPath);
+  const bufferReady = useApp((s) => !!s.currentSessionPath && s.sessionsMap[s.currentSessionPath] !== undefined);
   const isCompacting = useApp((s) => s.isCompacting);
   const compactionInfo = useApp((s) => s.compactionInfo);
   const isRetrying = useApp((s) => s.isRetrying);
@@ -466,8 +471,9 @@ export const ChatView: React.FC = () => {
     return n;
   }, [allTurns, startTurn]);
   const showEmpty = total === 0 && !isCompacting && !isRetrying;
-  // 有会话路径但消息为空 = 正在异步加载（首览历史会话）
-  const isLoading = total === 0 && !!currentSessionPath;
+  // 有会话路径、消息为空且该会话缓冲尚未建立 = 正在异步加载（首览历史会话）。
+  // 新建会话（resetChat 已建空缓冲）/ 已加载但确实为空的会话不算加载中，应显示空态。
+  const isLoading = total === 0 && !!currentSessionPath && !bufferReady;
 
   // 链接右键菜单状态
   const [linkMenu, setLinkMenu] = useState<{ url: string; x: number; y: number } | null>(null);
@@ -484,6 +490,9 @@ export const ChatView: React.FC = () => {
       prevSessionRef.current = currentSessionPath;
       prevLenRef.current = total;
       stickBottom.current = true;
+      // 方向判定基线归零：上一会话的 scrollTop 若大于新内容的底部，接下来的钉底滚动
+      // 会被 onScroll 误判成「用户上滚」而解除吸底（新会话不跟随、误显示跳到最新按钮）
+      lastScrollTopRef.current = 0;
       setAtBottom(true);
       setWindowStartTurn(Math.max(0, turnCount - WINDOW_TURNS));
       requestAnimationFrame(() => {
@@ -617,7 +626,10 @@ export const ChatView: React.FC = () => {
       node.scrollIntoView({ behavior: 'auto', block: 'center' });
       return;
     }
-    // 目标不在窗口：移动窗口让目标所在回合位于中部，渲染后定位
+    // 目标不在窗口：移动窗口让目标所在回合位于中部，渲染后定位。
+    // 先解除吸底：否则流式期间下一帧的跟随 effect 会把窗口拉回最新，跳转被吞掉
+    stickBottom.current = false;
+    setAtBottom(false);
     const ti = turnIndexOfMsg[index] ?? 0;
     const targetStart = Math.max(0, Math.min(ti - Math.floor(WINDOW_TURNS / 2), maxStartTurn));
     setWindowStartTurn(targetStart);

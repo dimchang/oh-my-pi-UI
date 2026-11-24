@@ -51,6 +51,8 @@ export const SessionList: React.FC<{
   const unreadSessions = useApp((s) => s.unreadSessions);
   const sessionErrors = useApp((s) => s.sessionErrors);
   const uiQueue = useApp((s) => s.uiQueue);
+  // 0.5.40：omp 进程崩溃中断 → 红点（覆盖运行中橙点）
+  const crashInterrupted = useApp((s) => s.crashInterrupted);
 
   // 任一右键菜单打开时，通过自定义事件通知其他菜单关闭（解决多菜单重叠）
   const openMenu = (menu: NonNullable<typeof ctxMenu>) => {
@@ -78,7 +80,7 @@ export const SessionList: React.FC<{
   return (
     <>
       {sessions.map((s) => {
-        const dot = sessionDotStatus(s.path, { procStateMap, unreadSessions, sessionErrors, uiQueue });
+        const dot = sessionDotStatus(s.path, { procStateMap, unreadSessions, sessionErrors, uiQueue, crashInterrupted });
         return (
           <div
             key={s.path}

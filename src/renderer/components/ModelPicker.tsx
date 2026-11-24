@@ -3,6 +3,7 @@ import { useApp } from '../store';
 import { rpc } from '../rpc-client';
 import { modelKey } from '../utils/path-key';
 import { fetchAvailableModels } from '../utils/available-models';
+import { formatCredits, modelDisplayNames } from '../utils/model-display';
 import type { ModelInfo } from '../../shared/rpc-types';
 
 /** get_available_models 的客户端超时（ms）。FrameRouter 默认 5 分钟对 UI 下拉太长。 */
@@ -25,8 +26,13 @@ export const ModelPicker: React.FC = () => {
   // 注意：React 18 StrictMode 开发模式会 mount→cleanup→remount，必须在 effect body 里重置为 false
   const cancelledRef = useRef(false);
   useEffect(() => { cancelledRef.current = false; return () => { cancelledRef.current = true; }; }, []);
+  // 请求序号：预热（cacheOnly）与打开下拉的实时拉取可能并发，只让最新一次请求落 state，
+  // 避免旧请求晚到覆盖新列表 / 提前把 loading 关掉 / 旧请求的超时定时器误报「加载失败」
+  const fetchSeqRef = useRef(0);
 
   const fetchModels = React.useCallback((showLoading = false, cacheOnly = false) => {
+    const seq = ++fetchSeqRef.current;
+    const stale = () => cancelledRef.current || seq !== fetchSeqRef.current;
     const sp = useApp.getState().currentSessionPath;
     if (!sp) {
       if (showLoading) setFetchError(true);
@@ -37,7 +43,7 @@ export const ModelPicker: React.FC = () => {
     setFallback(null);
 
     const timer = setTimeout(() => {
-      if (cancelledRef.current) return;
+      if (stale()) return;
       setLoading(false);
       setFetchError(true);
     }, MODELS_FETCH_TIMEOUT_MS);
@@ -46,14 +52,14 @@ export const ModelPicker: React.FC = () => {
     void useApp.getState().ensureOnline(sp).then((ok) => {
       if (!ok) {
         clearTimeout(timer);
-        if (cancelledRef.current) return;
+        if (stale()) return;
         setLoading(false);
         setFetchError(true);
         return;
       }
       void fetchAvailableModels(sp, { cacheOnly }).then((res) => {
         clearTimeout(timer);
-        if (cancelledRef.current) return;
+        if (stale()) return;
         setLoading(false);
         setModels(res.models);
         setFallback(res.fallback ? { reason: res.reason } : null);
@@ -61,7 +67,7 @@ export const ModelPicker: React.FC = () => {
         setFetchError(res.fallback && res.models.length === 0);
       }).catch(() => {
         clearTimeout(timer);
-        if (cancelledRef.current) return;
+        if (stale()) return;
         setLoading(false);
         setFetchError(true);
       });
@@ -121,20 +127,28 @@ export const ModelPicker: React.FC = () => {
 
   const pick = (m: ModelInfo) => {
     setOpen(false);
+    // sp 是**点击时**的会话快照：整个异步链路都用它，绝不回头读指针（可能已被切走）
     const sp = useApp.getState().currentSessionPath;
     if (!sp) return;
     void rpc.setModel(sp, m.provider, m.id).then((r) => {
       if (r.success && r.data) {
-        useApp.getState().setState({ model: r.data as ModelInfo });
-        // 按 sessionPath 记录（lastModelMap，会话间隔离）+ 全局 lastModel 兜底（新会话默认值），
-        // 重启/进程重拉后按会话各自的记录恢复，B 会话的选择不影响 A 会话。
         const mm = r.data as ModelInfo;
+        // 只在该会话仍是当前显示会话时改全局展示值 —— 否则 set_model 往返期间用户切走，
+        // 会把 A 会话刚选的模型显示到 B 会话上（2026-10-25 串模型观感来源之一）。
+        if (sp === useApp.getState().currentSessionPath) {
+          useApp.getState().setState({ model: mm });
+        }
+        // 按 sessionPath 记录（lastModelMap，会话间隔离，持久化）+ 展示层快照（sessionModels）
+        // + 全局 lastModel 兜底（只给「新开会话」用）。重启/进程重拉后按会话各自的记录恢复，
+        // B 会话的选择不影响 A 会话。
         useApp.getState().setLastModelForSession(sp, { provider: mm.provider, id: mm.id, name: mm.name });
       }
     }).catch(() => undefined);
   };
 
   const onSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // 输入法组字中的 Enter/Esc 属于输入法（确认/取消候选词），不能当成选中模型 / 关闭菜单
+    if (e.nativeEvent.isComposing) return;
     if (e.key === 'Escape') {
       if (query) {
         e.stopPropagation();
@@ -151,9 +165,20 @@ export const ModelPicker: React.FC = () => {
 
   const totalMatched = Object.values(groups).reduce((n, list) => n + list.length, 0);
 
+  // 同名消歧：按 provider 分组计算显示名（Hy3/Hy4 这类同族多通道 name 相同）
+  const displayNames = useMemo(() => {
+    const acc: Record<string, Map<string, string>> = {};
+    for (const [pid, list] of Object.entries(groups)) acc[pid] = modelDisplayNames(list);
+    return acc;
+  }, [groups]);
+
   return (
     <div className="model-picker" ref={ref}>
-      <button className="btn" onClick={() => setOpen((o) => !o)}>
+      <button
+        className="btn"
+        title={model ? `${model.provider}/${model.id}` : undefined}
+        onClick={() => setOpen((o) => !o)}
+      >
         {model?.name ?? model?.id ?? '选择模型'} ▾
       </button>
       {open && (
@@ -196,17 +221,27 @@ export const ModelPicker: React.FC = () => {
               Object.entries(groups).map(([provider, list]) => (
                 <div key={provider}>
                   <div className="model-group">{provider}</div>
-                  {list.map((m) => (
-                    <div
-                      key={`${m.provider}/${m.id}`}
-                      className={`model-item ${model?.id === m.id && model?.provider === m.provider ? 'current' : ''}`}
-                      onClick={() => pick(m)}
-                      title={m.contextWindow ? `上下文 ${m.contextWindow} tokens` : ''}
-                    >
-                      <span>{m.name ?? m.id}</span>
-                      {model?.id === m.id && model?.provider === m.provider && <span>✓</span>}
-                    </div>
-                  ))}
+                  {list.map((m) => {
+                    const credits = formatCredits(m.credits);
+                    return (
+                      <div
+                        key={`${m.provider}/${m.id}`}
+                        className={`model-item ${model?.id === m.id && model?.provider === m.provider ? 'current' : ''}`}
+                        onClick={() => pick(m)}
+                        title={[`${m.provider}/${m.id}`, m.contextWindow ? `上下文 ${m.contextWindow} tokens` : '']
+                          .filter(Boolean)
+                          .join(' · ')}
+                      >
+                        <span className="model-item-main">
+                          <span>{displayNames[provider]?.get(m.id) ?? m.name ?? m.id}</span>
+                          {credits && (
+                            <span className={`model-item-meta${credits === '免费' ? ' free' : ''}`}>{credits}</span>
+                          )}
+                        </span>
+                        {model?.id === m.id && model?.provider === m.provider && <span>✓</span>}
+                      </div>
+                    );
+                  })}
                 </div>
               ))
             )}

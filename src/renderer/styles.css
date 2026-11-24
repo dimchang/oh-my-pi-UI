@@ -1074,7 +1074,10 @@ body {
   box-shadow: 0 0 0 3px hsl(var(--accent-main-000) / 0.12);
 }
 .input-box textarea {
-  flex: 1;
+  /* 不能用 flex:1 —— .input-box 是 column 布局，flex:1 = flex-basis:0% 会压过 inline height，
+     导致 autoGrow 设置的高度全部失效（输入框永远不长大）。高度由 JS autoGrow 控制。 */
+  flex: 0 0 auto;
+  width: 100%;
   background: transparent;
   border: none;
   outline: none;
@@ -1082,7 +1085,10 @@ body {
   font-family: inherit;
   font-size: 14px;
   resize: none;
-  max-height: 320px;
+  overflow-y: auto;
+  /* JS（InputBox autoGrow）按行数精确控制 inline height，这里是 CSS 兜底上限：
+     12 行（21px 行高 × 12 = 252px）与屏幕高度 1/3 取小 */
+  max-height: min(252px, 33vh);
   line-height: 1.5;
   padding: 2px 0;
 }
@@ -1232,6 +1238,8 @@ body {
   border-color: hsl(var(--accent-main));
   box-shadow: 0 0 0 2px hsl(var(--accent-main) / 0.25);
 }
+
+/* 0.5.40：崩溃提醒收敛为「右下角红色 toast + 侧栏红点」，不再给输入框套红框。 */
 
 /* toolbar 内的 picker 按钮扁平化为胶囊 */
 .input-toolbar .model-picker .btn,
@@ -1508,6 +1516,11 @@ body {
 .model-item-desc { font-size: 11px; color: hsl(var(--text-400)); line-height: 1.35; }
 .model-item:hover { background: hsl(var(--bg-300) / 0.6); }
 .model-item.current { color: hsl(var(--accent-main-000)); font-weight: 500; }
+/* 同族多通道消歧：名字可能带 "· 短id"，长名字截断；右侧小字显示免费/倍率 */
+.model-item-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.model-item-main > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-item-meta { font-size: 10.5px; color: hsl(var(--text-400)); font-family: var(--font-mono); flex-shrink: 0; }
+.model-item-meta.free { color: hsl(var(--success-100)); font-weight: 600; }
 
 /* ====== modal ====== */
 .modal-overlay {
@@ -1622,18 +1635,58 @@ body {
 /* ====== toast — Apple 风格卡片 ====== */
 .toasts { position: fixed; bottom: 44px; right: 20px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
 .toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   background: hsl(var(--bg-000));
   border: 1px solid hsl(var(--border-200));
   border-left: 3px solid hsl(var(--accent-main-000));
   border-radius: var(--radius-md);
-  padding: 10px 16px;
+  padding: 10px 12px 10px 16px;
   font-size: 13px;
   max-width: 380px;
   box-shadow: var(--shadow-md);
   color: var(--text);
 }
+.toast-text { flex: 1 1 auto; min-width: 0; }
 .toast.warning { border-left-color: hsl(var(--warning-100)); }
 .toast.error { border-left-color: hsl(var(--danger-000)); }
+/* 0.5.40：崩溃中断唯一的醒目提醒——右下角红色整框 toast，常驻，带可点的「重发上一条」。 */
+.toast.error.toast-actionable {
+  border-color: hsl(var(--danger-000) / 0.55);
+  background: hsl(var(--danger-bg));
+  color: hsl(var(--danger-000));
+}
+.toast-resend {
+  flex-shrink: 0;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid hsl(var(--danger-000));
+  background: hsl(var(--danger-000));
+  color: #fff;
+  cursor: pointer;
+}
+.toast-resend:hover { filter: brightness(1.08); }
+.toast-close {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: hsl(var(--text-400));
+  font-size: 15px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.toast-close:hover { background: hsl(var(--bg-200)); color: var(--text); }
+
+/* 0.5.40：进程断开时不再弹全屏红色对话框，也不在聊天区插大横幅；
+   提醒只剩右下角红色 toast（.toast.error.toast-actionable）+ 会话条目前的红点。 */
 
 /* ====== 滚动条 — 极简 macOS 风格 ====== */
 ::-webkit-scrollbar { width: 24px; height: 24px; }
@@ -1821,6 +1874,11 @@ body {
   margin-top: 4px;
 }
 .thinking-menu-hint:hover { background: hsl(var(--bg-300) / 0.5); }
+/* omp 未标记模型支持思考时的修复入口：可点时用强调色（这是唯一的破局动作） */
+.thinking-menu-hint.thinking-repair { color: hsl(var(--accent-main-000)); font-weight: 500; }
+.thinking-menu-hint.thinking-repair:hover { background: hsl(var(--accent-main-000) / 0.08); }
+.thinking-menu-hint.thinking-repair.disabled { color: hsl(var(--text-400)); font-weight: 400; cursor: default; }
+.thinking-menu-hint.thinking-repair.disabled:hover { background: transparent; }
 
 /* ====== M4: 状态气泡（压缩/重试） ====== */
 .status-bubble {
@@ -2492,6 +2550,8 @@ body {
 .provider-model-row input[type='checkbox'] { flex-shrink: 0; cursor: pointer; }
 .provider-model-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-model-meta { font-size: 11px; color: hsl(var(--text-400)); flex-shrink: 0; font-family: var(--font-mono); }
+/* 免费通道标记：同族多通道（Hy3/Hy4）里唯一能一眼定取舍的信息 */
+.provider-model-meta.free { color: hsl(var(--success-100)); font-weight: 600; }
 
 /* ====== 添加模型弹窗（AddModelModal） ====== */
 .modal-overlay.inner { z-index: 150; }

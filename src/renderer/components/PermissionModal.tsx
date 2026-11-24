@@ -170,7 +170,7 @@ export const PermissionModal: React.FC<{ req: UiRequest }> = ({ req }) => {
                 placeholder={req.placeholder}
                 onChange={(e) => setInputVal(e.target.value)}
                 autoFocus
-                onKeyDown={(e) => e.key === 'Enter' && !busy && respond({ value: inputVal })}
+                onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && !busy && respond({ value: inputVal })}
               />
             )}
             <div className="modal-actions">

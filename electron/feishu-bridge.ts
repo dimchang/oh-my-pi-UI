@@ -72,6 +72,10 @@ export class FeishuBridge {
   private deps: BridgeDeps | null = null;
   /** 收到的 message_id 排重（飞书事件可能重试投递） */
   private seenMsgids: string[] = [];
+  /** message_id → chat_id：reply 失败时兜底主动发回「该消息所在的会话」 */
+  private chatByMsgId = new Map<string, string>();
+  /** 连接状态轮询定时器（重连/停用时必须清掉，否则每次保存配置都泄漏一个） */
+  private watchTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     // supportsStream=false：飞书无 stream 原语，core 在 agent_end 一次性回复
@@ -96,13 +100,21 @@ export class FeishuBridge {
             },
           });
         } catch {
-          // reply 窗口过期等：改用主动发送（需要已知 chatKey）
-          await bridgeSelf.sendToBoundChat(reqId, content);
+          // reply 窗口过期/原消息被撤回等：改为主动发到该消息所在的会话
+          try {
+            const chatId = bridgeSelf.chatByMsgId.get(reqId);
+            if (!chatId) throw new Error(`unknown chat for message ${reqId}`);
+            await bridgeSelf.sendToChat(chatId, content);
+          } catch {
+            bridgeSelf.deps?.log(`[feishu] reply+send 均失败，丢弃回复: ${content.slice(0, 60)}`);
+          }
         }
       },
       respondStream: async () => {
         /* 飞书无 stream 原语：core 在 finishTurn 时才调 respondText */
       },
+      pushText: async (chatKey: string, _chatType: 'single' | 'group', content: string) =>
+        bridgeSelf.sendToChat(chatKey, content),
     };
     const cfg = await this.core.init(deps, transport, /* supportsStream */ false);
     if (cfg.enabled && cfg.botId && cfg.secret) {
@@ -124,9 +136,10 @@ export class FeishuBridge {
       this.deps?.log(`[feishu] ws start failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     // 状态变化通过轮询（getConnectionStatus）暴露；连接建立/断开日志
-    const watch = setInterval(() => {
+    this.stopWatch();
+    this.watchTimer = setInterval(() => {
       if (!this.ws) {
-        clearInterval(watch);
+        this.stopWatch();
         return;
       }
       const st = this.ws.getConnectionStatus().state;
@@ -136,11 +149,19 @@ export class FeishuBridge {
         this.deps?.onStatusChange(this.core.status());
       } else if (st !== 'connected' && this.lastConnected) {
         this.lastConnected = false;
+        // 不收尾活跃回合：飞书回复走 HTTP API，与长连接无关；SDK 会自动重连，
+        // 在这里 onTransportClosed 只会把进行中的回答截断、丢掉剩余输出
         this.deps?.log(`[feishu] disconnected (${st})`);
-        this.core.onTransportClosed();
         this.deps?.onStatusChange(this.core.status());
       }
     }, 2_000);
+  }
+
+  private stopWatch(): void {
+    if (this.watchTimer) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = null;
+    }
   }
 
   private lastConnected = false;
@@ -163,6 +184,11 @@ export class FeishuBridge {
       if (this.seenMsgids.includes(m.message_id)) return;
       this.seenMsgids.push(m.message_id);
       if (this.seenMsgids.length > 256) this.seenMsgids.splice(0, this.seenMsgids.length - 256);
+      this.chatByMsgId.set(m.message_id, m.chat_id);
+      if (this.chatByMsgId.size > 1024) {
+        const oldest = this.chatByMsgId.keys().next().value;
+        if (oldest !== undefined) this.chatByMsgId.delete(oldest);
+      }
     }
     const chatType: 'single' | 'group' = m.chat_type === 'group' ? 'group' : 'single';
     const text = extractText(m.message_type, m.content, m.mentions);
@@ -177,25 +203,16 @@ export class FeishuBridge {
     void this.core.handleMessage(msg);
   }
 
-  /** reply 失败兜底：查绑定表拿 chatKey 主动发送。 */
-  private async sendToBoundChat(messageId: string, content: string): Promise<void> {
-    // message_id → chatKey 不可反查；遍历绑定找回合，或用 receive_id_type=chat_id 直接发
-    // （飞书 im.message.create 的 receive_id 单聊填 open_id、群聊填 chat_id——
-    // 我们 chatKey 就是 chat_id，两种场景都能直接用）
-    for (const b of this.core.config.bindings) {
-      try {
-        await this.api!.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: b.chatKey,
-            content: JSON.stringify({ text: content }),
-            msg_type: 'text',
-          },
-        });
-        return;
-      } catch { /* 下一个绑定 */ }
-    }
-    this.deps?.log(`[feishu] reply+send 均失败，丢弃回复: ${content.slice(0, 60)}`);
+  /** 主动发到指定会话（chatKey = chat_id，单聊/群聊都可用 receive_id_type=chat_id）。 */
+  private async sendToChat(chatId: string, content: string): Promise<void> {
+    await this.api!.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        content: JSON.stringify({ text: content }),
+        msg_type: 'text',
+      },
+    });
   }
 
   async saveConfig(cfg: WecomBridgeConfig): Promise<WecomBridgeConfig> {
@@ -206,6 +223,7 @@ export class FeishuBridge {
       this.ws = null;
       this.connect(saved.botId, saved.secret);
     } else if (this.ws) {
+      this.stopWatch();
       this.ws.close({ force: true });
       this.ws = null;
       this.lastConnected = false;
@@ -228,6 +246,7 @@ export class FeishuBridge {
   }
 
   dispose(): void {
+    this.stopWatch();
     this.ws?.close({ force: true });
     this.ws = null;
     this.core.dispose();

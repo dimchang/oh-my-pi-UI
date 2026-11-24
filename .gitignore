@@ -72,6 +72,8 @@ omp-*.html
 
 # ===== Runtime temp dir (omp stderr logs, etc.) =====
 .temp/
+# 一次性探针/实验目录（.temp-xxx）：不进仓库
+.temp-*/
 
 # ===== Local agent/IDE workspace cache (like .workbuddy) =====
 .qoder/

@@ -88,7 +88,8 @@ export function killProcessTree(pid: number, sync = false): void {
     const args = ['/PID', String(pid), '/T', '/F'];
     try {
       if (sync) spawnSync('taskkill', args, { windowsHide: true });
-      else spawn('taskkill', args, { windowsHide: true });
+      // 异步 spawn 失败（ENOENT/EACCES 等）以 'error' 事件抛出，无监听会以 uncaught 异常崩主进程
+      else spawn('taskkill', args, { windowsHide: true }).on('error', () => { /* noop */ });
     } catch {
       /* noop */
     }
@@ -249,7 +250,7 @@ export class OmpProcess {
       throw new Error('--no-session 不能与 -r/-c 组合（omp 18.2.1+ 直接报错）');
     }
 
-    const args = ['--mode', 'rpc-ui', '--approval-mode', this.opts.approvalMode ?? 'write'];
+    const args = ['--mode', 'rpc-ui', '--approval-mode', this.opts.approvalMode ?? 'yolo'];
     if (this.opts.noSession) args.push('--no-session');
     if (this.opts.resumeSession) args.push('-r', this.opts.resumeSession);
     else if (this.opts.continueSession) args.push('-c');
@@ -283,12 +284,19 @@ export class OmpProcess {
     }
 
     this.readyFired = false;
-    this.child = spawn(this.opts.ompPath, args, {
-      cwd: this.opts.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: utf8Env(),
-      windowsVerbatimArguments: false,
-    });
+    try {
+      this.child = spawn(this.opts.ompPath, args, {
+        cwd: this.opts.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: utf8Env(),
+        windowsVerbatimArguments: false,
+      });
+    } catch (e) {
+      // spawn 同步抛错（如 EINVAL、参数含 NUL）时上面已打开的日志流不会再被 cleanup，需在此关闭
+      this.logStream?.end();
+      this.logStream = null;
+      throw e;
+    }
 
     this.rl = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.rl.on('line', (line) => {
@@ -301,9 +309,19 @@ export class OmpProcess {
         this.events.onStderr(`[parse-error] ${trimmed.slice(0, 200)} :: ${String(err)}`);
         return;
       }
+      // 合法 JSON 但非对象（如 stdout 混入的 "null"）：下面读 .type 会抛 TypeError 并以 uncaught 崩主进程
+      if (!frame || typeof frame !== 'object') {
+        this.events.onStderr(`[parse-error] non-object frame: ${trimmed.slice(0, 200)}`);
+        return;
+      }
       if (!this.readyFired && (frame as { type?: string }).type === 'ready') {
         this.readyFired = true;
         this.events.onReady();
+        // restart() 等待中：新进程 ready → 兑现 restart Promise（同时清掉 restartReject，
+        // 否则之后该进程的正常退出会被 handleExit 当成"重启失败"吞掉 onExit）。
+        const rs = this.restartResolve;
+        this.restartResolve = null;
+        rs?.();
       }
       this.events.onFrame(frame);
     });
@@ -432,7 +450,8 @@ export class OmpProcess {
     // issue 9：先 flush stderrDecoder，把增量解码器里残留的未完整多字节序列吐出，
     // 避免进程被杀时丢失最后几字节解码输出。
     if (this.stderrDecoder) {
-      const tail = this.stderrDecoder.write(Buffer.alloc(0));
+      // end() 才会吐出残留的不完整多字节序列；write(空 Buffer) 只返回 ''，起不到 flush 作用
+      const tail = this.stderrDecoder.end();
       if (tail) {
         this.logStream?.write(`[${new Date().toISOString()}] ${tail}`);
         this.events.onStderr(tail);

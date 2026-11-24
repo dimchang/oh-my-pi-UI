@@ -21,6 +21,13 @@ export type { SessionTailInfo } from '../shared/ipc-channels';
 import type { SkillInfo } from '../shared/ipc-channels';
 import { ompStat, exportDiagLines } from './diagnostics';
 import { cwdKey, pathsEqual, modelKey } from './utils/path-key';
+import { TEMP_KEY_PREFIX } from './utils/temp-session';
+import {
+  detectCrashInterrupt,
+  lastUserTextFromChat,
+  CRASH_INTERRUPT_TOAST,
+  type CrashInterruptInfo,
+} from './utils/crash-interrupt';
 import { buildThemeCSS, getThemePreset } from './themes';
 import { extractDiff, extractChangeSummary } from './components/DiffView';
 
@@ -185,6 +192,23 @@ export interface ProcState {
   reconFailCount?: number;
 }
 
+/** toast 的可选动作（目前只有「重发上一条」）与常驻开关。
+ *  0.5.39：崩溃中断的红色 toast 必须 sticky——5 秒自动消失用户根本来不及点按钮。 */
+export interface ToastOptions {
+  action?: 'resend';
+  sessionPath?: string;
+  sticky?: boolean;
+}
+
+export interface ToastItem {
+  id: number;
+  text: string;
+  level: string;
+  action?: 'resend';
+  sessionPath?: string;
+  sticky?: boolean;
+}
+
 interface AppState {
   ready: boolean;
   ompExited: number | null | false;
@@ -337,6 +361,61 @@ interface AppState {
    *  典型场景：分叉（branch）后 selectedText 回填到输入框让用户编辑后重发。 */
   draftInput?: string;
   setDraftInput(v: string): void;
+  /** 每会话输入草稿（未发送的文本 + 待发附件，key = sessionPath）。**会话间互相隔离**：
+   *  A 会话打到一半的文字切到 B 不会被带过去，切回 A 原样还在（2026-10-25 修复）。
+   *  运行时态，不持久化（重启后从空草稿开始；tempKey 的草稿在迁移/丢弃时同步清理）。 */
+  composerDrafts: Record<string, { text: string; attachments: Attachment[] }>;
+  /** 写某会话草稿文本。sessionPath 必须显式传（调用点持有快照，禁内部重读指针）。 */
+  setComposerText(sessionPath: string, text: string): void;
+  /** 写某会话待发附件。 */
+  setComposerAttachments(sessionPath: string, attachments: Attachment[]): void;
+  /** 清空某会话草稿（发送成功 / 丢弃 temp 会话 / 删除会话时调用）。 */
+  clearComposerDraft(sessionPath: string): void;
+  /** tempKey→realPath 迁移时草稿跟随迁移（同 sessionNames 语义）。 */
+  migrateComposerDraft(from: string, to: string): void;
+  /** 各会话**进程实际**的模型快照（key = sessionPath）：切会话时立即回显该会话自己的模型，
+   *  不再出现「先显示上一个会话的模型 / 空白」再被 refreshState 纠正的串台观感。
+   *  运行时态，权威记录仍是 lastModelMap（持久化）。 */
+  sessionModels: Record<string, { provider: string; id: string; name?: string }>;
+  /** 写某会话的进程模型快照（展示层缓存，不持久化）。 */
+  setSessionModel(sessionPath: string, m: { provider: string; id: string; name?: string }): void;
+  /** tempKey（`__new_…`）→ omp 进程自报的真实 sessionFile（`get_state.sessionFile`）。
+   *
+   *  探针实证（omp 18.3.2，2026-10-25）：进程 ready 后 `get_state` 立刻返回真实
+   *  `sessionFile`/`sessionId`，但磁盘 .jsonl 要等**首条消息**才创建。这是 tempKey 与
+   *  真实会话之间唯一可靠的绑定，解决三个连带故障：
+   *   ① 侧栏去重——不能同时显示「假占位 `__new_x`」和「它自己的真文件」两条；
+   *   ② 迁移不必靠扫盘猜（进程已死时扫盘候选并不可靠，会认领错会话）；
+   *   ③ 进程被 LRU 淘汰后重新拉起能 `-r` 续接到自己的文件，而不是裂出第二个 .jsonl。
+   *  运行时态，不持久化（tempKey 本身重启即失效）。 */
+  tempRealPath: Record<string, string>;
+  /** 记录 tempKey → 真实 sessionFile 绑定（幂等；realPath 为空/仍是 tempKey 时忽略）。 */
+  bindTempRealPath(tempKey: string, realPath: string): void;
+  /** tempKey → 真实 path 迁移后，绑定跟着换 key（或清掉）。 */
+  migrateTempRealPath(from: string, to: string): void;
+  /** 丢弃 temp 会话时解除绑定（否则它绑定的真实条目会被永久隐藏）。 */
+  unbindTempRealPath(tempKey: string): void;
+  /** 刚迁移到「扫盘结果里还没有」的真实 path：短时保留侧栏条目，避免条目闪没。
+   *  值 = 过期时间戳；过期后交给扫盘结果决定，防陈旧条目永久滞留。 */
+  pendingLocalSessions: Record<string, number>;
+  markPendingLocalSession(path: string, ttlMs?: number): void;
+  /** 已删除会话的"墓碑"（path → 过期时间戳）。删除后立即扫盘可能又把旧条目扫回来
+   *  （文件删除是异步的 / 进程退出前 flush），表现为"右键删了但条目还在"。
+   *  在过期前，扫盘结果里出现这些 path 一律忽略。运行时态，不持久化。 */
+  suppressedSessions: Record<string, number>;
+  /** 给某 path 立墓碑（默认 5 分钟；期间 setSessions 忽略它）。 */
+  suppressSession(path: string, ttlMs?: number): void;
+  /** 新建后**从未提交过消息**的会话（key = 当前 key，spawn 后立刻变成真实 sessionFile）。
+   *  两个用途：
+   *   ① 侧栏条目在扫盘看到该文件之前一直保留（omo 要等首条消息才创建 .jsonl）；
+   *   ② 用户走开时判断"这是个空的新会话"→ 丢弃（连同磁盘上可能已创建的空文件）。
+   *  提交首条消息成功后 commitSession 移除；丢弃时一并清掉。运行时态，不持久化。 */
+  uncommittedSessions: Record<string, true>;
+  markUncommitted(path: string): void;
+  /** 提交过消息 → 不再算"空的新会话"。 */
+  commitSession(path: string): void;
+  /** key 变化时迁移该标记。 */
+  migrateUncommitted(from: string, to: string): void;
   setWorkspacesFile(file: WorkspacesFile): void;
   setCurrentWorkspaceId(id: string | null): void;
   /** 记录 omp 实际 cwd（主进程 OmpCwd 事件推过来） */
@@ -394,9 +473,22 @@ interface AppState {
    *  用于"仅浏览历史不拉起进程"后，需要进程能力（输入/模型列表/思考档位等）时再拉起。 */
   ensureOnline(sessionPath: string): Promise<boolean>;
 
+  /** omp 进程崩溃导致上一轮中断的会话（运行时态，key=sessionPath）。
+   *  0.5.40：侧栏红点 / 右下角红色 toast「重发上一条」的数据源；用户重发或发新消息后清除。 */
+  crashInterrupted: Record<string, CrashInterruptInfo>;
+  /** 用户手动关掉过崩溃 toast 的会话（运行时态，key=sessionPath，value=关闭时刻）。
+   *  只抑制「再次弹 toast」，红点仍在；防止切走再切回时读盘又弹一条。 */
+  crashDismissed: Record<string, number>;
+  /** 标记崩溃中断。返回 true=本次是新增（调用方据此决定是否弹 toast，避免同一次崩溃连弹）。 */
+  markCrashInterrupted(sessionPath: string, info: Omit<CrashInterruptInfo, 'at'>): boolean;
+  /** 清除提醒（重发/发新消息时调用），同时解除 toast 抑制，之后的新崩溃仍可提醒。 */
+  clearCrashInterrupted(sessionPath: string): void;
+  /** 关掉某会话的崩溃 toast：清 toast + 记录抑制，但保留 crashInterrupted（红点继续显示）。 */
+  dismissCrashToast(sessionPath: string): void;
+
   // ---- 轻量全局 toast（供 RPC 失败等场景在任意组件里弹提示）----
-  toasts: Array<{ id: number; text: string; level: string }>;
-  pushToast(text: string, level?: string): void;
+  toasts: ToastItem[];
+  pushToast(text: string, level?: string, opts?: ToastOptions): void;
   dismissToast(id: number): void;
 }
 
@@ -404,10 +496,13 @@ let seq = 0;
 const nid = () => `m${Date.now()}_${seq++}`;
 let userSeq = 0;
 /**
- * loadSessionMessages 的 epoch：每次调用都自增；callback 拿到结果时若发现 epoch 已不是
- * 自己的（说明用户在等待期间又触发了新的加载），就丢弃本次结果，避免旧回调覆盖新数据。
+ * loadSessionMessages 的 epoch（按会话 path 记录）：每次调用都分配一个新序号；callback 拿到结果时
+ * 若发现该 path 的最新序号已不是自己的（说明等待期间同一会话又触发了新的加载），就丢弃本次结果，
+ * 避免旧回调覆盖新数据。必须按 path 区分——全局单值会让「别的会话的读盘」（如看门狗对后台会话的
+ * healFromDisk）把当前会话正在进行的读盘结果整个丢掉，当前会话一直空白。
  */
-let loadEpoch = 0;
+let loadSeq = 0;
+const loadEpochs = new Map<string, number>();
 /** toast 自增 id 计数器：避免 Date.now()+Math.random() 可能的碰撞，且手动关闭后超时回调按 id 过滤无副作用。 */
 let toastSeq = 0;
 
@@ -489,6 +584,19 @@ function mergeContentAndTools(contentParts: MessagePart[], toolParts: ToolPart[]
   return [...thinking, ...toolParts, ...text];
 }
 
+function textOfParts(parts: MessagePart[]): string {
+  return parts.map((p) => (p.kind === 'text' ? p.text : '')).join('');
+}
+
+/** omp 的 user 回显（message_end）是否对应本地这条气泡：omp 实发文本 = 本地文本，或本地文本 + 附件路径块。
+ *  不能"取最后一条 user 就覆盖"：消息桥（企业微信/飞书）直接向会话进程投 prompt、本地不建气泡；
+ *  steer 也会越过排队中的 follow_up 先送达——这两种情况下最后一条 user 都不是本次回显的那条，
+ *  盲目覆盖会把别的问题气泡改写掉。对不上时保持本地气泡原样。 */
+function isUserEcho(local: ChatMessage, ompText: string): boolean {
+  const localText = textOfParts(local.parts);
+  return localText === '' ? ompText === '' : ompText === localText || ompText.startsWith(`${localText}\n\n`);
+}
+
 
 /** 连接状态三色：红=未连接/已退出，绿=就绪，黄=进行中。
  *  输入框权限按钮旁的大号状态胶囊与底部状态栏共用同一份判定，避免两处逻辑漂移。 */
@@ -565,22 +673,27 @@ export interface SessionDotSnapshot {
   unreadSessions: Record<string, boolean>;
   sessionErrors: Record<string, string>;
   uiQueue: UiRequest[];
+  /** 0.5.40：omp 进程崩溃中断的会话 → 红点（覆盖「运行中」的橙点）。 */
+  crashInterrupted?: Record<string, CrashInterruptInfo>;
 }
 
 /** 会话状态点标题（侧栏 tooltip）。 */
 export const SESSION_DOT_TITLES: Record<SessionDot, string> = {
-  red: '出错或等待确认',
+  red: '出错 / 进程崩溃中断 / 等待确认',
   stalled: '运行中但长时间无响应（疑似卡死）',
   orange: '运行中',
   green: '有新结果未查看',
 };
 
 /** 纯函数：给定会话 path 与状态切片，返回应显示的状态点颜色（无则 null）。
- *  优先级：红（出错/待确认）> 灰橙（运行中但静默）> 橙（运行中）> 绿（未读结果）。
+ *  优先级：红（出错/待确认/进程崩溃中断）> 灰橙（运行中但静默）> 橙（运行中）> 绿（未读结果）。
  *  等待确认 = uiQueue 里有 sessionPath 指向该会话的待应答请求（confirm/select/input/editor）。
  *  判据用 lastFrameAt 而非 stuckSince——stuckSince 只在 get_state 对账成功路径写入，
  *  进程失联时永远写不进去（判据自依赖失效，01a0cc6c 事故教训）。 */
 export function sessionDotStatus(sessionPath: string, snap: SessionDotSnapshot, now: number = Date.now()): SessionDot | null {
+  // 0.5.40：崩溃中断优先于一切——进程退出后 isStreaming 可能还残留在镜像里，
+  // 侧栏会继续亮「运行中」橙点，实际那一轮已经死了，必须改成红点。
+  if (snap.crashInterrupted?.[sessionPath]) return 'red';
   if (snap.sessionErrors[sessionPath]) return 'red';
   if (snap.uiQueue.some((q) => q.sessionPath === sessionPath)) return 'red';
   const ps = snap.procStateMap[sessionPath];
@@ -703,6 +816,34 @@ let lastFrameErrLoggedAt = 0;
 // 且 flush 时读取最新 store 状态，避免用旧数据覆盖新数据。
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** 进程 ready 后该恢复成哪个模型（restoreSessionModel 的唯一判据，纯函数可单测）。
+ *
+ *  2026-10-25 修复「会话1的模型被别的会话改掉」：
+ *  旧实现 `lastModelMap[sp] ?? lastModel` 无条件回退全局兜底 —— 任何**没有 per-session
+ *  记录**的老会话（升级前建的、记录丢失的）在进程重起时都会拿「最近在别的会话里选的模型」
+ *  去 setModel，把 omp 从会话文件里恢复出来的正确模型覆盖掉。
+ *
+ *  现在的规则：
+ *  - 有记录 → 用记录（会话自己选的，最权威）；
+ *  - 无记录的**新会话**（tempKey，还没落盘、omp 里只有默认模型）→ 用全局 lastModel，
+ *    满足「新开会话跟最后一次选的模型 / 默认模型走」；
+ *  - 无记录的**老会话** → 返回 undefined，**不碰**进程模型：omp -c/-r 续接时会话文件里
+ *    model_change 已经是它自己的模型，谁也别覆盖。 */
+export function resolveDesiredSessionModel(
+  sessionPath: string,
+  lastModelMap: Record<string, { provider: string; id: string; name?: string }>,
+  lastModel?: { provider: string; id: string; name?: string },
+  /** 是否是"新建会话"（还没有自己的模型记录，应当沿用最后一次选的模型）。
+   *  默认按 tempKey 判定——2026-10-25 起新会话 spawn 后会立刻换成真实 sessionFile，
+   *  调用点必须显式传 uncommittedSessions 的判定结果。 */
+  isNewSession: boolean = sessionPath.startsWith(TEMP_KEY_PREFIX),
+): { provider: string; id: string; name?: string } | undefined {
+  const recorded = lastModelMap[sessionPath];
+  if (recorded) return recorded;
+  if (isNewSession) return lastModel;
+  return undefined;
+}
+
 export const useApp = create<AppState>((set, get) => ({
   ready: false,
   ompExited: false,
@@ -713,6 +854,8 @@ export const useApp = create<AppState>((set, get) => ({
   sessionsMap: {},
   procStateMap: {},
   toasts: [],
+  crashInterrupted: {},
+  crashDismissed: {},
   slashCommands: [],
   skills: [],
   sessions: [],
@@ -798,16 +941,18 @@ export const useApp = create<AppState>((set, get) => ({
   },
   setOmpExited: (code) =>
     set((s) => {
-      // code === null 表示 omp 已上线/恢复，仅清全局流式标志，不动 per-session 状态
+      const cur = s.currentSessionPath ? s.procStateMap[s.currentSessionPath] : undefined;
+      // code === null 表示 omp 已上线/恢复，不动 per-session 状态。
+      // 多进程：onReady 对任意会话进程都会调到这里——全局流式标志须派生自当前显示会话的
+      // ProcState，不能一律清零（否则后台进程 ready 会把当前会话的「生成中」/停止按钮抹掉）。
       if (code === null) {
-        return { ompExited: null, isStreaming: false, isAborting: false };
+        return { ompExited: null, isStreaming: cur?.isStreaming ?? false, isAborting: cur?.isAborting ?? false };
       }
-      // issue 20: omp 进程已退出，所有会话绑定的进程一并失效。重置 per-session procState，
-      // 避免 acquireSession 误判某会话仍在线而复用已退出的进程。
-      const procStateMap: Record<string, ProcState> = {};
-      for (const [k, v] of Object.entries(s.procStateMap)) {
-        procStateMap[k] = { ...v, status: 'offline', isStreaming: false, isAborting: false };
-      }
+      // issue 20: 当前显示会话的 omp 进程已退出。多进程下每会话独立进程，只重置该会话的
+      // procState；其它会话的进程仍在运行，不能一并标 offline（会抹掉后台会话的流式状态）。
+      const procStateMap = s.currentSessionPath && cur
+        ? { ...s.procStateMap, [s.currentSessionPath]: { ...cur, status: 'offline' as const, isStreaming: false, isAborting: false } }
+        : s.procStateMap;
       return { ompExited: code, isStreaming: false, isAborting: false, procStateMap };
     }),
   setStreaming: (v) => set({ isStreaming: v }),
@@ -818,19 +963,54 @@ export const useApp = create<AppState>((set, get) => ({
 
   setSessions: (list) =>
     set((s) => {
-      // 保留尚未落盘的临时会话占位（__new_ 开头）：占位在首条消息提交时插入，而 omp 要到
-      // 该回合的 .jsonl 落盘后才会被扫盘扫到，期间若直接覆盖会让刚出现在侧栏的条目闪一下
-      // 消失。占位在 migrateTempSession 时由真实 path 替换 / 移除（见 App.tsx）。
-      const placeholders = s.sessions.filter(
-        (x) => x.path.startsWith('__new_') && !list.some((y) => y.path === x.path),
+      // ① 去重（2026-10-25）：被某个 tempKey 绑定过的真实 path 不再单独显示 ——
+      //    否则新会话会同时出现「假占位 __new_x」和「它自己的真文件」两条（用户实证）。
+      //    绑定只对「tempKey 仍然存活」的生效：temp 会话被丢弃后必须解除绑定，
+      //    但万一漏了，这里再兜一层（tempKey 既不在列表也不在进程表 → 视为陈旧绑定）。
+      const liveTempKeys = new Set([
+        ...s.sessions.filter((x) => x.path.startsWith(TEMP_KEY_PREFIX)).map((x) => x.path),
+        ...Object.keys(s.procStateMap).filter((k) => k.startsWith(TEMP_KEY_PREFIX)),
+      ]);
+      const hidden = new Set(
+        Object.entries(s.tempRealPath)
+          .filter(([k]) => liveTempKeys.has(k))
+          .map(([, v]) => v),
       );
-      if (placeholders.length === 0) return { sessions: list };
-      return { sessions: [...list, ...placeholders] };
+      // 墓碑（已删除的会话）：扫盘可能又把它们扫回来（文件删除是异步的），忽略之并按需清理过期项。
+      const nowTs = Date.now();
+      let suppressedSessions = s.suppressedSessions;
+      const liveSuppressed = new Set<string>();
+      for (const [k, exp] of Object.entries(s.suppressedSessions)) {
+        if (exp > nowTs) liveSuppressed.add(k);
+        else if (suppressedSessions === s.suppressedSessions) {
+          suppressedSessions = { ...s.suppressedSessions };
+        }
+        if (exp <= nowTs && suppressedSessions !== s.suppressedSessions) delete suppressedSessions[k];
+      }
+      const visible = liveSuppressed.size ? list.filter((x) => !liveSuppressed.has(x.path)) : list;
+      const base = hidden.size ? visible.filter((x) => !hidden.has(x.path)) : visible;
+      // ② 保留本地独有条目（扫盘还看不到的）：
+      //    - 尚未落盘的 temp 占位（__new_）——首条消息提交后才会落盘；
+      //    - 刚迁移到真实 path、但 .jsonl 还没被扫盘看到的条目（pendingLocalSessions）。
+      //    否则侧栏条目会闪一下消失。pending 有过期时间，过期后交给扫盘结果，防滞留。
+      const now = nowTs;
+      const keep = s.sessions.filter((x) => {
+        if (liveSuppressed.has(x.path)) return false;
+        if (base.some((y) => y.path === x.path)) return false;
+        if (x.path.startsWith(TEMP_KEY_PREFIX)) return true;
+        if (s.uncommittedSessions[x.path]) return true; // 空的新会话：还没落盘也要留在侧栏
+        const exp = s.pendingLocalSessions[x.path];
+        return exp !== undefined && exp > now;
+      });
+      const next = keep.length === 0 ? { sessions: base } : { sessions: [...base, ...keep] };
+      return suppressedSessions === s.suppressedSessions
+        ? next
+        : { ...next, suppressedSessions };
     }),
   upsertSessionPlaceholder: (path, cwd) =>
     set((s) => {
-      if (!path.startsWith('__new_')) return {};
-      // 已存在占位（如重入）则不重复插入
+      if (!path) return {};
+      // 已存在（如重入）则不重复插入
       if (s.sessions.some((x) => x.path === path)) return {};
       const placeholder: SessionSummary = {
         path,
@@ -843,7 +1023,10 @@ export const useApp = create<AppState>((set, get) => ({
         mtime: Date.now(),
         cwdExists: true, // 占位会话的 cwd 刚由用户选定/当前工作区给出，必然有效
       };
-      return { sessions: [...s.sessions, placeholder] };
+      return {
+        sessions: [...s.sessions, placeholder],
+        pendingLocalSessions: { ...s.pendingLocalSessions, [path]: Date.now() + 120_000 },
+      };
     }),
   setSkills: (list) => set({ skills: list }),
   setCurrentSessionPath: (p) => {
@@ -873,6 +1056,10 @@ export const useApp = create<AppState>((set, get) => ({
       retryInfo: '',
       retrySessionPath: null,
       retryStartedAt: 0,
+      // 压缩提示同理：auto_compaction_end 只对当前显示会话生效，切走后原会话的结束帧
+      // 不会再清它，不清就会串到新会话上常亮「压缩中」（在线会话由 refreshState 按 omp 真值回填）。
+      isCompacting: false,
+      compactionInfo: '',
       ...cleared,
     });
   },
@@ -885,6 +1072,12 @@ export const useApp = create<AppState>((set, get) => ({
   removedCwds: [],
   lastModel: undefined,
   lastModelMap: {},
+  sessionModels: {},
+  composerDrafts: {},
+  tempRealPath: {},
+  pendingLocalSessions: {},
+  uncommittedSessions: {},
+  suppressedSessions: {},
   unreadSessions: {},
   sessionErrors: {},
   ompCwd: null,
@@ -988,34 +1181,182 @@ export const useApp = create<AppState>((set, get) => ({
   setOmpCwd: (cwd) => set({ ompCwd: cwd }),
   setDraftInput: (v) => set({ draftInput: v }),
 
+  // ---- 每会话草稿（会话间隔离，2026-10-25）----
+  setComposerText: (sessionPath, text) => {
+    if (!sessionPath) return;
+    set((s) => {
+      const cur = s.composerDrafts[sessionPath];
+      if (cur && cur.text === text) return s;
+      return {
+        composerDrafts: {
+          ...s.composerDrafts,
+          [sessionPath]: { text, attachments: cur?.attachments ?? [] },
+        },
+      };
+    });
+  },
+  setComposerAttachments: (sessionPath, attachments) => {
+    if (!sessionPath) return;
+    set((s) => {
+      const cur = s.composerDrafts[sessionPath];
+      if (cur && cur.attachments === attachments) return s;
+      return {
+        composerDrafts: {
+          ...s.composerDrafts,
+          [sessionPath]: { text: cur?.text ?? '', attachments },
+        },
+      };
+    });
+  },
+  clearComposerDraft: (sessionPath) => {
+    if (!sessionPath) return;
+    set((s) => {
+      if (!s.composerDrafts[sessionPath]) return s;
+      const composerDrafts = { ...s.composerDrafts };
+      delete composerDrafts[sessionPath];
+      return { composerDrafts };
+    });
+  },
+  migrateComposerDraft: (from, to) => {
+    if (!from || !to || from === to) return;
+    set((s) => {
+      const cur = s.composerDrafts[from];
+      if (!cur) return s;
+      const composerDrafts = { ...s.composerDrafts };
+      delete composerDrafts[from];
+      // 目标已有草稿时以目标为准（用户已经在那边打了新的），不覆盖
+      if (!composerDrafts[to]) composerDrafts[to] = cur;
+      return { composerDrafts };
+    });
+  },
+
+  // ---- 每会话模型快照（展示层，运行时态）----
+  setSessionModel: (sessionPath, m) => {
+    if (!sessionPath) return;
+    set((s) => ({ sessionModels: { ...s.sessionModels, [sessionPath]: m } }));
+  },
+
+  // ---- tempKey → 真实 sessionFile 绑定（2026-10-25）----
+  bindTempRealPath: (tempKey, realPath) => {
+    if (!tempKey.startsWith(TEMP_KEY_PREFIX) || !realPath) return;
+    if (realPath.startsWith(TEMP_KEY_PREFIX)) return; // 仍是假 key，没意义
+    set((s) => {
+      if (s.tempRealPath[tempKey] === realPath) return s;
+      // 同一个真实 path 只允许被一个 tempKey 绑定（后来的不覆盖先来的）
+      for (const [k, v] of Object.entries(s.tempRealPath)) {
+        if (v === realPath && k !== tempKey) return s;
+      }
+      return { tempRealPath: { ...s.tempRealPath, [tempKey]: realPath } };
+    });
+  },
+  migrateTempRealPath: (from, to) => {
+    set((s) => {
+      const bound = s.tempRealPath[from];
+      if (!bound) return s;
+      const tempRealPath = { ...s.tempRealPath };
+      delete tempRealPath[from];
+      return { tempRealPath };
+    });
+  },
+  unbindTempRealPath: (tempKey) => {
+    set((s) => {
+      if (!(tempKey in s.tempRealPath)) return s;
+      const tempRealPath = { ...s.tempRealPath };
+      delete tempRealPath[tempKey];
+      return { tempRealPath };
+    });
+  },
+  markPendingLocalSession: (path, ttlMs = 120_000) => {
+    if (!path) return;
+    set((s) => ({ pendingLocalSessions: { ...s.pendingLocalSessions, [path]: Date.now() + ttlMs } }));
+  },
+  suppressSession: (path, ttlMs = 5 * 60_000) => {
+    if (!path) return;
+    set((s) => ({ suppressedSessions: { ...s.suppressedSessions, [path]: Date.now() + ttlMs } }));
+  },
+  markUncommitted: (path) => {
+    if (!path) return;
+    set((s) => {
+      if (s.uncommittedSessions[path]) return s;
+      return { uncommittedSessions: { ...s.uncommittedSessions, [path]: true } };
+    });
+  },
+  commitSession: (path) => {
+    if (!path) return;
+    set((s) => {
+      if (!s.uncommittedSessions[path]) return s;
+      const uncommittedSessions = { ...s.uncommittedSessions };
+      delete uncommittedSessions[path];
+      // 提交后条目的保留权从 uncommitted 交给 pendingLocal（再给 2 分钟）：
+      // omp 只在 turn 结束时才 flush .jsonl，提交瞬间扫盘还看不到它，给足落盘时间。
+      return {
+        uncommittedSessions,
+        pendingLocalSessions: { ...s.pendingLocalSessions, [path]: Date.now() + 120_000 },
+      };
+    });
+  },
+  migrateUncommitted: (from, to) => {
+    if (!from || !to || from === to) return;
+    set((s) => {
+      if (!s.uncommittedSessions[from]) return s;
+      const uncommittedSessions = { ...s.uncommittedSessions };
+      delete uncommittedSessions[from];
+      uncommittedSessions[to] = true;
+      return { uncommittedSessions };
+    });
+  },
+
   setLastModelForSession: (sessionPath, m) => {
-    set((s) => ({ lastModel: m, lastModelMap: { ...s.lastModelMap, [sessionPath]: m } }));
+    set((s) => ({
+      lastModel: m,
+      lastModelMap: { ...s.lastModelMap, [sessionPath]: m },
+      sessionModels: { ...s.sessionModels, [sessionPath]: m },
+    }));
     // 写回磁盘
     get().persistWorkspaces();
   },
 
   seedSessionModel: (sessionPath, m) => {
-    set((s) => ({ lastModelMap: { ...s.lastModelMap, [sessionPath]: m } }));
+    set((s) => ({
+      lastModelMap: { ...s.lastModelMap, [sessionPath]: m },
+      sessionModels: { ...s.sessionModels, [sessionPath]: m },
+    }));
     get().persistWorkspaces();
   },
 
   migrateLastModelKey: (from, to) => {
     const s = get();
     const m = s.lastModelMap[from];
-    if (!m) return;
+    // 展示层快照同样跟随迁移（key 变了，缓存也要跟着换，否则切回来拿不到自己的模型）
+    const sessionModels = { ...s.sessionModels };
+    const sm = sessionModels[from];
+    if (sm) {
+      delete sessionModels[from];
+      if (!sessionModels[to]) sessionModels[to] = sm;
+    }
+    if (!m) {
+      if (sm) set({ sessionModels });
+      return;
+    }
     const next = { ...s.lastModelMap };
     delete next[from];
     if (!next[to]) next[to] = m;
-    set({ lastModelMap: next });
+    set({ lastModelMap: next, sessionModels });
     get().persistWorkspaces();
   },
 
   removeLastModelKey: (sessionPath) => {
     const s = get();
-    if (!s.lastModelMap[sessionPath]) return;
+    const hasSm = !!s.sessionModels[sessionPath];
+    const sessionModels = { ...s.sessionModels };
+    if (hasSm) delete sessionModels[sessionPath];
+    if (!s.lastModelMap[sessionPath]) {
+      if (hasSm) set({ sessionModels });
+      return;
+    }
     const next = { ...s.lastModelMap };
     delete next[sessionPath];
-    set({ lastModelMap: next });
+    set({ lastModelMap: next, sessionModels });
     get().persistWorkspaces();
   },
 
@@ -1205,7 +1546,7 @@ export const useApp = create<AppState>((set, get) => ({
     const ws = session && s.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(session.cwd));
     const cwd = ws?.cwd ?? session?.cwd;
     if (!cwd) return false;
-    const mode = ws?.approvalMode ?? 'write';
+    const mode = ws?.approvalMode ?? 'yolo';
     try {
       await window.omp.acquire(sessionPath, cwd, mode);
       return true;
@@ -1224,9 +1565,18 @@ export const useApp = create<AppState>((set, get) => ({
       },
     })),
 
-  pushToast: (text, level = 'info') => {
+  pushToast: (text, level = 'info', opts) => {
     const id = ++toastSeq;
-    set((s) => ({ toasts: [...s.toasts, { id, text, level }] }));
+    set((s) => {
+      // 0.5.40：同一会话的崩溃提醒只保留一条——重连成功时把「已断开」那条
+      // 原地换成「已重连但不会自动继续」，避免右下角叠两条。
+      const base = opts?.action === 'resend' && opts.sessionPath
+        ? s.toasts.filter((t) => !(t.action === 'resend' && t.sessionPath === opts.sessionPath))
+        : s.toasts;
+      return { toasts: [...base, { id, text, level, ...opts }] };
+    });
+    // 0.5.39：带动作/需用户注意的红色提醒不自动消失，必须点按钮或 × 才关。
+    if (opts?.sticky) return;
     setTimeout(() => {
       // 按 id 精确过滤：手动关闭后此处仍为 no-op，无重复删除副作用
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
@@ -1234,11 +1584,40 @@ export const useApp = create<AppState>((set, get) => ({
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
+  markCrashInterrupted: (sessionPath, info) => {
+    const s = get();
+    const prev = s.crashInterrupted[sessionPath];
+    const now = Date.now();
+    // 同一次崩溃会同时触发 onExit / resume 帧 / 读盘历史三处判据：
+    // 5 分钟内只算一次，不重复弹 toast；后到的判据可以补齐缺失的 lastUserText。
+    if (prev && now - prev.at < 5 * 60 * 1000) {
+      if (!prev.lastUserText && info.lastUserText) {
+        set({ crashInterrupted: { ...s.crashInterrupted, [sessionPath]: { ...prev, lastUserText: info.lastUserText } } });
+      }
+      return false;
+    }
+    set({ crashInterrupted: { ...s.crashInterrupted, [sessionPath]: { ...info, at: now } } });
+    return true;
+  },
+  clearCrashInterrupted: (sessionPath) => set((s) => {
+    if (!s.crashInterrupted[sessionPath] && !s.crashDismissed[sessionPath]) return {};
+    const crashInterrupted = { ...s.crashInterrupted };
+    const crashDismissed = { ...s.crashDismissed };
+    delete crashInterrupted[sessionPath];
+    delete crashDismissed[sessionPath]; // 用户重发了 → 之后的新崩溃要能再提醒
+    return { crashInterrupted, crashDismissed };
+  }),
+  dismissCrashToast: (sessionPath) => set((s) => ({
+    toasts: s.toasts.filter((t) => !(t.action === 'resend' && t.sessionPath === sessionPath)),
+    crashDismissed: { ...s.crashDismissed, [sessionPath]: Date.now() },
+  })),
+
   loadSessionMessages: (path) => {
     // 从磁盘读历史（进程未拉起时显示磁盘内容）
     // 每次调用递增 epoch；callback 拿到结果时若发现 epoch 已变（说明等待期间又有新加载），
     // 就丢弃，避免把旧结果覆盖到新的 sessionsMap 上（rapid switch 时尤其重要）。
-    const epoch = ++loadEpoch;
+    const epoch = ++loadSeq;
+    loadEpochs.set(path, epoch);
     // 竞态守卫（2026-09-13「回复不显示」排查配套）：记下读盘起始时刻的帧活跃时间。
     // 读盘期间若该会话有新帧落地，磁盘快照必然过时（omp 在 agent_end 才 flush JSONL），
     // 此时用快照覆盖 buffer 会把已流式显示的内容回滚/抹掉。配合下方 buffer 非空检查：
@@ -1247,7 +1626,12 @@ export const useApp = create<AppState>((set, get) => ({
     const readStartFrameAt = get().procStateMap[path]?.lastFrameAt ?? 0;
     void import('./rpc-client').then(({ rpc }) => {
       return rpc.readSessionMessages(path).then((msgs) => {
-        if (epoch !== loadEpoch) return; // 已被更新的加载取代，丢弃旧结果
+        if (epoch !== loadEpochs.get(path)) return; // 已被同会话更新的加载取代，丢弃旧结果
+        // 0.5.39：磁盘历史尾部若有 session_exit / aborted 终止帧，说明这个会话停在
+        // 「进程崩溃、turn 被中断」的状态。用户在崩溃后重启 App 再打开会话也要看到红色提醒，
+        // 所以判据落在读盘结果上，不依赖崩溃当时的帧流（omp 崩溃前不发结束帧）。
+        const crash = detectCrashInterrupt(msgs);
+        if (crash) reportCrashInterrupt(path, crash);
         const stNow = get();
         const psNow = stNow.procStateMap[path];
         const existing = stNow.sessionsMap[path];
@@ -1260,6 +1644,8 @@ export const useApp = create<AppState>((set, get) => ({
         // 而是重建为 ToolPart 走 ToolCard（自带折叠）。其余走 contentToParts。
         const chat: ChatMessage[] = [];
         for (const m of msgs) {
+          // 0.5.39：session_exit 等 role='custom' 帧是判据不是聊天内容，跳过避免生成空气泡。
+          if (m.role === 'custom') continue;
           if (m.role === 'toolResult') {
             // 工具返回结果：构建 ToolPart，追加到最近一条 assistant 消息（与实时流一致）。
             const toolPart: ToolPart = {
@@ -1320,6 +1706,8 @@ export const useApp = create<AppState>((set, get) => ({
     // 优先用调用方显式传入的 sessionPath（onSend/onGuide/onQueue 的快照）；
     // 未传时才退回 currentSessionPath（兼容旧调用点）。
     const path = sessionPath ?? st.currentSessionPath ?? '';
+    // 0.5.39：用户发了新消息（onSend / steer / 排队 / 重发）＝ 已处理这次中断，红色提醒撤掉。
+    get().clearCrashInterrupted(path);
     const userMsg: ChatMessage = {
       id: `u${Date.now()}_${userSeq++}`,
       role: 'user',
@@ -1431,9 +1819,10 @@ export const useApp = create<AppState>((set, get) => ({
         if (errorText && !isDisplay) markErrorText = errorText;
         const buf = getBuf();
         let matched = false;
+        const ompUserText = msg.role === 'user' ? textOfParts(contentToParts(msg)) : '';
         for (let i = buf.length - 1; i >= 0; i--) {
           const m = buf[i];
-          if (m && m.role === msg.role && (m.streaming || msg.role === 'user')) {
+          if (m && m.role === msg.role && (m.streaming || (msg.role === 'user' && isUserEcho(m, ompUserText)))) {
             const toolParts = m.parts.filter((p): p is ToolPart => p.kind === 'tool');
             let parts = mergeContentAndTools(contentToParts(msg), toolParts);
             if (parts.length === 0 && errorText) {
@@ -1692,12 +2081,19 @@ function updateToolInBuffer(
   toolCallId: string,
   fn: (p: ToolPart) => ToolPart,
 ): ChatMessage[] {
-  return buffer.map((m) => ({
-    ...m,
-    parts: m.parts.map((p) =>
-      p.kind === 'tool' && p.toolCallId === toolCallId ? fn(p) : p,
-    ),
-  }));
+  // 只替换真正含该工具卡的消息，其余保持原引用——否则每个 tool_execution_update 帧
+  // （task 进度约 150ms 一帧）都会让全部消息换新身份，stabilizeTurns / AssistantTurn 的
+  // memo 全部失效、窗口内所有回合每帧重解析 markdown（2026-09-27 流式卡死同一根因）。
+  return buffer.map((m) =>
+    m.parts.some((p) => p.kind === 'tool' && p.toolCallId === toolCallId)
+      ? {
+          ...m,
+          parts: m.parts.map((p) =>
+            p.kind === 'tool' && p.toolCallId === toolCallId ? fn(p) : p,
+          ),
+        }
+      : m,
+  );
 }
 
 // ---- 子智能体（omp `task` 工具派生的 agent 作业）归一化 ----
@@ -1862,9 +2258,12 @@ function syncSubagentsFromAsyncResult(msg: AgentMessage, prev: SubagentJob[]): S
  *  入参恒为帧数据（真实 id），据此淘汰被改名的占位条目。 */
 function mergeSubagents(prev: SubagentJob[], incoming: SubagentJob[]): SubagentJob[] {
   const byId = new Map(prev.map((j) => [j.id, j]));
+  const incomingIds = new Set(incoming.map((j) => j.id));
   const superseded = new Set<string>();
   for (const inc of incoming) {
     for (const old of prev) {
+      // 占位 id 本身也出现在帧里 = 它就是真 id（只是有个同前缀兄弟，如 Review 与 Review-UI），不能淘汰
+      if (incomingIds.has(old.id)) continue;
       if (old.provisional && old.status === 'pending' && inc.id.startsWith(`${old.id}-`)) superseded.add(old.id);
     }
   }
@@ -1954,6 +2353,31 @@ function applyThemePreset(themeId?: string): void {
   el.textContent = buildThemeCSS(preset);
 }
 
+/** '#rrggbb' / '#rgb' → 'H S% L%'；非法输入返回 null。 */
+export function hexToHslTriplet(hex: string): string | null {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  let h6 = m[1]!;
+  if (h6.length === 3) h6 = h6.split('').map((c) => c + c).join('');
+  const r = parseInt(h6.slice(0, 2), 16) / 255;
+  const g = parseInt(h6.slice(2, 4), 16) / 255;
+  const b = parseInt(h6.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let h = 0;
+  let s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return `${Math.round(h)} ${Math.round(s * 100)}% ${Math.round(l * 100)}%`;
+}
+
 export function applyAppearance(a?: AppearanceConfig | null): void {
   const root = document.documentElement;
   if (!root) return;
@@ -1985,11 +2409,13 @@ export function applyAppearance(a?: AppearanceConfig | null): void {
     root.style.removeProperty('--bg');
   }
 
-  if (a?.accentColor) {
+  const accentHsl = a?.accentColor ? hexToHslTriplet(a.accentColor) : null;
+  if (a?.accentColor && accentHsl) {
     root.style.setProperty('--accent', a.accentColor);
-    root.style.setProperty('--accent-brand', a.accentColor);
-    root.style.setProperty('--accent-main-000', a.accentColor);
-    root.style.setProperty('--accent-main-100', a.accentColor);
+    // styles.css 的 --accent-* 存的是 HSL 分量（供 hsl(var(--x) / α) 使用），不能直接写 hex
+    root.style.setProperty('--accent-brand', accentHsl);
+    root.style.setProperty('--accent-main-000', accentHsl);
+    root.style.setProperty('--accent-main-100', accentHsl);
   } else {
     root.style.removeProperty('--accent');
     root.style.removeProperty('--accent-brand');
@@ -2015,4 +2441,39 @@ export async function syncCustomCss(list?: CustomCssConfig[] | null): Promise<vo
   } catch (e) {
     console.error('[syncCustomCss]', e);
   }
+}
+
+/** 手动关掉崩溃 toast 后的抑制窗口：窗口内切走/切回读盘不再弹，但侧栏红点仍在。 */
+const CRASH_TOAST_DISMISS_MS = 24 * 60 * 60 * 1000;
+
+/** 0.5.39 / 0.5.40：右下角红色常驻 toast（带「重发上一条」按钮）。
+ *  sticky —— 5 秒自动消失根本来不及点；同会话只保留一条（重连时换文案）。
+ *  用户手动关掉后 24h 内不再弹，避免切会话读盘反复骚扰。 */
+export function pushCrashInterruptToast(sessionPath: string, text: string = CRASH_INTERRUPT_TOAST): void {
+  const st = useApp.getState();
+  const dismissedAt = st.crashDismissed[sessionPath];
+  if (dismissedAt && Date.now() - dismissedAt < CRASH_TOAST_DISMISS_MS) return;
+  st.pushToast(text, 'error', { action: 'resend', sessionPath, sticky: true });
+}
+
+/**
+ * 0.5.39 / 0.5.40：崩溃中断的统一上报入口。
+ * 三个来源都走这里：① onExit 进程非正常退出；② 帧流里的 aborted 终止帧；③ 读盘历史尾部。
+ * markCrashInterrupted 负责「同一次崩溃只弹一次 toast」；无论是否被抑制，状态都会标记
+ * （侧栏红点的数据源），silent 用于调用方稍后自己弹重连提示。
+ */
+export function reportCrashInterrupt(
+  sessionPath: string,
+  info: Omit<CrashInterruptInfo, 'at'>,
+  opts?: { silent?: boolean },
+): boolean {
+  if (!sessionPath) return false;
+  const st = useApp.getState();
+  // 进程退出时磁盘可能还没 flush 终止帧，直接从当前消息缓冲兜底取「上一条」。
+  const lastUserText = info.lastUserText
+    || lastUserTextFromChat(st.sessionsMap[sessionPath] ?? [])
+    || undefined;
+  const isNew = st.markCrashInterrupted(sessionPath, { ...info, lastUserText });
+  if (isNew && !opts?.silent) pushCrashInterruptToast(sessionPath);
+  return isNew;
 }

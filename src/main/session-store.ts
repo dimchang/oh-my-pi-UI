@@ -86,17 +86,18 @@ async function titleFallback(header: SessionHeader, filePath: string): Promise<s
         if (entry.message?.role === 'user') {
           const textPart = entry.message.content?.find((c) => c.type === 'text');
           if (textPart?.text) {
-            const t = textPart.text.trim();
+            // 与渲染层 deriveSessionName 同源：取首个非空行，兜底名用全角括号（必须与 UNNAMED_SESSION 一致）
+            const t = textPart.text.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
             // 过短/纯符号文本（如误发的"？"）不配当标题——侧栏一排"？""！！"毫无信息量。
             // 回退"未命名会话"，等 omp 空闲时总结出正式标题（title 行/session_titles.db）。
             if (t.length >= 2 && !/^[？！?!.。,，、\s]+$/.test(t)) return t.slice(0, 40);
-            return '(未命名会话)';
+            return '（未命名会话）';
           }
         }
       } catch { /* skip */ }
     }
   } catch { /* noop */ }
-  return '(未命名会话)';
+  return '（未命名会话）';
 }
 
 /** 并发控制器：限制同时进行的异步任务数，避免数百个 session 文件同时打开耗尽 fd。 */
@@ -249,6 +250,18 @@ export async function readSessionMessages(filePath: string): Promise<ReplayMessa
         };
         if (entry.type === 'custom' && entry.customType === 'tool_execution_start' && entry.data?.toolCallId) {
           toolMeta.set(entry.data.toolCallId, { toolName: entry.data.toolName, args: entry.data.args });
+          continue;
+        }
+        // 0.5.39：omp 崩溃前会落盘 customType:'session_exit'（reason/kind/pendingToolCalls）。
+        // 保留成一条 role:'custom' 回放消息，渲染层据此识别「上一轮被进程崩溃中断」。
+        // 其它 custom 帧（tool_execution_* 等）依旧不进消息列表。
+        if (entry.type === 'custom' && entry.customType === 'session_exit') {
+          out.push({
+            role: 'custom',
+            content: [],
+            customType: 'session_exit',
+            details: entry.data,
+          });
           continue;
         }
         if (entry && entry.type === 'message' && entry.message) {

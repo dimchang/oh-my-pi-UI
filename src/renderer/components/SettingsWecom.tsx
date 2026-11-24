@@ -122,11 +122,18 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
     bindings: status?.bindings ?? [],
   });
 
+  // saveConfig 的返回值是落盘配置（BridgeConfig：无 connected/activeChats，且含明文 secret），
+  // 不能直接当状态用——bindings 非空时渲染 status.activeChats.includes 会抛错白屏。保存后重新取状态。
+  const saveAndRefresh = async (cfg: WecomBridgeConfig): Promise<void> => {
+    await api.saveConfig(cfg);
+    setStatus(await api.getStatus());
+  };
+
   const onSave = async (): Promise<void> => {
     setBusy(true);
     setSaveError(null);
     try {
-      setStatus(await api.saveConfig(buildConfig()));
+      await saveAndRefresh(buildConfig());
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -136,14 +143,16 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
 
   const onToggle = async (): Promise<void> => {
     if (!status) return;
-    if (!status.enabled && (!botId.trim() || !secret.trim())) {
+    // Secret 不随状态下发，表单里永远是空的：BotID 与已保存的一致时留空即沿用已存 Secret
+    // （主进程 ChatBridgeCore.saveConfig 对空 secret 回填），不要求每次启用都重新输入
+    if (!status.enabled && (!botId.trim() || (!secret.trim() && botId.trim() !== status.botId))) {
       setSaveError(`启用前请先填写并保存 ${api.idLabel} 与 Secret`);
       return;
     }
     setBusy(true);
     setSaveError(null);
     try {
-      setStatus(await api.saveConfig({ ...buildConfig(), enabled: !status.enabled }));
+      await saveAndRefresh({ ...buildConfig(), enabled: !status.enabled });
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -156,7 +165,8 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
     const dir = await window.omp.openDirDialog();
     if (!dir) return;
     const id = cwdKey(dir);
-    if (!workspaces.some((w) => w.id === id)) {
+    const existing = workspaces.find((w) => w.id === id);
+    if (!existing) {
       const ws: Workspace = {
         id,
         cwd: dir,
@@ -169,7 +179,8 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
       setCurrentWorkspaceId(id);
       persistWorkspaces();
     }
-    setCwd(dir);
+    // 已登记的工作空间用其 cwd 原值（对话框返回值大小写/分隔符可能不同，下拉框会匹配不到选项）
+    setCwd(existing?.cwd ?? dir);
   };
 
   const connected = status?.connected ?? false;
@@ -228,6 +239,8 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
           onChange={(e) => setCwd(e.target.value)}
         >
           {workspaces.length === 0 && <option value="">（无工作空间）</option>}
+          {/* 已保存的目录不在工作空间列表里（如工作空间已移除）：单列出来，避免下拉显示 A 实际保存 B */}
+          {cwd && !workspaces.some((w) => w.cwd === cwd) && <option value={cwd}>{cwd}</option>}
           {workspaces.map((w) => (
             <option key={w.id} value={w.cwd}>
               {w.displayName || w.cwd}

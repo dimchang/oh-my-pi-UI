@@ -91,6 +91,8 @@ const api: OmpApi = {
   closeWindow: () => ipcRenderer.invoke(IPC.WindowClose),
   isWindowMaximized: () => ipcRenderer.invoke(IPC.WindowIsMaximized),
   onWindowMaximizedChange: (cb) => subscribe<boolean>(IPC.WindowMaximizedChange, cb),
+  // 任务栏闪动提醒（0.5.23）：需要用户介入（权限确认等）且窗口未聚焦时闪动
+  flashWindow: (flash: boolean) => ipcRenderer.invoke(IPC.WindowFlash, flash),
 
   // 自定义标题栏菜单动作
   menuReload: () => ipcRenderer.invoke(IPC.MenuReload),

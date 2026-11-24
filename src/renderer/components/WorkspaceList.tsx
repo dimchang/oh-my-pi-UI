@@ -373,7 +373,7 @@ export const WorkspaceList: React.FC<{
         <div className="modal-overlay" onMouseDown={() => { setRenameTarget(null); setRenameValue(''); }}>
           {/* Enter/Escape 在主输入框里处理（见 input.onKeyDown）；此处只在焦点落在按钮等非输入框时响应 Escape */}
           <div className="modal" onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => {
-            if (e.key === 'Escape') { setRenameTarget(null); setRenameValue(''); }
+            if (e.key === 'Escape' && !e.nativeEvent.isComposing) { setRenameTarget(null); setRenameValue(''); }
           }}>
             <div className="modal-title">重命名工作空间</div>
             <input
@@ -382,6 +382,7 @@ export const WorkspaceList: React.FC<{
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return; // 输入法组字中的 Enter/Esc 交给输入法
                 // 把 Enter/Escape 处理移入输入框，避免被 input 的 stopPropagation 吞掉
                 if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submitRename(); }
                 else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setRenameTarget(null); setRenameValue(''); }

@@ -103,12 +103,19 @@ export const FileTree: React.FC<{ cwd: string }> = ({ cwd }) => {
   const [version, setVersion] = useState(0);
   const [fileMenu, setFileMenu] = useState<FileMenuState | null>(null);
   const pushToast = useApp((s) => s.pushToast);
+  /** 根目录加载序号：快速切换工作区时只认最后一次请求，防止慢的旧 cwd 结果覆盖新 cwd */
+  const loadSeqRef = React.useRef(0);
 
   const load = useCallback((dir: string) => {
+    const seq = ++loadSeqRef.current;
     void window.omp.listFiles(dir).then((list) => {
+      if (seq !== loadSeqRef.current) return;
       setEntries(list);
       setError('');
-    }).catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    }).catch((e) => {
+      if (seq !== loadSeqRef.current) return;
+      setError(e instanceof Error ? e.message : String(e));
+    });
   }, []);
 
   useEffect(() => {

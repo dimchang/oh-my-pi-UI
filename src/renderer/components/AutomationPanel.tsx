@@ -20,8 +20,8 @@ import type { ModelInfo } from '../../shared/rpc-types';
 
 /** OMP-UI 权限选项（与工作空间 approvalMode 同一语义，spawn 时生效）。 */
 const APPROVAL_OPTIONS: Array<{ value: ApprovalMode; label: string }> = [
-  { value: 'write', label: 'Write · 默认' },
-  { value: 'yolo', label: 'YOLO · 全自动' },
+  { value: 'yolo', label: 'YOLO · 全自动（默认）' },
+  { value: 'write', label: 'Write' },
   { value: 'always-ask', label: 'Always Ask · 每次询问' },
 ];
 
@@ -63,14 +63,14 @@ function draftFromTask(t: AutomationTask | null, defaultCwd: string): TaskDraft 
     const d = new Date(Date.now() + 5 * 60_000);
     d.setSeconds(0, 0);
     return {
-      id: '', name: '', prompt: '', cwd: defaultCwd, approvalMode: 'write', modelKey: '',
+      id: '', name: '', prompt: '', cwd: defaultCwd, approvalMode: 'yolo', modelKey: '',
       kind: 'once', at: fmtLocal(d.getTime(), true), time: '09:00', weekday: 1, day: 1,
       validUntilEnabled: false, validUntil: fmtLocal(Date.now(), false), enabled: true,
     };
   }
   const s = t.schedule;
   return {
-    id: t.id, name: t.name, prompt: t.prompt, cwd: t.cwd, approvalMode: t.approvalMode ?? 'write',
+    id: t.id, name: t.name, prompt: t.prompt, cwd: t.cwd, approvalMode: t.approvalMode ?? 'yolo',
     modelKey: t.model ? `${t.model.provider}/${t.model.id}` : '',
     kind: s.kind ?? 'once',
     at: s.at ?? fmtLocal(Date.now(), true),
@@ -133,7 +133,10 @@ const TaskModal: React.FC<{
       .catch(() => undefined);
   }, []);
 
-  const canSubmit = draft.prompt.trim().length > 0 && !!draft.cwd;
+  // 时间被清空（time/datetime-local 可清空）或勾了截止日期却没填：保存后任务永不触发 / 静默变长期有效
+  const scheduleOk = (draft.kind === 'once' ? !!draft.at : !!draft.time)
+    && (!draft.validUntilEnabled || !!draft.validUntil);
+  const canSubmit = draft.prompt.trim().length > 0 && !!draft.cwd && scheduleOk;
   const submit = () => {
     if (!canSubmit) return;
     const prev = useApp.getState().automations.find((t) => t.id === draft.id) ?? null;
@@ -176,6 +179,11 @@ const TaskModal: React.FC<{
                   onChange={(e) => set('cwd', e.target.value)}
                 >
                   {workspaces.length === 0 && <option value="">（无工作空间）</option>}
+                  {/* 草稿 cwd 不在列表里（未选当前工作空间 / 原工作空间已移除）时单列一项，
+                      否则下拉框显示第一个工作空间而实际值是 ''（确定按钮灰掉）或旧路径 */}
+                  {workspaces.length > 0 && !workspaces.some((w) => w.cwd === draft.cwd) && (
+                    <option value={draft.cwd}>{draft.cwd || '（请选择工作空间）'}</option>
+                  )}
                   {workspaces.map((w) => (
                     <option key={w.id} value={w.cwd}>{w.displayName}</option>
                   ))}
@@ -196,6 +204,10 @@ const TaskModal: React.FC<{
                 <Icon name="model" size={13} />
                 <select value={draft.modelKey} onChange={(e) => set('modelKey', e.target.value)}>
                   <option value="">默认模型</option>
+                  {/* 任务已选模型不在（缓存）列表里时也要显示，否则下拉显示「默认模型」实际却用该模型 */}
+                  {draft.modelKey && !models.some((m) => `${m.provider}/${m.id}` === draft.modelKey) && (
+                    <option value={draft.modelKey}>{draft.modelKey}</option>
+                  )}
                   {models.map((m) => (
                     <option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
                       {m.name && m.name !== m.id ? `${m.name} (${m.provider}/${m.id})` : `${m.provider}/${m.id}`}
@@ -344,6 +356,12 @@ export const AutomationPanel: React.FC<{
   }, [tasks, search]);
   const enabled = useMemo(() => filtered.filter((t) => t.enabled !== false), [filtered]);
   const paused = useMemo(() => filtered.filter((t) => t.enabled === false), [filtered]);
+  // 搜索框同时作用于运行记录（placeholder：搜索定时任务/记录）
+  const filteredRuns = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return runs;
+    return runs.filter((r) => r.taskName.toLowerCase().includes(q));
+  }, [runs, search]);
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => {
@@ -394,7 +412,7 @@ export const AutomationPanel: React.FC<{
         <span className="automation-row-name">{t.name}</span>
         <span className="automation-row-tag">定时任务</span>
         <span className="automation-row-desc">{describeSchedule(t.schedule)}</span>
-        <span className="automation-row-desc">· {approvalLabel(t.approvalMode ?? 'write')}</span>
+        <span className="automation-row-desc">· {approvalLabel(t.approvalMode ?? 'yolo')}</span>
         {t.model && <span className="automation-row-desc">· {t.model.name ?? `${t.model.provider}/${t.model.id}`}</span>}
       </div>
       <div className="automation-row-actions">
@@ -492,10 +510,10 @@ export const AutomationPanel: React.FC<{
           </>
         ) : (
           <>
-            {runs.length === 0 ? (
-              <div className="automation-empty">暂无运行记录</div>
+            {filteredRuns.length === 0 ? (
+              <div className="automation-empty">{runs.length === 0 ? '暂无运行记录' : '没有匹配的运行记录'}</div>
             ) : (
-              runs.map((r) => <RunRow key={r.id} run={r} />)
+              filteredRuns.map((r) => <RunRow key={r.id} run={r} />)
             )}
           </>
         )}

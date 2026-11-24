@@ -90,8 +90,14 @@ async function loadDoc(file: string): Promise<Document> {
 async function writeDoc(file: string, doc: Document): Promise<void> {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${randomUUID()}`;
-  await fs.promises.writeFile(tmp, doc.toString(), 'utf8');
-  await fs.promises.rename(tmp, file);
+  try {
+    await fs.promises.writeFile(tmp, doc.toString(), 'utf8');
+    await fs.promises.rename(tmp, file);
+  } catch (e) {
+    // 写入/rename 失败（Windows 上目标被占用时常见 EPERM）：清掉临时文件，避免在配置目录堆积垃圾
+    await fs.promises.unlink(tmp).catch(() => undefined);
+    throw e;
+  }
 }
 
 /** 新增/覆盖一个自定义 provider（只动 providers.<id> 子树，其余内容原样保留） */

@@ -24,6 +24,32 @@ const PING_INTERVAL_MS = 30_000;
 /** 断线重连基础退避 */
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
+/** 连续多少次心跳无回执即判定连接已死（半开连接不会触发 close 事件） */
+const MAX_MISSED_PINGS = 2;
+/** stream / markdown 内容上限：20480 字节（UTF-8），超出服务端拒收 */
+export const WECOM_CONTENT_MAX_BYTES = 20_480;
+
+/** 按 UTF-8 字节数截取尾部（保留最新内容），不从代理对中间切开。 */
+export function tailUtf8Bytes(s: string, maxBytes: number): string {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  let bytes = 0;
+  let i = s.length;
+  while (i > 0) {
+    const c = s.charCodeAt(i - 1);
+    let units = 1;
+    let size: number;
+    if (c < 0x80) size = 1;
+    else if (c < 0x800) size = 2;
+    else if (c >= 0xdc00 && c <= 0xdfff && i >= 2 && (s.charCodeAt(i - 2) & 0xfc00) === 0xd800) {
+      size = 4;
+      units = 2;
+    } else size = 3;
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    i -= units;
+  }
+  return s.slice(i);
+}
 
 /** aibot_msg_callback 的 body 结构（文本场景） */
 export interface WecomMsgCallbackBody {
@@ -66,6 +92,7 @@ export interface WecomClientEvents {
 }
 
 interface WsLike {
+  binaryType: string;
   send(data: string): void;
   close(code?: number, reason?: string): void;
   addEventListener(ev: 'open', cb: () => void): void;
@@ -81,8 +108,12 @@ export class WecomClient {
   private reconnectAttempt = 0;
   private stopped = false;
   private subscribed = false;
+  private missedPings = 0;
   /** req_id → resolve（响应关联） */
   private pending = new Map<string, { resolve: (ok: boolean, errmsg?: string) => void; timer: NodeJS.Timeout }>();
+  /** req_id → 该 req_id 上最后一个回复请求。回执按 req_id 关联，同一 req_id 的回复必须串行
+   *  （等上一帧回执再发下一帧），否则 pending 被覆盖、回执错配、流式帧乱序。 */
+  private replyChains = new Map<string, Promise<void>>();
   /** 最近 N 条 msgid，事件排重（企微回调可能重试） */
   private seenMsgids: string[] = [];
   private readonly seenCap = 256;
@@ -129,17 +160,18 @@ export class WecomClient {
 
   // ---- 回复原语 ----
 
-  /** 回复纯文本（透传 req_id）。 */
+  /** 回复纯文本（透传 req_id）。aibot_respond_msg 不支持 text（text 仅用于欢迎语），
+   *  用一帧即 finish 的 stream 承载。 */
   respondText(reqId: string, content: string): Promise<void> {
-    return this.request('aibot_respond_msg', reqId, {
-      msgtype: 'text',
-      text: { content },
+    return this.reply(reqId, {
+      msgtype: 'stream',
+      stream: { id: randomUUID(), finish: true, content: tailUtf8Bytes(content, WECOM_CONTENT_MAX_BYTES) },
     });
   }
 
   /** 回复 markdown（透传 req_id）。 */
   respondMarkdown(reqId: string, content: string): Promise<void> {
-    return this.request('aibot_respond_msg', reqId, {
+    return this.reply(reqId, {
       msgtype: 'markdown',
       markdown: { content },
     });
@@ -150,9 +182,9 @@ export class WecomClient {
    * 官方约束：从首条流式消息起 10 分钟内必须 finish，否则服务端自动结束。
    */
   respondStream(reqId: string, streamId: string, content: string, finish: boolean): Promise<void> {
-    return this.request('aibot_respond_msg', reqId, {
+    return this.reply(reqId, {
       msgtype: 'stream',
-      stream: { id: streamId, finish, content },
+      stream: { id: streamId, finish, content: tailUtf8Bytes(content, WECOM_CONTENT_MAX_BYTES) },
     });
   }
 
@@ -162,11 +194,25 @@ export class WecomClient {
       chatid: chatKey,
       chat_type: chatType,
       msgtype: 'markdown',
-      markdown: { content },
+      markdown: { content: tailUtf8Bytes(content, WECOM_CONTENT_MAX_BYTES) },
     });
   }
 
   // ---- 内部 ----
+
+  /** 同一 req_id 的被动回复排队串行发送。 */
+  private reply(reqId: string, body: unknown): Promise<void> {
+    const prev = this.replyChains.get(reqId);
+    const p = (prev ? prev.catch(() => undefined) : Promise.resolve()).then(() =>
+      this.request('aibot_respond_msg', reqId, body),
+    );
+    this.replyChains.set(reqId, p);
+    const done = (): void => {
+      if (this.replyChains.get(reqId) === p) this.replyChains.delete(reqId);
+    };
+    p.then(done, done);
+    return p;
+  }
 
   private connect(): void {
     if (this.stopped) return;
@@ -176,12 +222,17 @@ export class WecomClient {
       return;
     }
     const ws = new WS(WECOM_WS_URL) as unknown as WsLike;
+    // 全局 WebSocket（undici）默认 binaryType='blob'，下面只解析 ArrayBuffer/视图
+    ws.binaryType = 'arraybuffer';
     this.ws = ws;
+    // 所有监听先判 this.ws === ws：stop()/心跳判死丢弃的旧 socket 迟到的事件不能污染新连接
     ws.addEventListener('open', () => {
+      if (this.ws !== ws) return;
       // 连上后立刻订阅（有频率保护，只发一次）
-      void this.subscribe();
+      void this.subscribe(ws);
     });
     ws.addEventListener('message', (e) => {
+      if (this.ws !== ws) return;
       let data: string;
       if (typeof e.data === 'string') data = e.data;
       else if (e.data instanceof ArrayBuffer) data = Buffer.from(e.data).toString('utf8');
@@ -190,12 +241,20 @@ export class WecomClient {
       this.handleFrame(data);
     });
     ws.addEventListener('close', (e) => {
+      if (this.ws !== ws) return;
       const reason = `code=${e.code}${e.reason ? ` (${e.reason})` : ''}`;
       this.onDisconnected(reason);
     });
     ws.addEventListener('error', () => {
       // error 事件后必跟 close，统一在 close 处理，避免双路径重连
     });
+  }
+
+  /** 主动判死当前连接：立即走断线/重连流程，旧 socket 尽力关闭（其迟到事件被忽略）。 */
+  private dropConnection(ws: WsLike, reason: string): void {
+    if (this.ws !== ws) return;
+    this.onDisconnected(reason);
+    try { ws.close(4000, reason); } catch { /* noop */ }
   }
 
   private onDisconnected(reason: string): void {
@@ -221,22 +280,40 @@ export class WecomClient {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
   }
 
-  private subscribe(): Promise<void> {
+  private subscribe(ws: WsLike): Promise<void> {
     return this.request('aibot_subscribe', randomUUID(), {
       bot_id: this.botId,
       secret: this.secret,
-    }).then(() => {
-      this.subscribed = true;
-      this.reconnectAttempt = 0;
-      this.startPing();
-      this.events.onOpen();
-    });
+    }).then(
+      () => {
+        if (this.ws !== ws) return;
+        this.subscribed = true;
+        this.reconnectAttempt = 0;
+        this.startPing(ws);
+        this.events.onOpen();
+      },
+      (e) => {
+        if (this.ws !== ws) return;
+        // 凭证错误/订阅超时：上报（「测试连接」靠它出结果），断开后按退避重连
+        this.events.onError(`订阅失败：${e instanceof Error ? e.message : String(e)}`);
+        this.dropConnection(ws, 'subscribe failed');
+      },
+    );
   }
 
-  private startPing(): void {
+  private startPing(ws: WsLike): void {
+    this.missedPings = 0;
     this.pingTimer = setInterval(() => {
-      // ping 失败会被 pending 超时吞掉；连接级死亡由 close 事件处理
-      void this.request('ping', randomUUID(), undefined).catch(() => undefined);
+      // 半开连接（休眠唤醒/NAT 超时等）可能迟迟不触发 close：连续无回执即主动判死重连
+      if (this.missedPings >= MAX_MISSED_PINGS) {
+        this.dropConnection(ws, 'heartbeat timeout');
+        return;
+      }
+      this.missedPings += 1;
+      void this.request('ping', randomUUID(), undefined).then(
+        () => { this.missedPings = 0; },
+        () => undefined,
+      );
     }, PING_INTERVAL_MS);
   }
 

@@ -5,6 +5,7 @@ import { useApp } from '../store';
 import { Icon } from './Icon';
 import { rpc } from '../rpc-client';
 import { cwdKey } from '../utils/path-key';
+import { TEMP_KEY_PREFIX } from '../utils/temp-session';
 import type { SkillDetail, SkillInfo } from '../../shared/ipc-channels';
 import type { SlashCommand } from '../../shared/rpc-types';
 
@@ -161,6 +162,13 @@ export const SkillsPanel: React.FC = () => {
     if (!sp) return;
     const ps = st.procStateMap[sp];
     if (!ps || ps.status !== 'online') return;
+    // 未落盘新会话（__new_ 或已 adopt 真实 id 但尚未发消息的 uncommittedSessions）：
+    // release+acquire 会以普通 acquire 重拉一个不带 --append-system-prompt 的新进程（系统提示词静默丢失），
+    // 与 reloadCurrentSession 一致跳过
+    if (sp.startsWith(TEMP_KEY_PREFIX) || st.uncommittedSessions[sp]) {
+      useApp.getState().pushToast('当前新会话尚未发送消息，技能变更将在下次新建会话后生效', 'info');
+      return;
+    }
     if (ps.isStreaming || ps.isAborting) {
       useApp.getState().pushToast('当前会话正在生成，技能变更将在会话进程下次重启后生效', 'info');
       return;
@@ -169,7 +177,7 @@ export const SkillsPanel: React.FC = () => {
     const ws = session && st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(session.cwd));
     const cwd = ws?.cwd ?? session?.cwd;
     if (!cwd) return;
-    const mode = ws?.approvalMode ?? 'write';
+    const mode = ws?.approvalMode ?? 'yolo';
     await rpc.release(sp).catch(() => undefined);
     await rpc.acquire(sp, cwd, mode).catch((e) =>
       useApp.getState().pushToast(`重启会话进程失败：${e instanceof Error ? e.message : String(e)}`, 'error'),

@@ -36,12 +36,12 @@ export const TodoPanel: React.FC = () => {
           // issue #105: 用稳定的内容派生 key（不含数组 index），重排序时不错乱 DOM 状态
           <div key={`phase:${phase.phase ?? ''}`} className="todo-phase">
             <div className="todo-phase-title">{phase.phase}</div>
-            {phase.items?.map((item: TodoItem) => (
+            {phase.items && phase.items.length > 0 ? phase.items.map((item: TodoItem) => (
               <div key={`item:${phase.phase ?? ''}:${item.content}`} className="todo-item">
                 <StatusIcon status={item.status} />
                 <span className="todo-text">{item.content}</span>
               </div>
-            )) ?? (
+            )) : (
               <div className="todo-item todo-empty-phase">(空)</div>
             )}
           </div>

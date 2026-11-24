@@ -92,6 +92,17 @@ let appQuitting = false;
 let wecomBridge: WecomBridge | null = null;
 let feishuBridge: FeishuBridge | null = null;
 
+// 单实例（仅打包版，dev 仍可与打包版并行调试）：重复启动会出现两个主进程——两个 automation ticker
+// 各凭自己的内存缓存把同一定时任务各触发一次、两套消息桥抢同一机器人长连接、并发覆盖同一批 userData JSON。
+// 第二个实例直接退出并唤起已有窗口。
+const gotSingleInstanceLock = !app.isPackaged || app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) app.quit();
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+
 const WORKSPACES_FILE = path.join(app.getPath('userData'), 'workspaces.json');
 
 function emptyWorkspacesFile(): WorkspacesFile {
@@ -143,6 +154,17 @@ function parseWorkspacesFile(raw: string): WorkspacesFile {
     // 注意：本函数是"白名单式重建对象"，saveWorkspacesFile 里新增的字段必须在这里同步补上，
     // 否则该字段会在下次启动被剥掉、随后任意一次 persist 被永久抹掉（hooks 曾踩此坑）。
     hooks: Array.isArray(parsed.hooks) ? (parsed.hooks as WorkspacesFile['hooks']) : undefined,
+    lastModelMap: parsed.lastModelMap && typeof parsed.lastModelMap === 'object' && !Array.isArray(parsed.lastModelMap)
+      ? Object.fromEntries(Object.entries(parsed.lastModelMap as Record<string, any>).filter(
+          ([, v]) => v && typeof v === 'object' && typeof v.provider === 'string' && typeof v.id === 'string',
+        ))
+      : undefined,
+    inputBehavior: parsed.inputBehavior === 'queue' || parsed.inputBehavior === 'guide' ? parsed.inputBehavior : undefined,
+    sessionNames: parsed.sessionNames && typeof parsed.sessionNames === 'object' && !Array.isArray(parsed.sessionNames)
+      ? Object.fromEntries(Object.entries(parsed.sessionNames as Record<string, unknown>).filter(
+          (kv): kv is [string, string] => typeof kv[1] === 'string',
+        ))
+      : undefined,
   };
 }
 
@@ -262,6 +284,8 @@ function createWindow(): void {
     },
   });
   mainWindow.on('closed', () => { mainWindow = null; appendDiag('window closed'); });
+  // 任务栏闪动（0.5.23）：用户切回窗口（聚焦）即停止闪动，即使 renderer 事件没跟上也有兜底
+  mainWindow.on('focus', () => { try { mainWindow?.flashFrame(false); } catch { /* 忽略 */ } });
   // ---- 白屏取证：这几类事件此前完全没人记录，白屏才会"零日志" ----
   const wc = mainWindow.webContents;
   // ---- 链接兜底（v0.5.19）：渲染层 MarkdownLink 已拦截 markdown 链接左键，这里兜住
@@ -433,7 +457,7 @@ function registerIpc(): void {
       } catch {
         // 进程已离线（如 temp key 被释放）——静默忽略，不影响用户体验
       } finally {
-        pool.unpin(sessionPath);
+        pool.unpin(sessionPath, (cmd as ExtensionUIResponseCommand).id);
       }
       return { type: 'response', command: 'extension_ui_response', success: true };
     }
@@ -451,8 +475,10 @@ function registerIpc(): void {
     if (!pool) throw new Error('pool not initialized');
     // 钩子是全局的，续接/恢复的历史会话也一并加载（读取持久化配置，解析出 --hook 参数）。
     const wf = await loadWorkspacesFile();
-    const hooks = await resolveHookArgs(wf.hooks, sessionPath);
-    await pool.acquire(sessionPath, cwd, approvalMode ?? 'write', hooks);
+    // 已在线进程的包装钩子可能写在另一个 key 的缓存目录（temp key 迁移成真实路径后 / 消息桥拉起的会话）：
+    // 沿用该目录解析，否则路径不同会被 pool 误判为 hooks 变更而重起进程（打断进行中的回合）。
+    const hooks = await resolveHookArgs(wf.hooks, sessionPath, liveHookCacheDir(pool.get(sessionPath)?.hooks));
+    await pool.acquire(sessionPath, cwd, approvalMode ?? 'yolo', hooks);
   });
 
   ipcMain.handle(IPC.OmpNewSession, async (_e, tempKeyFromRenderer: string, cwd: string, approvalMode?: ApprovalMode) => {
@@ -469,7 +495,7 @@ function registerIpc(): void {
     const wf = await loadWorkspacesFile();
     const systemPrompt = wf.systemPrompt;
     const hooks = await resolveHookArgs(wf.hooks, tempKey);
-    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'write', systemPrompt, hooks);
+    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'yolo', systemPrompt, hooks);
     return { sessionPath: tempKey };
   });
 
@@ -510,7 +536,9 @@ function registerIpc(): void {
   ipcMain.handle(IPC.WecomGet, async () => wecomBridge?.status() ?? null);
   ipcMain.handle(IPC.WecomSave, async (_e, cfg: WecomBridgeConfig) => {
     if (!wecomBridge) throw new Error('bridge not initialized');
-    return await wecomBridge.saveConfig(cfg);
+    // 契约返回 WecomBridgeStatus：不要把含明文 secret 的落盘配置回传给渲染层
+    await wecomBridge.saveConfig(cfg);
+    return wecomBridge.status();
   });
   ipcMain.handle(IPC.WecomTest, async (_e, botId: string, secret: string) => {
     // 用临时 client 验证凭证，不动已保存配置与现有连接
@@ -531,7 +559,8 @@ function registerIpc(): void {
   ipcMain.handle(IPC.FeishuGet, async () => feishuBridge?.status() ?? null);
   ipcMain.handle(IPC.FeishuSave, async (_e, cfg: WecomBridgeConfig) => {
     if (!feishuBridge) throw new Error('bridge not initialized');
-    return await feishuBridge.saveConfig(cfg);
+    await feishuBridge.saveConfig(cfg);
+    return feishuBridge.status();
   });
   ipcMain.handle(IPC.FeishuTest, async (_e, botId: string, secret: string) => {
     // 用临时 WSClient 连一次验证凭证；飞书长连接握手成功即视为有效
@@ -611,10 +640,14 @@ function registerIpc(): void {
   });
   ipcMain.handle(IPC.ClipboardWriteText, async (_e, text: string) => { clipboard.writeText(String(text ?? '')); });
   ipcMain.handle(IPC.ShowItemInFolder, async (_e, fullPath: string) => {
-    let exists = false;
-    try { exists = (await fs.promises.stat(fullPath)).isFile(); } catch { exists = false; }
-    if (fullPath && exists) shell.showItemInFolder(path.normalize(fullPath));
-    else { const dir = path.dirname(fullPath || ''); const res = await shell.openPath(dir); if (res) throw new Error(res); }
+    let st: fs.Stats | null = null;
+    try { st = await fs.promises.stat(fullPath); } catch { st = null; }
+    if (fullPath && st?.isFile()) shell.showItemInFolder(path.normalize(fullPath));
+    else {
+      // 目录（如 temp 会话传入的工作空间 cwd）直接打开其本身；不存在的路径才退回父目录
+      const dir = fullPath && st?.isDirectory() ? path.normalize(fullPath) : path.dirname(fullPath || '');
+      const res = await shell.openPath(dir); if (res) throw new Error(res);
+    }
   });
   ipcMain.handle(IPC.ShowSaveDialog, async (_e, defaultPath?: string) => {
     if (!mainWindow) return null;
@@ -661,6 +694,13 @@ function registerIpc(): void {
     return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
   });
   // 添加文件到对话：多选文件，返回绝对路径 + 名称 + 大小（渲染进程据此拼进 prompt / 展示芯片）
+  // 用户亲自在系统文件对话框里选中的图片路径 → 记入 userPickedImagePaths（ReadImageAsDataUrl
+  // 白名单放行）。理由：用户明确选择 = 明确授权读取；否则工作区外图片（如 Pictures/Screenshots）
+  // 会被白名单拒读，渲染层退回 path 形式发给 omp，而 omp 18.3.2 对 path 形式图片不加载文件、
+  // 请求构建时在图片缓存键处崩（"undefined is not an object (evaluating 'e.data.length')"）。
+  const userPickedImagePaths = new Set<string>();
+  const PICKED_IMAGE_LIMIT = 200; // FIFO 上限，防 Set 无限增长
+  const IMAGE_PICK_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
   ipcMain.handle(IPC.DialogOpenFiles, async (_e, defaultPath?: string) => {
     if (!mainWindow) return null;
     const r = await dialog.showOpenDialog(mainWindow, {
@@ -674,6 +714,16 @@ function registerIpc(): void {
       r.filePaths.map(async (p) => {
         let size = 0;
         try { size = (await fs.promises.stat(p)).size; } catch { /* 读不到大小就用 0 */ }
+        const ext = path.extname(p).toLowerCase().replace(/^\./, '');
+        if (IMAGE_PICK_EXT.has(ext)) {
+          try { userPickedImagePaths.add((await fs.promises.realpath(p)).toLowerCase()); }
+          catch { userPickedImagePaths.add(path.resolve(p).toLowerCase()); }
+          while (userPickedImagePaths.size > PICKED_IMAGE_LIMIT) {
+            const first = userPickedImagePaths.values().next().value;
+            if (first === undefined) break;
+            userPickedImagePaths.delete(first);
+          }
+        }
         return { path: p, name: path.basename(p), size };
       }),
     );
@@ -727,18 +777,20 @@ function registerIpc(): void {
     const e = path.extname(filePath || '').toLowerCase().replace(/^\./, '').replace(/[^a-z0-9]/g, '');
     if (!VIEW_EXT.has(e)) throw new Error('不支持的图片格式');
 
-    // 安全白名单：仅允许读取 pasted-images/ 或工作区内的图片，防本地文件泄露（含符号链接逃逸）
+    // 安全白名单：仅允许读取 pasted-images/、工作区内、或用户经文件对话框亲自选中的图片，
+    // 防本地文件泄露（含符号链接逃逸）。userPickedImagePaths = 用户明确授权的文件集合。
     const userDataDir = app.getPath('userData');
     const pastedDir = path.join(userDataDir, 'pasted-images');
     let pastedDirReal: string | null = null;
     try { pastedDirReal = (await fs.promises.realpath(pastedDir)).toLowerCase(); } catch { pastedDirReal = null; }
+    let real: string;
+    try { real = (await fs.promises.realpath(filePath)).toLowerCase(); }
+    catch { real = path.resolve(filePath).toLowerCase(); }
     let allowed = false;
     if (pastedDirReal) {
-      let real: string;
-      try { real = (await fs.promises.realpath(filePath)).toLowerCase(); }
-      catch { real = path.resolve(filePath).toLowerCase(); }
       if (real === pastedDirReal || real.startsWith(pastedDirReal + path.sep)) allowed = true;
     }
+    if (!allowed && userPickedImagePaths.has(real)) allowed = true;
     if (!allowed && (await isWithinWorkspaces(filePath))) allowed = true;
     if (!allowed) throw new Error('禁止读取该路径的图片');
 
@@ -879,19 +931,67 @@ function registerIpc(): void {
     });
     const PER_PROVIDER_CAP = 1000;
     const out: ModelInfo[] = [];
+
+    // 上游字段差异极大（实测：openrouter 有 context_length + top_provider.max_completion_tokens；
+    // xiaomi 的 /models 只返回 {id, object, owned_by}；workbuddy 网关额外给 credits 倍率）。
+    // 原则：**只取到才写，取不到就留 undefined** —— 绝不写 0 / 默认 128000 之类的假值，
+    // 否则 UI 会把「不知道」渲染成「0 ctx / 128K」，比空着更误导。
+    const positiveNum = (v: unknown): number | undefined => {
+      const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    // 倍率只认 "x0.00" / "0.29" 这类格式；openrouter 的 pricing.prompt（美元/token 字符串）
+    // 语义完全不同，字段名也不同，绝不能映射过来。
+    const creditRatio = (v: unknown): string | undefined =>
+      typeof v === 'string' && /^x?\d+(\.\d+)?$/i.test(v.trim()) ? v.trim() : undefined;
+
+    // 思考能力：omp 的 discovery 只做 id 猜名，不读 supports_reasoning / reasoning_supported_efforts，
+    // 于是自定义 provider 的思考模型在 omp 里一律 reasoning:false → 用户选任何档位都被 clamp 回 off。
+    // 这里把上游说法单独存成 upstream* 字段（不冒充运行时结论），供「一键修复」写 models.yml。
+    const THINK_LEVELS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    const upstreamEfforts = (v: unknown): string[] | undefined => {
+      if (!Array.isArray(v)) return undefined;
+      const out = v
+        .filter((x): x is string => typeof x === 'string')
+        .map((x) => x.trim().toLowerCase())
+        .filter((x) => THINK_LEVELS.has(x));
+      return out.length > 0 ? out : undefined;
+    };
+
+    type ParsedModel = {
+      id: string; name?: string; contextWindow?: number; maxTokens?: number; credits?: string;
+      upstreamReasoning?: boolean; upstreamEfforts?: string[];
+    };
     await Promise.all(targets.map(async ([pid, cfg]) => {
       try {
         const base = (cfg.baseUrl ?? '').replace(/\/+$/, '');
         if (!base) return;
         let url: string;
-        let parse: (json: any) => { id: string; name?: string }[];
+        let parse: (json: any) => ParsedModel[];
         if (cfg.discovery?.type === 'ollama') {
           url = `${base}/api/tags`;
           parse = (j) => Array.isArray(j?.models) ? j.models.map((m: any) => ({ id: m.name, name: m.name })) : [];
         } else {
           // openai-models-list（默认）：GET {base}/models
           url = `${base}/models`;
-          parse = (j) => Array.isArray(j?.data) ? j.data.map((m: any) => ({ id: m.id, name: m.name ?? m.id })) : [];
+          parse = (j) => Array.isArray(j?.data) ? j.data.map((m: any): ParsedModel => {
+            const efforts = upstreamEfforts(m.reasoning_supported_efforts);
+            return {
+              id: m.id,
+              name: m.name ?? m.id,
+              // 上下文：context_length（openrouter/workbuddy）→ context_window → max_allowed_size
+              contextWindow: positiveNum(m.context_length) ?? positiveNum(m.context_window) ?? positiveNum(m.max_allowed_size),
+              // 输出上限：max_output_tokens（workbuddy）→ top_provider.max_completion_tokens（openrouter）
+              maxTokens: positiveNum(m.max_output_tokens) ?? positiveNum(m.top_provider?.max_completion_tokens),
+              credits: creditRatio(m.credits),
+              // 只有上游明确说支持才写 true；不支持/没提 → undefined（不臆断 false）
+              upstreamReasoning:
+                m.supports_reasoning === true || m.only_reasoning === true || (efforts?.length ?? 0) > 0
+                  ? true
+                  : undefined,
+              upstreamEfforts: efforts,
+            };
+          }) : [];
         }
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (cfg.auth !== 'none' && cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
@@ -902,7 +1002,16 @@ function registerIpc(): void {
           if (!res.ok) return;
           const json = await res.json();
           for (const m of parse(json).slice(0, PER_PROVIDER_CAP)) {
-            if (m?.id) out.push({ provider: pid, id: m.id, name: m.name ?? m.id });
+            if (!m?.id) continue;
+            // 只写有值的键：undefined 键在 IPC 序列化里会消失，但显式省略更明确，
+            // 也避免覆盖合并时把旧缓存里的已知值抹空。
+            const entry: ModelInfo = { provider: pid, id: m.id, name: m.name ?? m.id };
+            if (m.contextWindow !== undefined) entry.contextWindow = m.contextWindow;
+            if (m.maxTokens !== undefined) entry.maxTokens = m.maxTokens;
+            if (m.credits !== undefined) entry.credits = m.credits;
+            if (m.upstreamReasoning !== undefined) entry.upstreamReasoning = m.upstreamReasoning;
+            if (m.upstreamEfforts !== undefined) entry.upstreamEfforts = m.upstreamEfforts as ModelInfo['upstreamEfforts'];
+            out.push(entry);
           }
         } finally {
           clearTimeout(t);
@@ -918,6 +1027,10 @@ function registerIpc(): void {
     ipcMain.handle(IPC.WindowMaximize, () => { if (!mainWindow) return; if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize(); });
     ipcMain.handle(IPC.WindowClose, () => mainWindow?.close());
     ipcMain.handle(IPC.WindowIsMaximized, () => mainWindow?.isMaximized() ?? false);
+    // 任务栏闪动提醒（0.5.23）：等待用户决策时由 renderer 驱动；窗口重新聚焦即停
+    ipcMain.handle(IPC.WindowFlash, (_e, flash: boolean) => {
+      try { mainWindow?.flashFrame(!!flash); } catch { /* flashFrame 无窗口时可能抛，忽略 */ }
+    });
     ipcMain.handle(IPC.MenuReload, () => mainWindow?.webContents.reload());
     ipcMain.handle(IPC.MenuForceReload, () => mainWindow?.webContents.reloadIgnoringCache());
     ipcMain.handle(IPC.MenuToggleDevTools, () => { if (!mainWindow) return; if (mainWindow.webContents.isDevToolsOpened()) mainWindow.webContents.closeDevTools(); else mainWindow.webContents.openDevTools(); });
@@ -927,17 +1040,18 @@ function registerIpc(): void {
     ipcMain.handle(IPC.MenuToggleFullscreen, () => { if (!mainWindow) return; mainWindow.setFullScreen(!mainWindow.isFullScreen()); });
     ipcMain.handle(IPC.MenuShowAbout, () => showAboutDialog());
     ipcMain.handle(IPC.MenuStatsClick, () => { mainWindow?.webContents.send(IPC.MenuStats); });
-
-    // 渲染侧诊断上报（白屏取证）：renderer 把心跳/错误快照交过来落盘。
-    // 用 on 而非 handle：卡死的 renderer 不该为了写日志等回执。
-    ipcMain.on(IPC.DiagLog, (_e, lines: unknown) => {
-      if (!Array.isArray(lines)) return;
-      for (const l of lines.slice(0, 500)) appendDiag(`renderer ${String(l)}`);
-    });
   }
+
+  // 渲染侧诊断上报（白屏取证）：renderer 把心跳/错误快照交过来落盘（与标题栏无关，所有平台都注册）。
+  // 用 on 而非 handle：卡死的 renderer 不该为了写日志等回执。
+  ipcMain.on(IPC.DiagLog, (_e, lines: unknown) => {
+    if (!Array.isArray(lines)) return;
+    for (const l of lines.slice(0, 500)) appendDiag(`renderer ${String(l)}`);
+  });
 }
 
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
   ompPath = resolveOmpPath();
   if (!ompPath) {
     dialog.showErrorBox('未找到 OMP', '无法在系统中找到 omp 命令行工具（oh-my-pi）。\n\n请先安装 omp，并确保 omp 命令在系统 PATH 中可用。\n\n常见安装方式：\n  bun install -g oh-my-pi\n\n或通过环境变量 OMP_PATH 手动指定路径。');
@@ -951,9 +1065,15 @@ app.whenReady().then(() => {
     onFrame: (sessionPath, frame) => {
       // 交互式 UI 请求（confirm/select/input/editor/open_url）入队等用户应答：
       // pin 该会话，防止它在用户犹豫期间被 LRU 淘汰（等待中不输出帧，会被误判最闲）。
-      const fr = frame as { type?: string; method?: string };
-      if (fr.type === 'extension_ui_request' && ['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
-        pool?.pin(sessionPath);
+      const fr = frame as { type?: string; method?: string; id?: unknown; targetId?: unknown };
+      if (fr.type === 'extension_ui_request' && typeof fr.id === 'string') {
+        if (['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
+          pool?.pin(sessionPath, fr.id);
+        } else if (fr.method === 'cancel') {
+          // omp 撤销了某个待应答请求（如超时）：渲染层直接出队、不会再发应答，这里必须释放其 pin，
+          // 否则该会话永久不可被 LRU 淘汰，5 个会话都这样后新建会话一律失败。
+          pool?.unpin(sessionPath, typeof fr.targetId === 'string' ? fr.targetId : fr.id);
+        }
       }
       // 消息桥订阅帧流（流式增量 + agent_end 终态）
       wecomBridge?.handleFrame(sessionPath, frame as Record<string, unknown>);
@@ -961,7 +1081,8 @@ app.whenReady().then(() => {
       sendToRenderer(IPC.RpcEvent, { ...(frame as object), __sessionPath: sessionPath });
     },
     onReady: (sessionPath) => sendToRenderer(IPC.RpcReady, sessionPath),
-    onExit: (sessionPath, code) => { pool?.unpin(sessionPath); wecomBridge?.handleProcessExit(sessionPath); feishuBridge?.handleProcessExit(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
+    onExit: (sessionPath, code) => { wecomBridge?.handleProcessExit(sessionPath); feishuBridge?.handleProcessExit(sessionPath); sendToRenderer(IPC.OmpExit, { sessionPath, code }); },
+    onReplaced: (sessionPath) => { wecomBridge?.handleProcessExit(sessionPath); feishuBridge?.handleProcessExit(sessionPath); },
     // 审查 P1 修复（6e76c57 曾删掉此行）：PoolEvents.onStderr 是必填且 omp-pool 无条件调用，
     // 缺失时任何 stderr（parse-error / spawn-error / backpressure / omp-exit 提示…）都会
     // TypeError 崩主进程。渲染层 App.tsx 仍订阅此通道（pushStderr），恢复转发即恢复原功能。
@@ -1140,7 +1261,8 @@ async function isWithinWorkspaces(dirPath: string): Promise<boolean> {
   for (const w of wf.workspaces) {
     let base: string;
     try { base = (await fs.promises.realpath(w.cwd)).toLowerCase(); } catch { base = path.resolve(w.cwd).toLowerCase(); }
-    if (target === base || target.startsWith(base + path.sep)) return true;
+    // 盘符根（如 d:\）本身已以分隔符结尾，不能再拼一个
+    if (target === base || target.startsWith(base.endsWith(path.sep) ? base : base + path.sep)) return true;
   }
   return false;
 }
@@ -1216,14 +1338,24 @@ function sessionHookCacheDir(sessionPath: string): string {
   return path.join(app.getPath('userData'), 'hook-cache', h);
 }
 
+/** 在线进程 --hook 列表里包装文件所在的缓存目录（hook-cache 根或其 session 子目录）；无包装文件返回 undefined。 */
+function liveHookCacheDir(liveHooks?: string[]): string | undefined {
+  const root = path.join(app.getPath('userData'), 'hook-cache');
+  for (const h of liveHooks ?? []) {
+    const dir = path.dirname(h);
+    if (dir === root || path.dirname(dir) === root) return dir;
+  }
+  return undefined;
+}
+
 /** 把持久化的钩子配置解析成 omp 启动参数 `--hook=<path>` 列表。
  *  - 整文件默认导出（fileLevel）→ 直接传原文件。
  *  - 多单元（具名导出）→ 生成过滤包装文件（只调用启用的单元），传包装文件。
  *  包装文件写到 userData/hook-cache/<session-hash>/；每次解析后只清理"本 session
  *  子目录"内不在本次期望集合的陈旧文件（不碰其他 session，避免并发竞态）。 */
-async function resolveHookArgs(hooks?: HookFileConfig[], sessionPath?: string): Promise<string[]> {
+async function resolveHookArgs(hooks?: HookFileConfig[], sessionPath?: string, cacheDirOverride?: string): Promise<string[]> {
   const args: string[] = [];
-  const cacheDir = sessionPath ? sessionHookCacheDir(sessionPath) : path.join(app.getPath('userData'), 'hook-cache');
+  const cacheDir = cacheDirOverride ?? (sessionPath ? sessionHookCacheDir(sessionPath) : path.join(app.getPath('userData'), 'hook-cache'));
   const expected = new Set<string>();
   if (hooks && hooks.length > 0) {
     try { await fs.promises.mkdir(cacheDir, { recursive: true }); } catch { /* noop */ }
@@ -1248,7 +1380,8 @@ async function resolveHookArgs(hooks?: HookFileConfig[], sessionPath?: string): 
         `// AUTO-GENERATED by OMP-UI — do not edit\n` +
         `import * as __mod from ${importPath};\n` +
         `export default function (pi: any) {\n${calls}\n}\n`;
-      const fileName = hookWrapperName(cfg.path);
+      // 文件名带内容 hash：只改启用单元时路径也随之变化，pool 才能识别 hooks 变更并按需重起进程
+      const fileName = hookWrapperName(cfg.path).replace(/\.ts$/, `-${createHash('sha1').update(wrapper).digest('hex').slice(0, 8)}.ts`);
       const outPath = path.join(cacheDir, fileName);
       try {
         await fs.promises.writeFile(outPath, wrapper, 'utf8');

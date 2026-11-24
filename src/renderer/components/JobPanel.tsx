@@ -10,8 +10,10 @@ function durationOf(job: SubagentJob, nowMs: number): string {
   if (ms < 1000) return `${ms}ms`;
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m${Math.round(s - m * 60)}s`;
+  // 先取整再拆分：否则 119.6s 会显示成 "1m60s"
+  const total = Math.round(s);
+  const m = Math.floor(total / 60);
+  return `${m}m${total - m * 60}s`;
 }
 
 const STATUS_TEXT: Record<SubagentJob['status'], string> = {

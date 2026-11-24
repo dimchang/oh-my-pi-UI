@@ -52,7 +52,7 @@ export function parseAutomationsFile(raw: string): AutomationsFile {
       name: x.name,
       prompt: x.prompt,
       cwd: x.cwd,
-      approvalMode: x.approvalMode === 'yolo' || x.approvalMode === 'always-ask' ? x.approvalMode : 'write',
+      approvalMode: x.approvalMode === 'write' || x.approvalMode === 'always-ask' ? x.approvalMode : 'yolo',
       model: x.model && typeof x.model.provider === 'string' && typeof x.model.id === 'string'
         ? { provider: x.model.provider, id: x.model.id, name: typeof x.model.name === 'string' ? x.model.name : undefined }
         : undefined,
@@ -70,6 +70,9 @@ export function parseAutomationsFile(raw: string): AutomationsFile {
 }
 
 let cache: AutomationsFile | null = null;
+/** 写盘串行队列：ticker 扣账与渲染层 recordRun（running→success 紧挨着）会并发落盘，
+ *  对同一文件并发 writeFile 可能交错写出半截 JSON，下次启动解析失败 → 任务全丢。 */
+let writeQueue: Promise<void> = Promise.resolve();
 
 export async function loadAutomations(): Promise<AutomationsFile> {
   if (cache) return cache;
@@ -89,8 +92,13 @@ export async function saveAutomations(file: AutomationsFile): Promise<void> {
     runs: (Array.isArray(file.runs) ? file.runs : []).slice(0, MAX_RUNS),
   };
   cache = next;
-  await fs.promises.mkdir(path.dirname(automationsFile()), { recursive: true });
-  await fs.promises.writeFile(automationsFile(), JSON.stringify(next, null, 2), 'utf8');
+  const data = JSON.stringify(next, null, 2);
+  const run = writeQueue.then(async () => {
+    await fs.promises.mkdir(path.dirname(automationsFile()), { recursive: true });
+    await fs.promises.writeFile(automationsFile(), data, 'utf8');
+  });
+  writeQueue = run.catch(() => undefined);
+  return run;
 }
 
 /** 按 run.id upsert 一条执行记录（渲染层先报 running、后补 success/error）。 */
@@ -123,9 +131,11 @@ export function startAutomationTicker(deps: AutomationTickerDeps): () => void {
     const file = await loadAutomations();
     const now = Date.now();
     let dirty = false;
+    const due: AutomationTask[] = [];
     for (const task of file.tasks) {
       if (!task.enabled) continue;
-      const base = task.lastRunAt ?? 0;
+      // 从未执行过的任务以创建时刻为基准：创建之前就已过去的计划时刻（如 16:00 新建「每天 15:40」）不应立即触发
+      const base = task.lastRunAt ?? task.createdAt ?? 0;
       let next = computeNextRunAt(task.schedule, base, task.validUntil);
       if (next === null) continue;
       if (next > now) continue; // 未到期
@@ -143,19 +153,22 @@ export function startAutomationTicker(deps: AutomationTickerDeps): () => void {
         next = computeNextRunAt(task.schedule, task.lastRunAt, task.validUntil);
       }
       if (next === null || next > now) continue;
-      // 到期：先扣账再触发
+      // 到期：先扣账（落盘后）再触发
       task.lastRunAt = now;
       dirty = true;
+      due.push(task);
+    }
+    if (dirty) {
+      await saveAutomations(file).catch(() => undefined);
+      deps.onChanged(file);
+    }
+    for (const task of due) {
       deps.log(`[automation] fire task ${task.name} (${task.id})`);
       try {
         deps.fire(task);
       } catch (e) {
         deps.log(`[automation] fire failed: ${e instanceof Error ? e.message : String(e)}`);
       }
-    }
-    if (dirty) {
-      await saveAutomations(file).catch(() => undefined);
-      deps.onChanged(file);
     }
   };
   const timer = setInterval(() => {

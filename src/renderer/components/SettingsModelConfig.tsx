@@ -17,7 +17,10 @@ import { useApp } from '../store';
 import { AddModelModal } from './AddModelModal';
 import { modelKey } from '../utils/path-key';
 import { reloadCurrentSession } from '../utils/reload-session';
-import { fetchAvailableModels } from '../utils/available-models';
+import { dropProviderFromCache, fetchAvailableModels } from '../utils/available-models';
+import { syncProviderThinking } from '../utils/model-thinking';
+import { hasRuntimeThinking } from '../../shared/model-thinking';
+import { formatCredits, modelDisplayNames } from '../utils/model-display';
 import type { ModelInfo } from '../../shared/rpc-types';
 import type { OmpModelsConfig } from '../../shared/ipc-channels';
 
@@ -89,6 +92,14 @@ export const SettingsModelConfig: React.FC = () => {
   // 而不是空数组导致所有模型被禁用。
   const allModelKeys = useMemo(() => models.map(modelKey), [models]);
 
+  // 同名消歧（真实上游：Hy3 有 4 个 id、Hy4 preview 有 3 个、Hy4 有 2 个，name 全相同）。
+  // 按 provider 分组计算，只影响显示文本，白名单 key 仍是完整 provider\0id。
+  const displayNames = useMemo(() => {
+    const acc: Record<string, Map<string, string>> = {};
+    for (const [pid, list] of Object.entries(groups)) acc[pid] = modelDisplayNames(list);
+    return acc;
+  }, [groups]);
+
   // 搜索过滤（issue 156）：provider 名 / 模型名 / 模型 id 任一匹配即可；空查询显示全部
   const filteredGroups = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -131,8 +142,9 @@ export const SettingsModelConfig: React.FC = () => {
     if (allOn) {
       // 全部已勾选 → 全不选
       if (cur === undefined) {
-        // 首次操作：初始化为空数组（= 白名单激活但全部不选）
-        next = [];
+        // 首次操作：用全部模型 key 初始化白名单再剔除本 provider（与 toggleEnabledModel 同理，issue #4）；
+        // 初始化成 [] 会把其它 provider 的模型也一并取消勾选
+        next = allModelKeys.filter((k) => !keys.includes(k));
       } else {
         next = cur.filter((k) => !keys.includes(k));
       }
@@ -142,7 +154,32 @@ export const SettingsModelConfig: React.FC = () => {
     }
 
     useApp.getState().setEnabledModels(next);
-  }, []);
+  }, [allModelKeys]);
+
+  /** 一次补齐该 provider 下所有「上游声明支持思考、但 omp 不认」的模型（写 models.yml + 重启进程） */
+  const doSyncThinking = useCallback(async (pid: string) => {
+    setBusy(`正在补齐 ${pid} 的思考能力…`);
+    setError('');
+    try {
+      const res = await syncProviderThinking(pid);
+      const n = res.added + res.updated;
+      if (n === 0) {
+        useApp.getState().pushToast(`${pid}：没有需要补齐的模型（上游未声明支持思考，或已是最新）`, 'info');
+      } else {
+        const levels = Array.from(new Set(Object.values(res.changed).flat()));
+        useApp.getState().pushToast(
+          `已为 ${pid} 补齐 ${n} 个模型的思考能力（档位 ${levels.join(' / ')}）` +
+            (res.reloaded ? '，进程已重载' : '；当前会话无法自动重载，切换会话或重启应用后生效'),
+          res.reloaded ? 'success' : 'warn',
+        );
+      }
+    } catch (e) {
+      setError(`补齐思考能力失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy('');
+      refresh();
+    }
+  }, [refresh]);
 
   /** 删除自定义 provider：删 models.yml 条目 → 重载会话进程 → 刷新；白名单里该 provider 的 key 一并清理 */
   const doDeleteProvider = useCallback(async (pid: string) => {
@@ -155,6 +192,9 @@ export const SettingsModelConfig: React.FC = () => {
     try {
       await window.omp.deleteOmpProvider(pid);
       deleted = true;
+      // 同步清掉模型缓存：RPC 失败是本机常态，旧缓存是唯一数据源，
+      // 不清的话「已删除的 provider」会继续出现在列表里（本次改动新增的坑）。
+      await dropProviderFromCache(pid);
       const st = useApp.getState();
       if (st.enabledModels?.some((k) => k.startsWith(`${pid}\u0000`))) {
         st.setEnabledModels(st.enabledModels.filter((k) => !k.startsWith(`${pid}\u0000`)));
@@ -230,6 +270,15 @@ export const SettingsModelConfig: React.FC = () => {
           const isCustom = customProviders.has(pid);
           const cfg = ymlConfig.providers?.[pid];
           const enabledCount = list.filter((m) => isEnabled(modelKey(m))).length;
+          // 「上游说支持思考、但 omp 还不认」的模型数：>0 才显示批量补齐入口。
+          // 判据必须落在 models.yml（我们写入的地方）——不能用 m.reasoning：
+          // 直拉/缓存来的条目没有运行时字段，否则按钮永远消不掉。
+          const ymlModels = cfg?.models ?? [];
+          const thinkingGaps = list.filter((m) => {
+            if (m.upstreamReasoning !== true || hasRuntimeThinking(m)) return false;
+            const y = ymlModels.find((x) => x.id === m.id);
+            return !(y?.reasoning === true && (y.thinking?.efforts?.length ?? 0) > 0);
+          }).length;
           // 用 discovered models 里的第一个 sample 提供 baseUrl/api 兜底（issue 156：omp 内置但 yml 里没有的 provider 编辑时）
           const discoveredSample = list[0];
           return (
@@ -242,6 +291,16 @@ export const SettingsModelConfig: React.FC = () => {
                   <span className="provider-count">{enabledCount}/{list.length} 启用</span>
                 </div>
                 <div className="provider-card-actions">
+                  {thinkingGaps > 0 && (
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => void doSyncThinking(pid)}
+                      disabled={!!busy}
+                      title="把上游声明的思考档位一次性写入 models.yml（该提供商下全部模型），并重启 omp 生效"
+                    >
+                      补齐思考（{thinkingGaps}）
+                    </button>
+                  )}
                   {list.length > 0 && (
                     <button className="btn btn-sm" onClick={() => toggleProvider(pid, list)}>
                       {list.every((m) => isEnabled(modelKey(m))) ? '全不选' : '全选'}
@@ -271,6 +330,7 @@ export const SettingsModelConfig: React.FC = () => {
                 <div className="provider-models">
                   {list.map((m) => {
                     const key = modelKey(m);
+                    const credits = formatCredits(m.credits);
                     return (
                       <label key={key} className="provider-model-row" title={key}>
                         <input
@@ -278,7 +338,15 @@ export const SettingsModelConfig: React.FC = () => {
                           checked={isEnabled(key)}
                           onChange={() => useApp.getState().toggleEnabledModel(key, allModelKeys)}
                         />
-                        <span className="provider-model-name">{m.name ?? m.id}</span>
+                        <span className="provider-model-name">
+                          {displayNames[pid]?.get(m.id) ?? m.name ?? m.id}
+                        </span>
+                        {/* 倍率只在「免费」时强调：这是同族多通道里唯一能一眼定取舍的信息 */}
+                        {credits && (
+                          <span className={`provider-model-meta${credits === '免费' ? ' free' : ''}`}>
+                            {credits}
+                          </span>
+                        )}
                         {m.contextWindow ? (
                           <span className="provider-model-meta">{formatCtx(m.contextWindow)}</span>
                         ) : null}

@@ -3,7 +3,7 @@
  * 入口：TitleBar 的 Window 菜单 →「设置」。Esc / 遮罩点击 / ✕ 关闭。
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { SettingsWecom, SettingsFeishu } from './SettingsWecom';
 import { SettingsModelConfig } from './SettingsModelConfig';
@@ -115,6 +115,14 @@ const SystemConfigTab: React.FC = () => {
 
   // 外部（如恢复默认）同步时刷新本地草稿
   useEffect(() => { setPromptDraft(systemPrompt ?? ''); }, [systemPrompt]);
+  // Esc / 点遮罩关闭设置页会直接卸载本组件，React 在提交阶段不派发 textarea 的 onBlur，
+  // 未失焦的提示词编辑会丢失 → 卸载时兜底提交（与 onBlur 自动保存语义一致）
+  const promptDraftRef = useRef(promptDraft);
+  promptDraftRef.current = promptDraft;
+  useEffect(() => () => {
+    const st = useApp.getState();
+    if ((st.systemPrompt ?? '') !== promptDraftRef.current) st.setSystemPrompt(promptDraftRef.current);
+  }, []);
   useEffect(() => {
     setTheme(appearance?.theme ?? '');
     setMode(appearance?.mode ?? 'system');
@@ -299,6 +307,7 @@ const SystemConfigTab: React.FC = () => {
               onChange={(e) => setFontSize(Number(e.target.value))}
               onMouseUp={() => commit({ fontSize: fontSize > 0 ? fontSize : undefined })}
               onTouchEnd={() => commit({ fontSize: fontSize > 0 ? fontSize : undefined })}
+              onKeyUp={() => commit({ fontSize: fontSize > 0 ? fontSize : undefined })}
             />
             <span className="settings-slider-value">{fontSize}px</span>
           </div>
