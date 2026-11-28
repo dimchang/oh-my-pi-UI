@@ -215,6 +215,23 @@ export async function deleteSession(filePath: string): Promise<void> {
   await fs.promises.unlink(absTarget).catch((err) => {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
   });
+  // omp 19.0.0+：截断输出与临时产物存储在会话伴生目录（<basename-without-.jsonl>/，即 local:// 根）。
+  // 顺手清理同目录伴生子目录（严格校验位于 sessionsRoot 内且非符号链接目录），避免删除会话后残留垃圾。
+  if (absTarget.toLowerCase().endsWith('.jsonl')) {
+    const companionDir = path.join(path.dirname(absTarget), path.basename(absTarget, '.jsonl'));
+    try {
+      const lst = await fs.promises.lstat(companionDir);
+      if (lst.isDirectory() && !lst.isSymbolicLink()) {
+        const compReal = await fs.promises.realpath(companionDir);
+        const normComp = process.platform === 'win32' ? compReal.toLowerCase() : compReal;
+        if (normComp.startsWith(normRoot + path.sep) && normComp !== normRoot) {
+          await fs.promises.rm(companionDir, { recursive: true, force: true });
+        }
+      }
+    } catch {
+      /* 无伴生目录或权限不足时静默跳过 */
+    }
+  }
 }
 
 /** 读取 session JSONL 中的完整消息历史（type:"message" 行的 .message 字段）。

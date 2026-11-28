@@ -101,6 +101,7 @@ const SystemConfigTab: React.FC = () => {
   const systemPrompt = useApp((s) => s.systemPrompt);
   const appearance = useApp((s) => s.appearance);
   const inputBehavior = useApp((s) => s.inputBehavior ?? 'guide');
+  const intentTracing = useApp((s) => s.intentTracing ?? false);
 
   const [promptDraft, setPromptDraft] = useState(systemPrompt ?? '');
   // appearance 用本地草稿，避免每次拖动滑块都触发 persist（失焦/松手时提交）
@@ -213,6 +214,32 @@ const SystemConfigTab: React.FC = () => {
             ? '当前：Enter 引导（mid-run）。omp 在当前 tool 完成后立即按新方向继续，跳过剩余 tool 队列。'
             : '当前：Enter 排队。把消息追加到当前会话末尾，等当前 agent turn 跑完再处理，不打断当前 tool/t。'}
         </p>
+      </section>
+
+      {/* ===== 工具调用意图（omp 19.0.0+ PI_INTENT_TRACING） ===== */}
+      <section className="settings-section">
+        <h3 className="settings-section-title">工具调用意图（Intent Tracing）</h3>
+        <p className="settings-section-desc">
+          OMP 19.0+ 在 RPC 模式下默认关闭工具调用意图以节省输出 token。开启后会为新拉起/重启的会话进程注入 <code>PI_INTENT_TRACING=1</code>，在工具卡片和子智能体面板中展示调用意图。
+        </p>
+        <div className="settings-toggle-row" role="tablist" aria-label="工具调用意图">
+          <button
+            role="tab"
+            aria-selected={!intentTracing}
+            className={`settings-toggle-btn ${!intentTracing ? 'active' : ''}`}
+            onClick={() => useApp.getState().setIntentTracing(false)}
+          >
+            关闭（省 Token，默认）
+          </button>
+          <button
+            role="tab"
+            aria-selected={intentTracing}
+            className={`settings-toggle-btn ${intentTracing ? 'active' : ''}`}
+            onClick={() => useApp.getState().setIntentTracing(true)}
+          >
+            开启（显示意图）
+          </button>
+        </div>
       </section>
 
       {/* ===== 系统风格 ===== */}

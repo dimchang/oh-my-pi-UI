@@ -11,9 +11,11 @@ import {
   resolveDesiredSessionModel,
   reportCrashInterrupt,
   pushCrashInterruptToast,
+  parseModelRestoreError,
   SESSION_STALL_MS,
 } from './store';
 import { isCrashAbortedMessage, lastUserTextFromChat, CRASH_RECOVER_TOAST } from './utils/crash-interrupt';
+import { isToolMountNotice } from '../shared/notice-filter';
 import { rpc } from './rpc-client';
 import { ChatView } from './components/ChatView';
 import { SkillsPanel } from './components/SkillsPanel';
@@ -22,6 +24,7 @@ import { WorkspaceList } from './components/WorkspaceList';
 import { Icon } from './components/Icon';
 import { StatusBar } from './components/StatusBar';
 import { PermissionModal } from './components/PermissionModal';
+import { ModelRestoreModal } from './components/ModelRestoreModal';
 import { FileTree } from './components/FileTree';
 import { TitleBar } from './components/TitleBar';
 import { TodoPanel } from './components/TodoPanel';
@@ -108,6 +111,9 @@ export default function App(): React.ReactElement {
         if (sp.startsWith(TEMP_KEY_PREFIX) && typeof sf === 'string') {
           useApp.getState().bindTempRealPath(sp, sf);
         }
+        if (d.queuedMessages) {
+          useApp.getState().setQueuedMessages(sp, d.queuedMessages);
+        }
         useApp.getState().setState({
           ...(isCurrent ? {
             model: d.model,
@@ -117,6 +123,11 @@ export default function App(): React.ReactElement {
             sessionId: d.sessionId,
             todoPhases: d.todoPhases ?? [],
             isCompacting: d.isCompacting ?? false,
+            fastModeEnabled: d.fastModeEnabled,
+            fastModeActive: d.fastModeActive,
+            slowModeSupported: d.slowModeSupported,
+            slowModeEnabled: d.slowModeEnabled,
+            usageLimit: d.usageLimit,
           } : {}),
           // isStreaming/isAborting 仍由 procStateMap 驱动；但若镜像与 omp 真值漂移
           // （agent_end 帧丢失），下面立即校正——选中即对账，不等 30s 看门狗。
@@ -653,10 +664,8 @@ export default function App(): React.ReactElement {
       if (f.type === 'notice') {
         const n = frame as { message?: string; level?: string };
         if (n.message) {
-          // 抑制 omp 启动时的 MCP 挂载噪声：通知消息以 `xd://` 开头说明是 omp 内部扩展协议
-          // （如 `xd://: mounted mcp__node_repl_js, mcp__node_repl_js_add_node_module_dir, ...`），
-          // 属于每次启动都会刷的运行时注册日志，对用户无意义，弹窗只会污染视线。直接丢弃。
-          if (/^xd:\/\//i.test(n.message)) return;
+          // 抑制 omp 启动时的工具/命令挂载噪声：覆盖旧版 `xd://` 与 19.1.0+ `commands:`/`tools:` 挂载通知。
+          if (isToolMountNotice(n.message)) return;
           // omp 18.2.1+（§2.3）：会话存储停止接受写入（磁盘满/文件被锁/盘被移除）时
           // 以 error notice 上报。这是致命错误——除 toast 外标记会话红点，让用户能从侧栏定位。
           if (n.level === 'error' && sp) {
@@ -711,7 +720,11 @@ export default function App(): React.ReactElement {
       // space-bunny-alpha 在 OpenRouter 已 404，用户看到"模型变了 + 请求失败"）。
       const adopting = adoptRealSessionId(sessionPath);
       const restoring = adopting
-        .then((realKey) => restoreSessionModel(realKey))
+        .then((realKey) => {
+          // omp 18.4.5+ / 18.13.2+：开启 delta 模式降低流式传输体积与内存占用（旧版不支持时静默降级为全量快照）
+          void rpc.setEventFilter(realKey, { messageUpdates: 'delta' }).catch(() => undefined);
+          return restoreSessionModel(realKey);
+        })
         .finally(() => {
           // 只清理指向同一 Promise 的条目（换 key 后可能挂在 realKey 上）
           for (const [k, v] of pendingModelRestore.current) {
@@ -990,6 +1003,26 @@ export default function App(): React.ReactElement {
     return off;
   }, []);
 
+  /** omp 18.6.3+：若异常为 `Could not restore model <id>`，弹窗让用户手选替代模型 */
+  const maybeOpenModelRestore = useCallback((
+    err: unknown,
+    sessionPath: string,
+    cwd: string,
+    approvalMode: ApprovalMode,
+    restore?: boolean,
+  ): boolean => {
+    const missingModel = parseModelRestoreError(err);
+    if (!missingModel) return false;
+    useApp.getState().setModelRestorePrompt({
+      sessionPath,
+      cwd,
+      approvalMode,
+      missingModel,
+      restore,
+    });
+    return true;
+  }, []);
+
   const onSend = useCallback((text: string, attachments?: Attachment[]) => {
     const st = useApp.getState();
     let sp = st.currentSessionPath;
@@ -1006,6 +1039,53 @@ export default function App(): React.ReactElement {
     // 更进一步：对象须带 blob:sha256: URI（经 omp blob 入库）才能触发 vision 路由，
     // 等同原生 OMP 的 @image.png 入库机制（见 probe-blob*.mjs / probe-img-shapes.mjs 实测）。
     const promptText = buildPromptWithAttachments(text, attachments);
+
+    // P2: `/btw <问题>` 旁路快速问答（不污染主对话历史、不中断当前任务）
+    const btwMatch = /^\/btw(?:\s+([\s\S]+))?$/i.exec(text.trim());
+    if (btwMatch) {
+      const question = (btwMatch[1] ?? '').trim();
+      if (!question) {
+        pushToast('用法：/btw <你的问题>', 'info');
+        return;
+      }
+      const doBtw = async () => {
+        let key = await resolveSessionKey(sp!);
+        await rpc.acquire(key, cwd, approvalMode);
+        key = await adoptRealSessionId(key);
+        useApp.getState().setBtwPanel({
+          open: true,
+          sessionPath: key,
+          question,
+          answer: '',
+          streaming: true,
+        });
+        const res = await rpc.btw(key, question);
+        if (!res.success) {
+          useApp.getState().setBtwPanel(null);
+          pushToast(`/btw 失败：${res.error ?? '当前 omp 版本不支持'}`, 'error');
+          return;
+        }
+        const ans = (res.data as { answer?: string } | undefined)?.answer;
+        if (ans) {
+          const cur = useApp.getState().btwPanel;
+          useApp.getState().setBtwPanel({
+            open: true,
+            sessionPath: key,
+            question,
+            answer: ans,
+            streaming: false,
+            topicId: cur?.topicId,
+          });
+        }
+      };
+      void doBtw().catch((err) => {
+        if (!maybeOpenModelRestore(err, sp!, cwd, approvalMode)) {
+          pushToast(`/btw 失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+        }
+      });
+      return;
+    }
+
     // 提交瞬间就「上架」（同步，在任何 await 之前）：新会话一提交就必须在侧栏有名字，
     // 否则用户在 acquire/prompt 的 await 窗口里切走 → 会话既看不见、也再回不去，
     // 要等落盘扫盘才出现（2026-10-25 bug 3）。同时打「提交中」标记，防止切走时被
@@ -1043,9 +1123,41 @@ export default function App(): React.ReactElement {
       const stNow = useApp.getState();
       if (!(stNow.composerDrafts[sp!]?.text ?? '').trim()) stNow.setComposerText(sp!, text);
       if (!(stNow.sessionsMap[sp!]?.length ?? 0)) tempSubmittedKeys.current.delete(sp!);
+      if (maybeOpenModelRestore(err, sp!, cwd, approvalMode)) return;
       pushToast(`发送失败：${err instanceof Error ? err.message : String(err)}`, 'error');
     });
-  }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
+  }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession, maybeOpenModelRestore]);
+
+  /** omp 18.7+ `--restore`：进程崩溃后恢复中断的最后回合（保留完整上下文与中间工具状态） */
+  const restoreCrashedSession = useCallback(async (sessionPath?: string) => {
+    const st = useApp.getState();
+    const path = sessionPath ?? st.currentSessionPath ?? '';
+    if (!path || path.startsWith(TEMP_KEY_PREFIX)) return;
+    const session = st.sessions.find((x) => x.path === path);
+    const ws = session && st.workspaces.find((w) => cwdKey(w.cwd) === cwdKey(session.cwd));
+    const cwd = ws?.cwd ?? session?.cwd ?? st.currentWorkspace()?.cwd;
+    if (!cwd) {
+      pushToast('无法确定该会话的工作目录，请手动切换后重试', 'error');
+      return;
+    }
+    const approvalMode = ws?.approvalMode ?? 'yolo';
+    selfRestartKeys.current.add(path);
+    const purge = window.setTimeout(() => selfRestartKeys.current.delete(path), 5000);
+    try {
+      await rpc.release(path).catch(() => undefined);
+      await rpc.acquire(path, cwd, approvalMode, { restore: true });
+      useApp.getState().clearCrashInterrupted(path);
+      void refreshState(path);
+      useApp.getState().loadSessionMessages(path);
+      pushToast('已使用 omp --restore 恢复中断会话', 'info');
+    } catch (err) {
+      selfRestartKeys.current.delete(path);
+      window.clearTimeout(purge);
+      if (!maybeOpenModelRestore(err, path, cwd, approvalMode, true)) {
+        pushToast(`恢复中断回合失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    }
+  }, [pushToast, refreshState, maybeOpenModelRestore]);
 
   /** 0.5.39 / 0.5.40：重发上一条用户消息（仅文本，附件需重新添加）。
    *  右下角红色 toast 的按钮入口；只作用于当前显示会话，避免串台。 */
@@ -1111,6 +1223,7 @@ export default function App(): React.ReactElement {
       const stNow = useApp.getState();
       if (!(stNow.composerDrafts[sp!]?.text ?? '').trim()) stNow.setComposerText(sp!, text);
       if (!(stNow.sessionsMap[sp!]?.length ?? 0)) tempSubmittedKeys.current.delete(sp!);
+      if (maybeOpenModelRestore(err, sp!, cwd, approvalMode)) return;
       pushToast(`引导失败：${err instanceof Error ? err.message : String(err)}`, 'error');
     });
   }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
@@ -1151,6 +1264,7 @@ export default function App(): React.ReactElement {
       const stNow = useApp.getState();
       if (!(stNow.composerDrafts[sp!]?.text ?? '').trim()) stNow.setComposerText(sp!, text);
       if (!(stNow.sessionsMap[sp!]?.length ?? 0)) tempSubmittedKeys.current.delete(sp!);
+      if (maybeOpenModelRestore(err, sp!, cwd, approvalMode)) return;
       pushToast(`排队失败：${err instanceof Error ? err.message : String(err)}`, 'error');
     });
   }, [pushToast, refreshSessions, resolveSessionKey, autoNameTempSession]);
@@ -1180,6 +1294,39 @@ export default function App(): React.ReactElement {
         if (sp === stNow.currentSessionPath) stNow.setState({ isAborting: false });
       });
   }, []);
+
+  // omp 18.10+：中止当前回合，同时把排队中的消息退回输入框草稿
+  const onAbortAndRestoreQueue = useCallback(() => {
+    const st = useApp.getState();
+    const sp = st.currentSessionPath;
+    if (!sp) return;
+    st.setProcState(sp, { isAborting: true, isStreaming: false });
+    if (sp === st.currentSessionPath) st.setState({ isAborting: true, isStreaming: false });
+    void rpc.abortAndRestoreQueue(sp)
+      .then((res) => {
+        const stNow = useApp.getState();
+        stNow.setProcState(sp, { isAborting: false });
+        if (sp === stNow.currentSessionPath) stNow.setState({ isAborting: false });
+        stNow.setQueuedMessages(sp, { steering: [], followUp: [] });
+        const d = res.data as {
+          text?: string;
+          steering?: Array<string | { text?: string; message?: string }>;
+          followUp?: Array<string | { text?: string; message?: string }>;
+        } | undefined;
+        const extractMsg = (item: string | { text?: string; message?: string }): string =>
+          typeof item === 'string' ? item : (item.text ?? item.message ?? '');
+        const restored = d?.text
+          ?? [...(d?.steering ?? []), ...(d?.followUp ?? [])].map(extractMsg).filter(Boolean).join('\n\n');
+        if (restored) {
+          const curDraft = stNow.composerDrafts[sp]?.text ?? '';
+          stNow.setComposerText(sp, curDraft ? `${curDraft}\n\n${restored}` : restored);
+        }
+      })
+      .catch(() => {
+        // 旧版 omp 若无 abort_and_restore_queue，回退普通 abort
+        onAbort();
+      });
+  }, [onAbort]);
 
   // ---- 流式看门狗：检测"生成中但长时间无任何帧"的疑似卡死会话 + 流式状态对账自愈 ----
   // 背景（实证 session 01a02a7c）：omp 工具执行无超时，eval 挂死 9h38m 期间不发任何帧，
@@ -1689,24 +1836,32 @@ export default function App(): React.ReactElement {
         return;
       }
       const approvalMode = useApp.getState().workspaces.find((w) => cwdKey(w.cwd) === cwdKey(s.cwd))?.approvalMode ?? 'yolo';
-      // 拉起该会话的进程（branch 作用于该进程的 current = s.path），不调 switchSession
-      void rpc.acquire(s.path, s.cwd, approvalMode).then(() => {
-        void rpc.branch(s.path, entryId).then((r) => {
-          if (r.success && r.data) {
-            const d = r.data as { text?: string; cancelled?: boolean };
-            if (d.cancelled) { pushToast('分叉已取消', 'info'); return; }
-            if (d.text) useApp.getState().setDraftInput(d.text);
-            useApp.getState().setCurrentSessionPath(s.path);
-            void refreshSessions();
-            useApp.getState().loadSessionMessages(s.path);
-            pushToast('分叉成功，可编辑消息后重新发送', 'info');
-          } else {
-            pushToast(`分叉失败：${r.error ?? '未知错误'}`, 'error');
-          }
-        }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
-      }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
+      // 拉起该会话的进程（branch/fork 作用于该进程的 current = s.path），不调 switchSession
+      void rpc.acquire(s.path, s.cwd, approvalMode).then(async () => {
+        let r = await rpc.branch(s.path, entryId);
+        // omp 18.8+ 引入 fork（替代旧 branch 命名）：若 branch 返回不支持则自动回退 fork
+        if (!r.success) {
+          const rFork = await rpc.fork(s.path, entryId).catch(() => null);
+          if (rFork?.success) r = rFork;
+        }
+        if (r.success && r.data) {
+          const d = r.data as { text?: string; cancelled?: boolean };
+          if (d.cancelled) { pushToast('分叉已取消', 'info'); return; }
+          if (d.text) useApp.getState().setDraftInput(d.text);
+          useApp.getState().setCurrentSessionPath(s.path);
+          void refreshSessions();
+          useApp.getState().loadSessionMessages(s.path);
+          pushToast('分叉成功，可编辑消息后重新发送', 'info');
+        } else {
+          pushToast(`分叉失败：${r.error ?? '未知错误'}`, 'error');
+        }
+      }).catch((e) => {
+        if (!maybeOpenModelRestore(e, s.path, s.cwd, approvalMode)) {
+          pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+        }
+      });
     }).catch((e) => pushToast(`分叉失败：${e instanceof Error ? e.message : String(e)}`, 'error'));
-  }, [pushToast, refreshSessions]);
+  }, [pushToast, refreshSessions, maybeOpenModelRestore]);
 
   const onCopySessionId = useCallback((s: SessionSummary) => {
     void window.omp.copyText(s.id)
@@ -1954,7 +2109,14 @@ export default function App(): React.ReactElement {
         ) : (
           <>
             <ChatView />
-            <InputBox onSend={onSend} onGuide={onGuide} onQueue={onQueue} onAbort={onAbort} onChangeApprovalMode={onChangeApprovalMode} />
+            <InputBox
+              onSend={onSend}
+              onGuide={onGuide}
+              onQueue={onQueue}
+              onAbort={onAbort}
+              onAbortAndRestoreQueue={onAbortAndRestoreQueue}
+              onChangeApprovalMode={onChangeApprovalMode}
+            />
             <StatusBar />
           </>
         )}
@@ -1984,22 +2146,43 @@ export default function App(): React.ReactElement {
         />
       )}
 
+      <ModelRestoreModal
+        onRestored={(sp) => {
+          void refreshState(sp);
+          useApp.getState().loadSessionMessages(sp);
+        }}
+      />
+
       <div className="toasts">
         {toasts.map((t) => (
           <div key={t.id} className={`toast ${t.level}${t.action ? ' toast-actionable' : ''}`}>
             <span className="toast-text">{t.text}</span>
-            {/* 0.5.39 / 0.5.40：崩溃中断的 sticky toast 带「重发上一条」。后台会话不给按钮，避免串台。 */}
+            {/* 0.5.39 / 0.5.40 + omp 18.7+ --restore：崩溃中断的 sticky toast 带「恢复中断回合」与「重发上一条」。后台会话不给按钮，避免串台。 */}
             {t.action === 'resend' && (!t.sessionPath || pathsEqual(t.sessionPath, currentSessionPath ?? '')) && (
-              <button
-                className="toast-resend"
-                title="重新发送最后一条用户消息（仅文本）"
-                onClick={() => {
-                  resendLast(t.sessionPath);
-                  useApp.getState().dismissToast(t.id);
-                }}
-              >
-                重发上一条
-              </button>
+              <>
+                {t.sessionPath && !t.sessionPath.startsWith(TEMP_KEY_PREFIX) && (
+                  <button
+                    className="toast-resend"
+                    title="通过 omp --restore 恢复崩溃中断的回合"
+                    onClick={() => {
+                      void restoreCrashedSession(t.sessionPath);
+                      useApp.getState().dismissToast(t.id);
+                    }}
+                  >
+                    恢复中断回合
+                  </button>
+                )}
+                <button
+                  className="toast-resend"
+                  title="重新发送最后一条用户消息（仅文本）"
+                  onClick={() => {
+                    resendLast(t.sessionPath);
+                    useApp.getState().dismissToast(t.id);
+                  }}
+                >
+                  重发上一条
+                </button>
+              </>
             )}
             <button
               className="toast-close"
@@ -2100,7 +2283,12 @@ const IS_WIN32 = window.omp?.platform === 'win32';
 
 /** 权限模式的展示名（toast / 确认框 / 选择器共用同一套措辞）。 */
 function approvalModeLabel(mode: ApprovalMode): string {
-  return mode === 'yolo' ? 'YOLO · 全自动' : mode === 'always-ask' ? 'Always Ask · 每次询问' : 'Write';
+  switch (mode) {
+    case 'yolo': return 'YOLO · 全自动';
+    case 'always-ask': return 'Always Ask · 每次询问';
+    case 'always-ask-cached': return 'Ask & Remember · 询问并记住';
+    case 'write': return 'Write';
+  }
 }
 
 /** 渲染层生成 tempKey（新建会话先切指针再 spawn 用）。crypto.randomUUID 在非安全上下文
@@ -2341,9 +2529,15 @@ function handleUiRequest(
     return;
   }
 
-  if (method === 'confirm' || method === 'select' || method === 'input' || method === 'editor') {
+  if (
+    method === 'confirm' ||
+    method === 'select' ||
+    method === 'input' ||
+    method === 'editor' ||
+    method === 'form'
+  ) {
     // confirm 类：先查 per-session 工具级"始终允许"缓存，命中则宿主侧自动放行（不弹窗）。
-    // select/input/editor 需要用户主动输入，不走自动放行。
+    // select/input/editor/form 需要用户主动输入，不走自动放行。
     if (method === 'confirm') {
       const ui = toUiRequest(req);
       const tool = toolNameOf(ui);
@@ -2357,6 +2551,12 @@ function handleUiRequest(
     }
     st.enqueueUi(toUiRequest(req));
     return;
+  }
+
+  // 兜底：若未来 omp 新增带 id 的交互式 extension_ui_request，入队走 PermissionModal 默认兜底（支持取消），
+  // 避免静默丢弃导致 omp 进程永久等待应答而挂起。
+  if (req.id) {
+    st.enqueueUi(toUiRequest(req));
   }
 }
 
@@ -2375,6 +2575,13 @@ function toUiRequest(req: RpcExtensionUIRequest & { __sessionPath?: string }): U
     text: req.text,
     level: req.level,
     targetId: req.targetId,
+    secret: req.secret,
+    initialIndex: req.initialIndex,
+    selectionMarker: req.selectionMarker,
+    checkedIndices: req.checkedIndices,
+    markableCount: req.markableCount,
+    html: req.html,
+    timeout: req.timeout,
     sessionPath: req.__sessionPath,
     raw: req,
   };

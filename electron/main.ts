@@ -33,7 +33,7 @@ import { listSkills, readSkillDetail, setSkillEnabled, uninstallSkill } from './
 import { loadAutomations, saveAutomations, recordAutomationRun, startAutomationTicker } from './automations';
 import { WecomBridge } from './wecom-bridge';
 import { FeishuBridge } from './feishu-bridge';
-import { IPC, type WecomBridgeConfig, type FileEntry, type WorkspacesFile, type WorkspacesLoadResult, type ApprovalMode, type OmpProviderConfig, type HookFileConfig, type HookFileInfo, type CustomCssConfig, type PastedImageResult, type ImageDataUrlResult, type AutomationsFile, type AutomationRun } from '../src/shared/ipc-channels';
+import { IPC, type WecomBridgeConfig, type FileEntry, type WorkspacesFile, type WorkspacesLoadResult, type ApprovalMode, type AcquireOptions, type OmpProviderConfig, type HookFileConfig, type HookFileInfo, type CustomCssConfig, type PastedImageResult, type ImageDataUrlResult, type AutomationsFile, type AutomationRun } from '../src/shared/ipc-channels';
 import type { RpcCommand, ExtensionUIResponseCommand, ModelInfo } from '../src/shared/rpc-types';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,8 +57,23 @@ function resolveOmpPath(): string {
       if (t) { try { if (fs.existsSync(t)) return t; } catch { /* */ } }
     } catch { /* */ }
   }
-  const bunBinDir = path.join(os.homedir(), '.bun', 'bin');
-  const fallbacks = process.platform === 'win32' ? [path.join(bunBinDir, 'omp.exe')] : [path.join(bunBinDir, 'omp')];
+  const home = os.homedir();
+  const bunBinDir = path.join(home, '.bun', 'bin');
+  // omp 18.18.8+：install.ps1 默认安装独立二进制，兜底路径覆盖独立二进制常见落点与 bun shim
+  const localAppData = process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local');
+  const fallbacks = process.platform === 'win32'
+    ? [
+        path.join(localAppData, 'omp', 'omp.exe'),
+        path.join(localAppData, 'omp', 'bin', 'omp.exe'),
+        path.join(home, '.local', 'bin', 'omp.exe'),
+        path.join(home, '.omp', 'bin', 'omp.exe'),
+        path.join(bunBinDir, 'omp.exe'),
+      ]
+    : [
+        path.join(home, '.local', 'bin', 'omp'),
+        path.join(home, '.omp', 'bin', 'omp'),
+        path.join(bunBinDir, 'omp'),
+      ];
   for (const p of fallbacks) { try { if (fs.existsSync(p)) return p; } catch { /* */ } }
   return '';
 }
@@ -165,6 +180,7 @@ function parseWorkspacesFile(raw: string): WorkspacesFile {
           (kv): kv is [string, string] => typeof kv[1] === 'string',
         ))
       : undefined,
+    intentTracing: typeof parsed.intentTracing === 'boolean' ? parsed.intentTracing : undefined,
   };
 }
 
@@ -268,10 +284,25 @@ function appendDiag(line: string): void {
   } catch { /* 诊断自身绝不能抛 */ }
 }
 
+function resolveWindowIcon(): string | undefined {
+  const candidates = [
+    path.join(__dirname, '..', '..', 'resources', 'icon.ico'),
+    path.join(process.resourcesPath ?? '', 'icon.ico'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p)) return p;
+    } catch { /* ignore */ }
+  }
+  return undefined;
+}
+
 function createWindow(): void {
+  const icon = resolveWindowIcon();
   mainWindow = new BrowserWindow({
     width: 1280, height: 840, minWidth: 900, minHeight: 600,
     backgroundColor: '#0d1117', title: 'OMP — Codex',
+    ...(icon ? { icon } : {}),
     frame: !USE_CUSTOM_TITLE_BAR,
     titleBarStyle: USE_CUSTOM_TITLE_BAR ? 'hidden' : 'default',
     webPreferences: {
@@ -471,14 +502,17 @@ function registerIpc(): void {
     }
   });
 
-  ipcMain.handle(IPC.OmpAcquire, async (_e, sessionPath: string, cwd: string, approvalMode?: ApprovalMode) => {
+  ipcMain.handle(IPC.OmpAcquire, async (_e, sessionPath: string, cwd: string, approvalMode?: ApprovalMode, opts?: AcquireOptions) => {
     if (!pool) throw new Error('pool not initialized');
     // 钩子是全局的，续接/恢复的历史会话也一并加载（读取持久化配置，解析出 --hook 参数）。
     const wf = await loadWorkspacesFile();
     // 已在线进程的包装钩子可能写在另一个 key 的缓存目录（temp key 迁移成真实路径后 / 消息桥拉起的会话）：
     // 沿用该目录解析，否则路径不同会被 pool 误判为 hooks 变更而重起进程（打断进行中的回合）。
     const hooks = await resolveHookArgs(wf.hooks, sessionPath, liveHookCacheDir(pool.get(sessionPath)?.hooks));
-    await pool.acquire(sessionPath, cwd, approvalMode ?? 'yolo', hooks);
+    await pool.acquire(sessionPath, cwd, approvalMode ?? 'yolo', hooks, {
+      ...opts,
+      intentTracing: wf.intentTracing,
+    });
   });
 
   ipcMain.handle(IPC.OmpNewSession, async (_e, tempKeyFromRenderer: string, cwd: string, approvalMode?: ApprovalMode) => {
@@ -495,7 +529,9 @@ function registerIpc(): void {
     const wf = await loadWorkspacesFile();
     const systemPrompt = wf.systemPrompt;
     const hooks = await resolveHookArgs(wf.hooks, tempKey);
-    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'yolo', systemPrompt, hooks);
+    await pool.acquireNew(tempKey, cwd, approvalMode ?? 'yolo', systemPrompt, hooks, {
+      intentTracing: wf.intentTracing,
+    });
     return { sessionPath: tempKey };
   });
 
@@ -1063,11 +1099,11 @@ app.whenReady().then(() => {
   // 初始化进程池
   pool = new OmpProcessPool(ompPath, {
     onFrame: (sessionPath, frame) => {
-      // 交互式 UI 请求（confirm/select/input/editor/open_url）入队等用户应答：
-      // pin 该会话，防止它在用户犹豫期间被 LRU 淘汰（等待中不输出帧，会被误判最闲）。
+      // 交互式 UI 请求（confirm/select/input/editor/open_url/form）入队等用户应答：
+      // pin 该会话，防止它在用户犹豫/填表期间被 LRU 淘汰（等待中不输出帧，会被误判最闲）。
       const fr = frame as { type?: string; method?: string; id?: unknown; targetId?: unknown };
       if (fr.type === 'extension_ui_request' && typeof fr.id === 'string') {
-        if (['confirm', 'select', 'input', 'editor', 'open_url'].includes(fr.method ?? '')) {
+        if (['confirm', 'select', 'input', 'editor', 'open_url', 'form'].includes(fr.method ?? '')) {
           pool?.pin(sessionPath, fr.id);
         } else if (fr.method === 'cancel') {
           // omp 撤销了某个待应答请求（如超时）：渲染层直接出队、不会再发应答，这里必须释放其 pin，

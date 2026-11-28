@@ -1080,3 +1080,112 @@ describe('hexToHslTriplet', () => {
     expect(hexToHslTriplet('red')).toBeNull();
   });
 });
+
+describe('OMP 19.1.1 适配事件与工具函数', () => {
+  beforeEach(() => {
+    useApp.setState({
+      currentSessionPath: SP,
+      messages: [],
+      sessionsMap: { [SP]: [] },
+      procStateMap: {},
+      subagents: [],
+      queuedMessagesMap: {},
+      btwPanel: null,
+      isCompacting: false,
+      compactionInfo: '',
+    });
+  });
+
+  it('delta 模式 message_update（无 content[]）能正确累积 thinking_delta 和 text_delta', () => {
+    ev({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    ev({
+      type: 'message_update',
+      message: { role: 'assistant' },
+      assistantMessageEvent: { type: 'thinking_delta', delta: '思考' },
+    });
+    ev({
+      type: 'message_update',
+      message: { role: 'assistant' },
+      assistantMessageEvent: { type: 'thinking_delta', delta: '完成' },
+    });
+    ev({
+      type: 'message_update',
+      message: { role: 'assistant' },
+      assistantMessageEvent: { type: 'text_delta', delta: '你好，' },
+    });
+    ev({
+      type: 'message_update',
+      message: { role: 'assistant' },
+      assistantMessageEvent: { type: 'text_delta', delta: '世界！' },
+    });
+    const parts = useApp.getState().messages[0]?.parts ?? [];
+    expect(parts).toEqual([
+      { kind: 'thinking', text: '思考完成' },
+      { kind: 'text', text: '你好，世界！' },
+    ]);
+  });
+
+  it('manual_compaction_start / manual_compaction_end 正确切换压缩状态', () => {
+    ev({ type: 'manual_compaction_start' });
+    expect(useApp.getState().isCompacting).toBe(true);
+    expect(useApp.getState().compactionInfo).toContain('手动压缩');
+    ev({ type: 'manual_compaction_end' });
+    expect(useApp.getState().isCompacting).toBe(false);
+    expect(useApp.getState().compactionInfo).toBe('');
+  });
+
+  it('queue_update 同步原生 steering / followUp 排队列表', () => {
+    ev({
+      type: 'queue_update',
+      queuedMessages: { steering: ['先看测试'], followUp: ['再更新文档', '最后提交'] },
+    });
+    expect(useApp.getState().queuedMessagesMap[SP]).toEqual({
+      steering: ['先看测试'],
+      followUp: ['再更新文档', '最后提交'],
+    });
+  });
+
+  it('btw_delta / btw_record 驱动 /btw 旁路回答流', () => {
+    ev({ type: 'btw_delta', delta: '答案是 ', topicId: 't1' });
+    ev({ type: 'btw_delta', delta: '42', topicId: 't1' });
+    expect(useApp.getState().btwPanel).toMatchObject({
+      open: true,
+      streaming: true,
+      topicId: 't1',
+      answer: '答案是 42',
+    });
+    ev({ type: 'btw_record', question: '生命的意义', answer: '答案是 42', topicId: 't1' });
+    expect(useApp.getState().btwPanel).toMatchObject({
+      open: true,
+      streaming: false,
+      question: '生命的意义',
+      answer: '答案是 42',
+    });
+  });
+
+  it('wait 工具（omp 18.8+ 取代 hub）也能更新子智能体作业状态', () => {
+    ev({
+      type: 'tool_execution_start',
+      toolCallId: 'w1',
+      toolName: 'wait',
+      args: { jobs: ['job-1'] },
+    });
+    ev({
+      type: 'tool_execution_end',
+      toolCallId: 'w1',
+      toolName: 'wait',
+      isError: false,
+      result: {
+        details: {
+          jobs: [{ id: 'job-1', type: 'task', status: 'completed', durationMs: 1200, resolvedModel: 'claude' }],
+        },
+      },
+    });
+    expect(useApp.getState().subagents).toHaveLength(1);
+    expect(useApp.getState().subagents[0]).toMatchObject({
+      id: 'job-1',
+      status: 'completed',
+      durationMs: 1200,
+    });
+  });
+});

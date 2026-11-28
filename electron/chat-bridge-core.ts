@@ -17,6 +17,7 @@ import { randomUUID } from 'crypto';
 import { app } from 'electron';
 import type { OmpProcessPool } from './omp-pool';
 import type { ApprovalMode, WecomBinding, WecomBridgeStatus } from '../src/shared/ipc-channels';
+import { isToolMountNotice } from '../src/shared/notice-filter';
 
 /** 流式刷新节流间隔 */
 export const STREAM_FLUSH_MS = 1_000;
@@ -469,8 +470,8 @@ export class ChatBridgeCore {
     if (type === 'notice') {
       const n = frame as { message?: string; level?: string };
       // 只有 error 级通知（如会话写盘失败）才终止回合：info/warning 通知（含每次启动都会刷的
-      // xd:// MCP 挂载通知）不代表回合结束，在这里收尾会截断回答、丢掉后续全部输出
-      if (n.level === 'error' && typeof n.message === 'string' && n.message && !/^xd:\/\//i.test(n.message)) {
+      // xd:// 或 19.1.0+ tools.commands MCP 挂载通知）不代表回合结束，在这里收尾会截断回答、丢掉后续全部输出
+      if (n.level === 'error' && typeof n.message === 'string' && n.message && !isToolMountNotice(n.message)) {
         const turn = this.findTurn(sessionPath);
         if (turn) {
           this.finishTurn(turn, `${turn.text}\n\n---\n⚠ ${n.message}`);

@@ -2,14 +2,16 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../store';
 import type { ApprovalMode } from '../../shared/ipc-channels';
 
-/** 权限模式选项（对应 omp `--approval-mode` 三档）。
+/** 权限模式选项（对应 omp `--approval-mode` 四档）。
  *  - yolo：全自动，不弹窗（默认；仅信任的任务使用）。
  *  - write：读/写自动，仅执行类（bash/浏览器/ssh/task）弹窗。
- *  - always-ask：每次工具调用都弹窗确认。 */
+ *  - always-ask：每次工具调用都弹窗确认。
+ *  - always-ask-cached（omp 19+）：首次询问并支持本会话内记住放行决策。 */
 const MODES: { value: ApprovalMode; label: string; desc: string }[] = [
   { value: 'yolo', label: 'YOLO · 全自动（默认）', desc: '自动批准所有工具调用（含 bash 等执行类），不弹窗' },
   { value: 'write', label: 'Write', desc: '读/写自动执行，仅执行类（bash/浏览器/ssh 等）弹窗' },
   { value: 'always-ask', label: 'Always Ask · 每次询问', desc: '每次工具调用都弹窗确认' },
+  { value: 'always-ask-cached', label: 'Ask & Remember · 询问并记住', desc: '首次询问确认，支持本会话内记住同工具放行（omp 19+）' },
 ];
 
 export const PermissionPicker: React.FC<{ onChange: (mode: ApprovalMode) => void }> = ({ onChange }) => {

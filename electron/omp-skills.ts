@@ -19,21 +19,22 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { parseDocument, Document, parse, YAMLMap } from 'yaml';
 import { getAgentDir } from './omp-config';
+import { expandHomeDir } from '../src/shared/omp-paths';
 import type { SkillInfo, SkillDetail } from '../src/shared/ipc-channels';
 
 /** 用户主目录：OMP_HOME 显式设置时以它为准（与 getAgentDir 一致，测试也可用它隔离） */
 function userHome(): string {
   const h = process.env.OMP_HOME && process.env.OMP_HOME.trim();
-  return h ? h : os.homedir();
+  return h ? expandHomeDir(h) : os.homedir();
 }
 
 /** 技能发现根目录（对应 omp 的 agents/claude/codex 三个 user provider；custom 目录单独合并） */
-function baseSkillRoots(): string[] {
+function baseSkillRoots(): Array<{ root: string; provider?: string }> {
   const home = userHome();
   return [
-    path.join(home, '.agents', 'skills'),
-    path.join(home, '.claude', 'skills'),
-    path.join(home, '.codex', 'skills'),
+    { root: path.join(home, '.agents', 'skills') },
+    { root: path.join(home, '.claude', 'skills'), provider: 'claude' },
+    { root: path.join(home, '.codex', 'skills'), provider: 'codex' },
   ];
 }
 
@@ -65,7 +66,11 @@ async function resolveConfigFile(): Promise<string> {
 /** 读 config.yml 的 skills.* 状态（文件缺失/解析失败返回空，不抛错） */
 export interface SkillConfigState {
   ignoredSkills: string[];
+  manualSkills: string[];
   customDirectories: string[];
+  /** omp 18.15.0+：第三方源白名单（undefined 表示未显式配置；数组存在时不在列表内的第三方源可能被 omp 门控） */
+  enabledProviders?: string[];
+  disabledProviders: string[];
 }
 export async function readSkillConfig(): Promise<SkillConfigState> {
   const file = await resolveConfigFile();
@@ -77,12 +82,21 @@ export async function readSkillConfig(): Promise<SkillConfigState> {
   } catch {
     // 文件不存在 → 空配置
   }
-  const skills = (obj.skills ?? {}) as { ignoredSkills?: unknown; customDirectories?: unknown };
+  const skills = (obj.skills ?? {}) as {
+    ignoredSkills?: unknown;
+    manualSkills?: unknown;
+    customDirectories?: unknown;
+  };
   const asStrings = (v: unknown): string[] =>
-    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  const home = userHome();
   return {
     ignoredSkills: asStrings(skills.ignoredSkills),
-    customDirectories: asStrings(skills.customDirectories),
+    manualSkills: asStrings(skills.manualSkills),
+    // omp 18.12.3+：skills.customDirectories 支持 ~/ 展开
+    customDirectories: asStrings(skills.customDirectories).map((d) => expandHomeDir(d, home)),
+    enabledProviders: Array.isArray(obj.enabledProviders) ? asStrings(obj.enabledProviders) : undefined,
+    disabledProviders: asStrings(obj.disabledProviders),
   };
 }
 
@@ -134,11 +148,16 @@ function parseSkillMd(raw: string): { metadata: Record<string, unknown>; body: s
   return { metadata, body: raw.slice(m[0].length) };
 }
 
-/** 扫描所有技能根，返回 name → { dir, source }（同名取第一个找到的） */
-async function scanSkillDirs(customDirs: string[]): Promise<Map<string, { dir: string; source: string }>> {
-  const roots = [...baseSkillRoots(), ...customDirs];
-  const out = new Map<string, { dir: string; source: string }>();
-  for (const root of roots) {
+/** 扫描所有技能根，返回 name → { dir, source, provider }（同名取第一个找到的） */
+async function scanSkillDirs(
+  customDirs: string[],
+): Promise<Map<string, { dir: string; source: string; provider?: string }>> {
+  const roots: Array<{ root: string; provider?: string }> = [
+    ...baseSkillRoots(),
+    ...customDirs.map((root) => ({ root })),
+  ];
+  const out = new Map<string, { dir: string; source: string; provider?: string }>();
+  for (const { root, provider } of roots) {
     let entries: fs.Dirent[] = [];
     try {
       entries = await fs.promises.readdir(root, { withFileTypes: true });
@@ -151,7 +170,7 @@ async function scanSkillDirs(customDirs: string[]): Promise<Map<string, { dir: s
       if (!e.isDirectory() && !e.isSymbolicLink()) continue;
       const dir = path.join(root, e.name);
       if (!(await fileExists(path.join(dir, 'SKILL.md')))) continue;
-      if (!out.has(e.name)) out.set(e.name, { dir, source: path.basename(root) });
+      if (!out.has(e.name)) out.set(e.name, { dir, source: provider ?? path.basename(root), provider });
     }
   }
   return out;
@@ -159,7 +178,7 @@ async function scanSkillDirs(customDirs: string[]): Promise<Map<string, { dir: s
 
 /** 技能名对应的所有 SKILL.md 目录（卸载用：同名可能存在于多个根） */
 async function findAllSkillDirs(name: string, customDirs: string[]): Promise<string[]> {
-  const roots = [...baseSkillRoots(), ...customDirs];
+  const roots = [...baseSkillRoots().map((r) => r.root), ...customDirs];
   const out: string[] = [];
   for (const root of roots) {
     const dir = path.join(root, name);
@@ -172,6 +191,13 @@ function validateSkillName(name: string): void {
   if (!name || name.includes('/') || name.includes('\\') || name.includes('..') || /\s/.test(name)) {
     throw new Error('技能名不合法');
   }
+}
+
+function isProviderDisabled(cfg: SkillConfigState, provider?: string): boolean {
+  if (!provider) return false;
+  if (cfg.disabledProviders.includes(provider)) return true;
+  if (cfg.enabledProviders !== undefined && !cfg.enabledProviders.includes(provider)) return true;
+  return false;
 }
 
 /** 列出已安装技能（含已停用）：目录扫描 + config 启停状态 */
@@ -188,7 +214,17 @@ export async function listSkills(): Promise<SkillInfo[]> {
     } catch {
       // 读不到描述不阻塞
     }
-    out.push({ name, description, enabled: !isIgnored(cfg.ignoredSkills, name), path: info.dir, source: info.source });
+    const manual = isIgnored(cfg.manualSkills, name) || undefined;
+    const providerDisabled = isProviderDisabled(cfg, info.provider) || undefined;
+    out.push({
+      name,
+      description,
+      enabled: !isIgnored(cfg.ignoredSkills, name),
+      path: info.dir,
+      source: info.source,
+      ...(manual ? { manual: true } : {}),
+      ...(providerDisabled ? { providerDisabled: true } : {}),
+    });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -248,7 +284,7 @@ export async function uninstallSkill(name: string): Promise<{ ok: boolean; moved
     if (dirs.length === 0) {
       return { ok: false, moved: [], error: "未找到该技能的目录" };
     }
-    const roots = [...baseSkillRoots(), ...cfg.customDirectories].map((r) => path.resolve(r));
+    const roots = [...baseSkillRoots().map((r) => r.root), ...cfg.customDirectories].map((r) => path.resolve(r));
     const trashRoot = path.join(getAgentDir(), 'skills-trash');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const trashDir = path.join(trashRoot, `${name}-${stamp}`);

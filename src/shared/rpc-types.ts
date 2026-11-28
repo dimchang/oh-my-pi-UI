@@ -190,6 +190,16 @@ export interface SwitchSessionCommand extends RpcCommandBase {
   /** 实测 + 源码权威（rpc-types.ts L75）：字段名是 sessionPath。
    *  值可为 .jsonl 绝对路径（正/反斜杠均可）或裸 sessionId，均 success。 */
   sessionPath: string;
+  /** omp 18.6.3+：可选覆盖目标会话模型（原模型不可恢复时用） */
+  provider?: string;
+  modelId?: string;
+}
+
+export interface OpenSessionCommand extends RpcCommandBase {
+  type: 'open_session';
+  sessionPath: string;
+  provider?: string;
+  modelId?: string;
 }
 
 export interface SetSessionNameCommand extends RpcCommandBase {
@@ -202,9 +212,78 @@ export interface LoginCommand extends RpcCommandBase {
   provider: string;
 }
 
+export interface LogoutCommand extends RpcCommandBase {
+  type: 'logout';
+  provider: string;
+  accountId?: string;
+}
+
 export interface SetThinkingLevelCommand extends RpcCommandBase {
   type: 'set_thinking_level';
   level: ThinkingLevel;
+}
+
+export interface SetFastModeCommand extends RpcCommandBase {
+  type: 'set_fast_mode';
+  enabled: boolean;
+}
+
+export interface SetSlowModeCommand extends RpcCommandBase {
+  type: 'set_slow_mode';
+  enabled: boolean;
+}
+
+export interface SetEventFilterCommand extends RpcCommandBase {
+  type: 'set_event_filter';
+  messageUpdates?: 'full' | 'delta';
+  includeSubagentEvents?: boolean;
+  [k: string]: unknown;
+}
+
+export interface RemoveQueuedMessageCommand extends RpcCommandBase {
+  type: 'remove_queued_message';
+  queue?: 'steering' | 'followUp' | 'follow_up';
+  index?: number;
+  text?: string;
+  [k: string]: unknown;
+}
+
+export interface AbortAndRestoreQueueCommand extends RpcCommandBase {
+  type: 'abort_and_restore_queue';
+}
+
+export interface GetSessionLeaseCommand extends RpcCommandBase {
+  type: 'get_session_lease';
+  sessionIds: string[];
+}
+
+export interface NavigateTreeCommand extends RpcCommandBase {
+  type: 'navigate_tree';
+  entryId: string;
+  summarize?: boolean;
+}
+
+export interface ForkCommand extends RpcCommandBase {
+  type: 'fork';
+  entryId?: string;
+}
+
+export interface SetLabelCommand extends RpcCommandBase {
+  type: 'set_label';
+  entryId: string;
+  label?: string;
+}
+
+export interface BtwCommand extends RpcCommandBase {
+  type: 'btw';
+  message: string;
+  topicId?: string;
+  images?: RpcImage[];
+}
+
+export interface BtwCancelCommand extends RpcCommandBase {
+  type: 'btw_cancel';
+  topicId?: string;
 }
 
 export interface ExtensionUIResponseCommand extends RpcCommandBase {
@@ -214,6 +293,9 @@ export interface ExtensionUIResponseCommand extends RpcCommandBase {
   confirmed?: boolean;
   cancelled?: boolean;
   timedOut?: boolean;
+  always?: boolean;
+  /** omp 19.1.0+：`ask` 整页 HTML 表单（method:'form'）提交数据 */
+  data?: Record<string, string | number | boolean | string[]>;
 }
 
 export type RpcCommand =
@@ -222,11 +304,24 @@ export type RpcCommand =
   | FollowUpCommand
   | SetModelCommand
   | SwitchSessionCommand
+  | OpenSessionCommand
   | SetSessionNameCommand
   | LoginCommand
+  | LogoutCommand
   | SetThinkingLevelCommand
+  | SetFastModeCommand
+  | SetSlowModeCommand
+  | SetEventFilterCommand
+  | RemoveQueuedMessageCommand
+  | AbortAndRestoreQueueCommand
+  | GetSessionLeaseCommand
+  | NavigateTreeCommand
+  | ForkCommand
+  | SetLabelCommand
+  | BtwCommand
+  | BtwCancelCommand
   | ExtensionUIResponseCommand
-  | RpcCommandBase; // 其余简单命令：{type:'get_state'|'abort'|'new_session'|...}
+  | RpcCommandBase; // 其余简单命令：{type:'get_state'|'abort'|'new_session'|'get_entries'|'get_tree'|...}
 
 // ---------------------------------------------------------------------------
 // omp → client：响应帧
@@ -278,7 +373,7 @@ export interface ToolExecutionStartEvent {
   toolName?: string;
   name?: string;
   args?: unknown;
-  /** omp 对该次工具调用的一句话意图（实测 start 帧恒带，中英文都有），UI 原样展示。 */
+  /** omp 对该次工具调用的一句话意图（omp 19.0.0+ 在 RPC 模式默认关闭，开启 PI_INTENT_TRACING=1 时下发）。 */
   intent?: string;
   [k: string]: unknown;
 }
@@ -303,19 +398,43 @@ export interface NoticeEvent { type: 'notice'; message?: string; level?: string;
 /** 实测帧：{"type":"thinking_level_changed","thinkingLevel":"low"} —— 字段是 thinkingLevel */
 export interface ThinkingLevelChangedEvent { type: 'thinking_level_changed'; thinkingLevel?: ThinkingLevel; [k: string]: unknown; }
 
+/** omp 18.13.3+：手动压缩（/compact、RPC compact）进度事件 */
+export interface ManualCompactionStartEvent { type: 'manual_compaction_start'; [k: string]: unknown; }
+export interface ManualCompactionEndEvent { type: 'manual_compaction_end'; [k: string]: unknown; }
+
+/** omp 18.4.4+：排队消息实时快照 */
+export interface QueuedMessagesSnapshot {
+  steering?: string[];
+  followUp?: string[];
+  [k: string]: unknown;
+}
+export interface QueueUpdateEvent {
+  type: 'queue_update';
+  steering?: string[];
+  followUp?: string[];
+  queuedMessages?: QueuedMessagesSnapshot;
+  [k: string]: unknown;
+}
+
+/** omp 18.6.3+：/btw 侧边问答流事件 */
+export interface BtwDeltaEvent { type: 'btw_delta'; topicId?: string; delta?: string; [k: string]: unknown; }
+export interface BtwRecordEvent { type: 'btw_record'; topicId?: string; question?: string; answer?: string; status?: string; [k: string]: unknown; }
+
 export type AgentSessionEvent =
   | AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent
   | MessageStartEvent | MessageUpdateEvent | MessageEndEvent
   | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolExecutionEndEvent
   | NoticeEvent | ThinkingLevelChangedEvent
+  | ManualCompactionStartEvent | ManualCompactionEndEvent
+  | QueueUpdateEvent | BtwDeltaEvent | BtwRecordEvent
   | { type: string; [k: string]: unknown }; // 兜底：auto_compaction_*/auto_retry_*/todo_* 等
 
 // ---------------------------------------------------------------------------
-// omp → client：extension_ui_request（权限/选项/OAuth/通知）
+// omp → client：extension_ui_request（权限/选项/表单/OAuth/通知）
 // ---------------------------------------------------------------------------
 
 export type ExtensionUIMethod =
-  | 'confirm' | 'select' | 'input' | 'editor' | 'cancel'   // 需应答
+  | 'confirm' | 'select' | 'input' | 'editor' | 'form' | 'cancel'   // 需应答（form: omp 19.1.0+ ask 整页 HTML 表单）
   | 'notify' | 'setStatus' | 'setWidget' | 'setTitle' | 'set_editor_text' // 单向
   | 'open_url'                                            // OAuth
   | string;                                               // 兜底
@@ -340,6 +459,16 @@ export interface RpcExtensionUIRequest {
   options?: ExtensionUIOptionItem[];
   defaultValue?: string;
   placeholder?: string;
+  /** omp 18.13.2+：input 敏感输入掩码提示（密码/Token） */
+  secret?: boolean;
+  /** omp 18.20.0+：select 初始高亮项及复选元数据 */
+  initialIndex?: number;
+  selectionMarker?: string;
+  checkedIndices?: number[];
+  markableCount?: number;
+  /** omp 19.1.0+：method === 'form' 整页 HTML 表单 */
+  html?: string;
+  timeout?: number;
   // open_url
   url?: string;
   launchUrl?: string;
@@ -357,7 +486,12 @@ export interface RpcExtensionUIRequest {
 // omp → client：其他系统帧
 // ---------------------------------------------------------------------------
 
-export interface ReadyFrame { type: 'ready'; }
+export interface ReadyFrame {
+  type: 'ready';
+  /** omp 18.18.1+：是否支持 bash 命令的 excludeFromContext */
+  supportsBashExcludeFromContext?: boolean;
+  [k: string]: unknown;
+}
 
 export interface SlashCommand {
   name: string;
@@ -386,7 +520,8 @@ export type OmpFrame =
 // get_state 的 data（实测字段）
 // ---------------------------------------------------------------------------
 
-export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+/** omp 18.3.4 / 19.1.0+ 新增 'auto'（按任务复杂度自动选择思考深度） */
+export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto';
 
 export interface ModelInfo {
   id: string;
@@ -433,6 +568,8 @@ export interface RpcSessionState {
   sessionId?: string;
   messageCount?: number;
   queuedMessageCount?: number;
+  /** omp 18.4.4+：实际待发送队列快照（steering / followUp） */
+  queuedMessages?: QueuedMessagesSnapshot;
   todoPhases?: TodoPhase[];
   contextUsage?: ContextUsage;
   /** omp 18.2.1+：非 TUI 客户端可用的生成吞吐（tok/s） */
@@ -440,8 +577,13 @@ export interface RpcSessionState {
   /** omp 18.2.1+：fast mode 可用/生效状态 */
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
-  /** omp 18.3.1+：RPC prompt 生命周期标识（配合 prompt_result 关联） */
+  /** omp 18.6.3+：slow mode（低优先级 / flex tier）状态与额度提示 */
+  slowModeSupported?: boolean;
+  slowModeEnabled?: boolean;
+  usageLimit?: { stage?: string; resetAt?: string; [k: string]: unknown };
+  /** omp 18.3.1+：RPC prompt 生命周期标识与结算状态 */
   promptId?: string;
+  isSettled?: boolean;
   [k: string]: unknown;
 }
 

@@ -3,7 +3,7 @@
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun, type WecomBridgeConfig, type WecomBridgeStatus } from '../src/shared/ipc-channels';
+import { IPC, type OmpApi, type FileEntry, type PickedFile, type WorkspacesFile, type ApprovalMode, type AcquireOptions, type OmpProviderConfig, type CustomCssConfig, type AutomationsFile, type AutomationTask, type AutomationRun, type WecomBridgeConfig, type WecomBridgeStatus } from '../src/shared/ipc-channels';
 // 审查 P1 修复：下方 api 签名引用了这三个类型，缺导入会让 typecheck 全程红着
 import type { RpcCommand, OmpFrame, ModelInfo } from '../src/shared/rpc-types';
 
@@ -19,8 +19,8 @@ const api: OmpApi = {
   diagLog: (lines: string[]) => ipcRenderer.send(IPC.DiagLog, lines),
   send: <T = unknown>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<T> =>
     ipcRenderer.invoke(IPC.RpcSend, sessionPath, cmd, timeoutMs),
-  acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode) =>
-    ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode),
+  acquire: (sessionPath: string, cwd: string, approvalMode?: ApprovalMode, opts?: AcquireOptions) =>
+    ipcRenderer.invoke(IPC.OmpAcquire, sessionPath, cwd, approvalMode, opts),
   newSessionForCwd: (tempKey: string, cwd: string, approvalMode?: ApprovalMode) =>
     ipcRenderer.invoke(IPC.OmpNewSession, tempKey, cwd, approvalMode),
   release: (sessionPath: string) => ipcRenderer.invoke(IPC.OmpRelease, sessionPath),

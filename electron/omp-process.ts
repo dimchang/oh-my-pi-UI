@@ -24,9 +24,15 @@ export interface OmpProcessOptions {
   logDir?: string;
   /** 重启时带 -c 继续上一个会话（用于同 cwd 切权限模式，保留会话上下文） */
   continueSession?: boolean;
-  /** resume 指定 path 的历史会话（-r <path>）。多进程池 acquire 历史会话时用。
+  /** resume 指定 path 的历史会话（-r <path> 或 --restore <path>）。多进程池 acquire 历史会话时用。
    *  与 continueSession 互斥：resumeSession 优先。 */
   resumeSession?: string;
+  /** true 时配合 resumeSession 使用 `--restore <path>` 而非 `-r`（omp 18.10.3+ 崩溃后真续跑中断回合）。 */
+  restore?: boolean;
+  /** 显式指定模型（`--model <provider/id>`），用于原会话保存的模型不可恢复时切换替代模型（omp 18.6.3+）。 */
+  model?: string;
+  /** omp 19.0.0+：是否在 RPC 模式下开启工具调用意图追踪（PI_INTENT_TRACING=1；默认 false 跟随上游省 token）。 */
+  intentTracing?: boolean;
   /** 钩子文件绝对路径列表，逐个通过 --hook=<path> 注入 omp（全局钩子，每个进程都加载）。 */
   hooks?: string[];
 }
@@ -50,12 +56,12 @@ export interface OmpProcessEvents {
  * 注意：这只能"建议"子进程使用 UTF-8，最终效果取决于 omp 内部如何
  * spawn 子 shell 以及如何解码其 stdout。彻底修复需上游 omp 配合。
  *
- * omp 18.2.1+：上游已修复"shell/PTY 输出从 UTF-8 回退到系统 ANSI 码页"问题
- * （中文区域回退 GBK）。本注入与之可能交互：待实测 §5.2 三条命令后决定去留；
- * 实测无冲突前保留注入（17.x 乱码治理成果，勿轻易回退）。
+ * omp 18.18.1+：上游已统一在全平台为 agent bash 命令注入 LANG/LC_ALL=C.UTF-8，
+ * 并修复 Windows CJK 代码页单字节乱码（18.17.0），本注入与上游完全对齐，安全保留。
+ * omp 19.0.0+：RPC 模式默认关闭 tools.intentTracing 以省 token；仅当用户开启设置项时注入 PI_INTENT_TRACING=1。
  */
-function utf8Env(): NodeJS.ProcessEnv {
-  return {
+function utf8Env(intentTracing?: boolean): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     // --- POSIX shell (Git Bash / MSYS2 / WSL) ---
     LANG: 'C.UTF-8',
@@ -69,6 +75,10 @@ function utf8Env(): NodeJS.ProcessEnv {
     // --- General ---
     NO_COLOR: '1',
   };
+  if (intentTracing) {
+    env.PI_INTENT_TRACING = '1';
+  }
+  return env;
 }
 
 /**
@@ -252,8 +262,16 @@ export class OmpProcess {
 
     const args = ['--mode', 'rpc-ui', '--approval-mode', this.opts.approvalMode ?? 'yolo'];
     if (this.opts.noSession) args.push('--no-session');
-    if (this.opts.resumeSession) args.push('-r', this.opts.resumeSession);
-    else if (this.opts.continueSession) args.push('-c');
+    if (this.opts.resumeSession) {
+      // omp 18.10.3+：--restore 续跑因进程崩溃中断的回合与子代理；普通恢复仍用 -r
+      args.push(this.opts.restore ? '--restore' : '-r', this.opts.resumeSession);
+    } else if (this.opts.continueSession) {
+      args.push('-c');
+    }
+    // omp 18.6.3+：历史会话原模型不可恢复时，显式传入 --model 覆盖以便打开会话
+    if (this.opts.model && this.opts.model.trim()) {
+      args.push('--model', this.opts.model.trim());
+    }
     // 系统提示词：仅新建会话（acquireNew，不带 -r/-c）时注入。续接/恢复的历史会话不重复注入。
     if (this.opts.systemPrompt && this.opts.systemPrompt.trim()) {
       args.push('--append-system-prompt', this.opts.systemPrompt.trim());
@@ -288,7 +306,7 @@ export class OmpProcess {
       this.child = spawn(this.opts.ompPath, args, {
         cwd: this.opts.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: utf8Env(),
+        env: utf8Env(this.opts.intentTracing),
         windowsVerbatimArguments: false,
       });
     } catch (e) {
@@ -433,9 +451,32 @@ export class OmpProcess {
       // 这里不能调 cleanup()（否则会 null 掉新进程的 child/rl）。
       victim.on('exit', () => { /* 旧进程：所有资源已在 kill().cleanup() 释放 */ });
       victim.on('close', () => { /* 旧进程：同上 */ });
-      // 树杀整棵进程（Windows 下 omp.exe 是 bun shim，真 agent 是子进程 bun.exe）。
-      // sync=true 用于 app 退出路径（需同步等进程真死透，异步计时器等不到）。
-      killProcessTree(victim.pid, sync);
+      // omp 19.0.0 / 19.1.0+：MCP 与后台服务收敛至单用户统一 daemon；
+      // sync=true（应用退出）仍同步整树强杀确保无残留；
+      // sync=false（单会话淘汰/重启）优先关闭 stdin 让 omp 优雅收尾（释放本地 session 与 MCP 租约、
+      // 避免 taskkill /T 误伤同树可能关联的共享 daemon），若 1200ms 内仍未退出再兜底树杀。
+      if (sync) {
+        killProcessTree(victim.pid, true);
+      } else {
+        const victimPid = victim.pid;
+        let exited = false;
+        const fallback = setTimeout(() => {
+          if (!exited && victim.exitCode === null && victim.signalCode === null) {
+            killProcessTree(victimPid, false);
+          }
+        }, 1200);
+        fallback.unref?.();
+        victim.once('exit', () => {
+          exited = true;
+          clearTimeout(fallback);
+        });
+        try {
+          victim.stdin?.end();
+        } catch {
+          clearTimeout(fallback);
+          killProcessTree(victimPid, false);
+        }
+      }
     }
     this.cleanup();
   }

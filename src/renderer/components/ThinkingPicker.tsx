@@ -6,6 +6,7 @@ import type { ModelInfo, ThinkingLevel } from '../../shared/rpc-types';
 
 const LEVELS: { value: ThinkingLevel; label: string; desc: string }[] = [
   { value: 'off', label: '关闭', desc: '不思考' },
+  { value: 'auto', label: '自动', desc: '按任务复杂度自动选择（omp 19+）' },
   { value: 'minimal', label: '极简', desc: '仅在必要时思考' },
   { value: 'low', label: '低', desc: '轻度思考' },
   { value: 'medium', label: '中', desc: '平衡' },
@@ -65,8 +66,9 @@ export const ThinkingPicker: React.FC = () => {
   if (!model) return null;
   const supported = model.thinking?.efforts;
   // omp 侧不支持思考时，除「关闭」外的档位一律不可选 —— 选也只会被 clamp 回 off（历史误导点）
+  // 'auto'（omp 19.0+）由运行时动态选档，只要模型支持思考即允许选择
   const isSupported = (v: ThinkingLevel) =>
-    v === 'off' || (runtimeOk && (!supported || supported.includes(v)));
+    v === 'off' || (runtimeOk && (v === 'auto' || !supported || supported.includes(v)));
 
   const pick = (l: ThinkingLevel) => {
     if (!isSupported(l)) return;

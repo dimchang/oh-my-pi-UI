@@ -77,12 +77,15 @@ export const InputBox: React.FC<{
   onGuide: (text: string, attachments?: Attachment[]) => void;
   onQueue: (text: string, attachments?: Attachment[]) => void;
   onAbort: () => void;
+  onAbortAndRestoreQueue?: () => void;
   onChangeApprovalMode: (mode: ApprovalMode) => void;
-}> = ({ onSend, onGuide, onQueue, onAbort, onChangeApprovalMode }) => {
+}> = ({ onSend, onGuide, onQueue, onAbort, onAbortAndRestoreQueue, onChangeApprovalMode }) => {
   // 草稿（文本 + 待发附件）**按会话隔离**，存在 store 里而不是组件本地 state：
   // InputBox 在整个应用生命周期只挂载一次，本地 state 会在切会话时把 A 会话没发出去的文字
   // 带进 B 会话（2026-10-25 bug）。sessionPath 为 key，切回 A 时原样恢复。
   const sessionPath = useApp((s) => s.currentSessionPath ?? '');
+  const queued = useApp((s) => (sessionPath ? s.queuedMessagesMap[sessionPath] : undefined));
+  const btwPanel = useApp((s) => s.btwPanel);
   const draft = useApp((s) => (sessionPath ? s.composerDrafts[sessionPath]?.text ?? '' : ''));
   const attachments = useApp((s) =>
     sessionPath ? s.composerDrafts[sessionPath]?.attachments : undefined,
@@ -365,9 +368,84 @@ export const InputBox: React.FC<{
           : '正在生成…Enter 排队（等当前轮跑完再处理），Shift+Enter 引导')
       : '给 MyPi 派个任务…（/ 打开命令，Esc 中止）';
 
+  const queuedSteering = queued?.steering ?? [];
+  const queuedFollowUp = queued?.followUp ?? [];
+  const hasQueued = queuedSteering.length > 0 || queuedFollowUp.length > 0;
+
+  const removeQueued = (kind: 'steering' | 'followUp', index: number) => {
+    if (!sessionPath) return;
+    void rpc.removeQueuedMessage(sessionPath, { queue: kind, index }).catch(() => undefined);
+  };
+
+  const cancelBtw = () => {
+    if (btwPanel?.streaming && btwPanel.sessionPath) {
+      void rpc.btwCancel(btwPanel.sessionPath, btwPanel.topicId).catch(() => undefined);
+    }
+    useApp.getState().setBtwPanel(null);
+  };
+
   return (
     <div className="input-area">
       <div className="input-inner">
+        {btwPanel?.open && (
+          <div className="btw-card" role="region" aria-label="/btw 旁路回答">
+            <div className="btw-card-head">
+              <span className="btw-card-tag">/btw</span>
+              <span className="btw-card-q" title={btwPanel.question}>{btwPanel.question || '旁路问答'}</span>
+              <button
+                type="button"
+                className="btw-card-close"
+                onClick={cancelBtw}
+                title={btwPanel.streaming ? '取消并关闭' : '关闭'}
+              >
+                {btwPanel.streaming ? '取消' : '×'}
+              </button>
+            </div>
+            <div className="btw-card-body">
+              {btwPanel.answer || (btwPanel.streaming ? '正在思考…' : '（无内容）')}
+            </div>
+          </div>
+        )}
+        {hasQueued && (
+          <div className="queued-bar" role="region" aria-label="排队中的消息">
+            <div className="queued-chips">
+              {queuedSteering.map((msg, i) => (
+                <span key={`s-${i}`} className="queued-chip steering" title={msg}>
+                  <span className="queued-chip-tag">引导</span>
+                  <span className="queued-chip-text">{msg}</span>
+                  <button
+                    type="button"
+                    className="queued-chip-remove"
+                    title="移除该排队消息"
+                    onClick={() => removeQueued('steering', i)}
+                  >×</button>
+                </span>
+              ))}
+              {queuedFollowUp.map((msg, i) => (
+                <span key={`f-${i}`} className="queued-chip followup" title={msg}>
+                  <span className="queued-chip-tag">排队</span>
+                  <span className="queued-chip-text">{msg}</span>
+                  <button
+                    type="button"
+                    className="queued-chip-remove"
+                    title="移除该排队消息"
+                    onClick={() => removeQueued('followUp', i)}
+                  >×</button>
+                </span>
+              ))}
+            </div>
+            {isStreaming && onAbortAndRestoreQueue && (
+              <button
+                type="button"
+                className="queued-restore-btn"
+                onClick={onAbortAndRestoreQueue}
+                title="中止当前生成并将排队消息退回输入框"
+              >
+                中止并退回草稿
+              </button>
+            )}
+          </div>
+        )}
         {slashMatch && slashMatch.list.length > 0 && (
           <div className="slash-popup">
             {slashMatch.list.map((c, i) => (

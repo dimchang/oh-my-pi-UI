@@ -12,7 +12,7 @@
 import { OmpProcess } from './omp-process';
 import { FrameRouter } from '../src/main/frame-router';
 import type { OmpFrame, RpcCommand, RpcResponse } from '../src/shared/rpc-types';
-import type { ApprovalMode } from '../src/shared/ipc-channels';
+import type { ApprovalMode, AcquireOptions } from '../src/shared/ipc-channels';
 import * as path from 'path';
 import * as fs from 'fs';
 
@@ -22,10 +22,16 @@ export interface PoolEntry {
   approvalMode: ApprovalMode;
   /** 该进程启动时注入的 hook 路径列表（顺序无关）。用于配置变更后识别是否需要重起。 */
   hooks: string[];
+  /** omp 19.0.0+：是否注入 PI_INTENT_TRACING=1 */
+  intentTracing: boolean;
   proc: OmpProcess;
   router: FrameRouter;
   lastActiveAt: number;
   status: 'spawning' | 'online' | 'evicted';
+}
+
+export interface PoolAcquireOptions extends AcquireOptions {
+  intentTracing?: boolean;
 }
 
 export interface PoolEvents {
@@ -138,12 +144,19 @@ export class OmpProcessPool {
    *  - 已 online → 直接返回（更新 lastActiveAt）。
    *  - 池满 → 先 LRU 淘汰最久未活跃的 idle 进程。
    *  - spawn 带 -c：resume 该 sessionPath 的历史（用户切回旧会话续接）。 */
-  async acquire(sessionPath: string, cwd: string, approvalMode: ApprovalMode = 'yolo', hooks?: string[]): Promise<PoolEntry> {
+  async acquire(
+    sessionPath: string,
+    cwd: string,
+    approvalMode: ApprovalMode = 'yolo',
+    hooks?: string[],
+    opts?: PoolAcquireOptions,
+  ): Promise<PoolEntry> {
+    const wantIntent = Boolean(opts?.intentTracing);
     const existing = this.entries.get(sessionPath);
     if (existing && existing.status === 'online') {
-      // hook 配置变更后必须重起进程，否则老进程不带新 --hook（issue: 导入钩子后不生效）。
-      if (!hooksEqual(existing.hooks, hooks)) {
-        this.events.onLog(`[pool] hooks changed for ${sessionPath}, respawning`);
+      // hook 配置变更、显式 --restore / --model 重拉、或 intentTracing 开关变更时需重起进程。
+      if (!hooksEqual(existing.hooks, hooks) || opts?.restore || opts?.model || existing.intentTracing !== wantIntent) {
+        this.events.onLog(`[pool] respawn needed for ${sessionPath} (hooks/opts changed)`);
         this.evict(sessionPath);
       } else {
         existing.lastActiveAt = Date.now();
@@ -159,13 +172,13 @@ export class OmpProcessPool {
         throw new Error('进程池已满且所有会话都在等待用户确认，无法新建会话（请先关闭或回应某个会话）');
       }
     }
-    // 历史会话（磁盘文件存在）→ -r resume 指定文件；
+    // 历史会话（磁盘文件存在）→ -r / --restore resume 指定文件；
     // tempKey 防分裂兜底（2026-09-14 bet_zp 事故根因）：temp 会话曾落盘过
     // （tempSessionFiles 有记忆）→ 同样带 -r 续接，而不是全新 spawn 出第二个 .jsonl。
     // resume 判定已下移到 spawnEntry 内部用异步 stat 完成（issue 7），这里不再同步 existsSync，
     // 以保证容量检查 → spawning 注册之间不插入 await（维持 issue 1 的并发安全）。
     const knownFile = isTempKey(sessionPath) ? this.tempSessionFiles.get(sessionPath) : undefined;
-    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, knownFile, undefined, hooks);
+    const p = this.spawnEntry(sessionPath, cwd, approvalMode, /*continueSession*/ false, knownFile, undefined, hooks, opts);
     this.spawning.set(sessionPath, p);
     try {
       return await p;
@@ -178,7 +191,14 @@ export class OmpProcessPool {
    *  解析真实 path 再 renameKey(tempKey, realPath)。tempKey 用临时占位。
    *  systemPrompt 非空时通过 --append-system-prompt 注入到该新会话。
    *  hooks 非空时逐个通过 --hook=<path> 注入（全局钩子）。 */
-  async acquireNew(tempKey: string, cwd: string, approvalMode: ApprovalMode = 'yolo', systemPrompt?: string, hooks?: string[]): Promise<PoolEntry> {
+  async acquireNew(
+    tempKey: string,
+    cwd: string,
+    approvalMode: ApprovalMode = 'yolo',
+    systemPrompt?: string,
+    hooks?: string[],
+    opts?: PoolAcquireOptions,
+  ): Promise<PoolEntry> {
     const pending = this.spawning.get(tempKey);
     if (pending) return pending;
     if (this.inflightCount() >= this.maxPool) {
@@ -186,7 +206,7 @@ export class OmpProcessPool {
         throw new Error('进程池已满且所有会话都在等待用户确认，无法新建会话（请先关闭或回应某个会话）');
       }
     }
-    const p = this.spawnEntry(tempKey, cwd, approvalMode, /*continueSession*/ false, undefined, systemPrompt, hooks);
+    const p = this.spawnEntry(tempKey, cwd, approvalMode, /*continueSession*/ false, undefined, systemPrompt, hooks, opts);
     this.spawning.set(tempKey, p);
     try {
       return await p;
@@ -304,11 +324,14 @@ export class OmpProcessPool {
     resumeSession?: string,
     systemPrompt?: string,
     hooks?: string[],
+    opts?: PoolAcquireOptions,
   ): Promise<PoolEntry> {
     return new Promise<PoolEntry>((resolve, reject) => {
       const normalizedCwd = path.normalize(cwd);
       // 用 ctx 包装让 proc 回调能引用尚未声明的 entry/router/proc（闭包运行时解析）
       const ctx: { entry?: PoolEntry; router?: FrameRouter; proc?: OmpProcess } = {};
+      /** 启动期 stderr 缓冲（最多保留最近 20 行），用于检测 omp 18.6.3+ `Could not restore model <provider/id>` */
+      const startupStderr: string[] = [];
       /** 当前池 key：renameKey 会更新 entry.sessionPath，而闭包不能引用 spawn 时捕获的
        *  初始 sessionPath（tempKey）——否则 rename 后帧/事件仍按旧 key 标记。 */
       const currentSessionKey = (): string => (ctx.entry ? ctx.entry.sessionPath : sessionPath);
@@ -336,6 +359,7 @@ export class OmpProcessPool {
         cwd: normalizedCwd,
         approvalMode,
         hooks: hooks ? [...hooks] : [],
+        intentTracing: Boolean(opts?.intentTracing),
         // 占位，proc 创建后立即覆盖（entry 已同步注册，killAll 在 spawn 完成前不会用到它）。
         proc: undefined as unknown as OmpProcess,
         router,
@@ -391,7 +415,18 @@ export class OmpProcessPool {
           // 异步 stat 期间可能已被 evict/killAll：不再拉起进程，否则成为池外孤儿进程。
           if (isEvicted()) return;
           const proc = new OmpProcess(
-            { ompPath: this.ompPath, cwd: normalizedCwd, approvalMode, continueSession, resumeSession: resolvedResume, systemPrompt, hooks },
+            {
+              ompPath: this.ompPath,
+              cwd: normalizedCwd,
+              approvalMode,
+              continueSession,
+              resumeSession: resolvedResume,
+              restore: opts?.restore,
+              model: opts?.model,
+              intentTracing: opts?.intentTracing,
+              systemPrompt,
+              hooks,
+            },
             {
               onReady: () => {
                 if (ctx.entry) ctx.entry.status = 'online';
@@ -436,11 +471,25 @@ export class OmpProcessPool {
                 if (!settled) {
                   settled = true;
                   clearTimeout(timeout);
-                  reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
+                  // omp 18.6.3+：历史会话保存的模型不可恢复时，-r/-c 在 rpc-ui 下直接报错退出
+                  // （Could not restore model <provider/id>）。把该错误原文带回渲染层，便于弹窗选替代模型。
+                  const stderrJoined = startupStderr.join('\n');
+                  const restoreMatch = /Could not restore model\s+([^\s\r\n"'`]+)/i.exec(stderrJoined);
+                  if (restoreMatch?.[1]) {
+                    reject(new Error(`Could not restore model ${restoreMatch[1]} (code=${code})`));
+                  } else {
+                    reject(new Error(`omp exited before ready (code=${code}) for ${sessionPath}`));
+                  }
                 }
                 if (isCurrent) this.events.onExit(key, code);
               },
-              onStderr: (line) => this.events.onStderr(currentSessionKey(), line),
+              onStderr: (line) => {
+                if (!settled) {
+                  startupStderr.push(line);
+                  if (startupStderr.length > 20) startupStderr.shift();
+                }
+                this.events.onStderr(currentSessionKey(), line);
+              },
             },
           );
           ctx.proc = proc;

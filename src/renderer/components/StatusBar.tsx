@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp, connTone, connDetail, connStuckMinutes } from '../store';
+import { rpc } from '../rpc-client';
 import { Icon } from './Icon';
 
 export const StatusBar: React.FC = () => {
@@ -10,6 +11,12 @@ export const StatusBar: React.FC = () => {
   // 当前会话的模型 / 思考档位（refreshState 已填充，这里仅展示）
   const model = useApp((s) => s.model);
   const thinking = useApp((s) => s.thinkingLevel);
+  const sessionPath = useApp((s) => s.currentSessionPath);
+  const fastModeEnabled = useApp((s) => s.fastModeEnabled);
+  const fastModeActive = useApp((s) => s.fastModeActive);
+  const slowModeSupported = useApp((s) => s.slowModeSupported);
+  const slowModeEnabled = useApp((s) => s.slowModeEnabled);
+  const usageLimit = useApp((s) => s.usageLimit);
   // 直接从 selector 参数 s 中 find，避免在 selector 内调用 get() 破坏响应式订阅
   const currentWorkspace = useApp((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId) ?? null);
   // 连接三色与文案统一由 store 派生（与输入框旁的 conn-pill 同源，避免判定漂移）
@@ -21,6 +28,27 @@ export const StatusBar: React.FC = () => {
   // （onReady / agent_end / 切会话时都会刷新），本组件纯展示。
 
   const dot = tone === 'red' ? 'off' : tone === 'green' ? 'on' : 'busy';
+  const thinkingLabel = thinking === 'auto' ? '自动' : thinking;
+
+  const toggleFast = () => {
+    if (!sessionPath) return;
+    const next = !(fastModeEnabled ?? fastModeActive);
+    void rpc.setFastMode(sessionPath, next).then((r) => {
+      if (r.success) {
+        useApp.getState().setState({ fastModeEnabled: next, fastModeActive: next });
+      }
+    }).catch(() => undefined);
+  };
+
+  const toggleSlow = () => {
+    if (!sessionPath) return;
+    const next = !slowModeEnabled;
+    void rpc.setSlowMode(sessionPath, next).then((r) => {
+      if (r.success) {
+        useApp.getState().setState({ slowModeEnabled: next });
+      }
+    }).catch(() => undefined);
+  };
 
   return (
     <div className="statusbar">
@@ -39,7 +67,36 @@ export const StatusBar: React.FC = () => {
           {model.name ?? model.id} · {model.provider}
         </span>
       )}
-      {thinking && <span className="status-item">思考: {thinking}</span>}
+      {thinkingLabel && <span className="status-item">思考: {thinkingLabel}</span>}
+      {(fastModeEnabled !== undefined || fastModeActive) && (
+        <button
+          type="button"
+          className={`status-pill-btn${fastModeActive || fastModeEnabled ? ' active' : ''}`}
+          onClick={toggleFast}
+          title="切换 Fast 模式（点击开/关）"
+        >
+          ⚡ Fast
+        </button>
+      )}
+      {slowModeSupported && (
+        <button
+          type="button"
+          className={`status-pill-btn${slowModeEnabled ? ' active' : ''}`}
+          onClick={toggleSlow}
+          title="切换 Slow 省额模式（点击开/关）"
+        >
+          🐢 Slow
+        </button>
+      )}
+      {usageLimit?.stage && (
+        <span
+          className="status-item"
+          style={{ color: 'var(--yellow)' }}
+          title={usageLimit.resetAt ? `重置时间：${usageLimit.resetAt}` : '模型额度受限阶段'}
+        >
+          额度: {usageLimit.stage}
+        </span>
+      )}
       <span className="status-spacer" />
       {stats?.totalTokens !== undefined && Number.isFinite(stats.totalTokens) && (
         <span className="status-item" title={`${stats.messageCount ?? 0} 条消息`}>

@@ -23,6 +23,7 @@ const APPROVAL_OPTIONS: Array<{ value: ApprovalMode; label: string }> = [
   { value: 'yolo', label: 'YOLO · 全自动（默认）' },
   { value: 'write', label: 'Write' },
   { value: 'always-ask', label: 'Always Ask · 每次询问' },
+  { value: 'always-ask-cached', label: 'Ask & Remember · 询问并记住' },
 ];
 
 const approvalLabel = (m: ApprovalMode): string =>

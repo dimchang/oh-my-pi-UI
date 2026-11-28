@@ -11,12 +11,13 @@ import type {
   AgentMessage,
   ContextUsage,
   ModelInfo,
+  QueuedMessagesSnapshot,
   SlashCommand,
   ThinkingLevel,
   TodoPhase,
   TodoItem,
 } from '../shared/rpc-types';
-import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AppearanceConfig, HookFileConfig, CustomCssConfig, AutomationTask, SessionTailInfo } from '../shared/ipc-channels';
+import type { SessionSummary, Workspace, WorkspacesFile, ApprovalMode, AcquireOptions, AppearanceConfig, HookFileConfig, CustomCssConfig, AutomationTask, SessionTailInfo } from '../shared/ipc-channels';
 export type { SessionTailInfo } from '../shared/ipc-channels';
 import type { SkillInfo } from '../shared/ipc-channels';
 import { ompStat, exportDiagLines } from './diagnostics';
@@ -168,9 +169,45 @@ export interface UiRequest {
   text?: string;
   level?: string;
   targetId?: string;
+  /** omp 18.18+: input 密码遮罩 */
+  secret?: boolean;
+  /** omp 19.0+: select 初始高亮/已勾选索引与标记符号 */
+  initialIndex?: number;
+  selectionMarker?: string;
+  checkedIndices?: number[];
+  markableCount?: number;
+  /** omp 19.1.0+: ask 原生 HTML 表单源码与超时（ms） */
+  html?: string;
+  timeout?: number;
   /** UI 请求来源的会话 path（多进程：应答时路由回该会话进程） */
   sessionPath?: string;
   raw: unknown;
+}
+
+/** 历史会话原模型不可恢复时的弹窗上下文（omp 18.6.3+） */
+export interface ModelRestorePrompt {
+  sessionPath: string;
+  cwd: string;
+  approvalMode: ApprovalMode;
+  missingModel: string;
+  restore?: boolean;
+}
+
+/** `/btw` 旁路问答浮层状态（omp 18.4+ / 18.13+） */
+export interface BtwPanelState {
+  open: boolean;
+  sessionPath: string;
+  question: string;
+  answer: string;
+  streaming: boolean;
+  topicId?: string;
+}
+
+/** 从 acquire 报错中解析 `Could not restore model <provider/id>`（omp 18.6.3+）。 */
+export function parseModelRestoreError(err: unknown): string | null {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  const m = /Could not restore model\s+([^\s\r\n"'`]+)/i.exec(msg);
+  return m?.[1] ?? null;
 }
 
 /** 某会话绑定的 omp 进程状态（多进程池：每会话一进程） */
@@ -230,6 +267,21 @@ interface AppState {
   contextUsage?: ContextUsage;
   /** omp 18.2.1+ get_state：生成吞吐（tok/s），状态栏展示用 */
   tokensPerSecond?: number;
+  /** omp 18.6+ / 19.0+ get_state：Fast/Slow 模式与用量限额状态 */
+  fastModeEnabled?: boolean;
+  fastModeActive?: boolean;
+  slowModeSupported?: boolean;
+  slowModeEnabled?: boolean;
+  usageLimit?: { stage?: string; resetAt?: string; [k: string]: unknown };
+  /** omp 18.4+ / 18.10+：各会话原生排队消息（steering / followUp） */
+  queuedMessagesMap: Record<string, QueuedMessagesSnapshot>;
+  setQueuedMessages(sessionPath: string, q: QueuedMessagesSnapshot): void;
+  /** omp 18.6.3+：历史会话原模型不可恢复时的替代模型选择弹窗 */
+  modelRestorePrompt: ModelRestorePrompt | null;
+  setModelRestorePrompt(p: ModelRestorePrompt | null): void;
+  /** omp 18.4+ / 18.13+：`/btw` 旁路问答浮层状态 */
+  btwPanel: BtwPanelState | null;
+  setBtwPanel(p: BtwPanelState | null): void;
   sessionId?: string;
   slashCommands: SlashCommand[];
   /** 已安装技能（技能页网格）：来自主进程扫描（含已停用项），enabled 反映 config.yml */
@@ -304,6 +356,9 @@ interface AppState {
    *  Shift+Enter 自动取反。 */
   inputBehavior: 'queue' | 'guide';
   setInputBehavior(v: 'queue' | 'guide'): void;
+  /** omp 19.0.0+：是否注入 PI_INTENT_TRACING=1 开启工具调用意图追踪（默认关闭以省 token） */
+  intentTracing: boolean;
+  setIntentTracing(v: boolean): void;
   /** 外观（系统风格）配置。改了即持久化并实时应用。 */
   appearance?: AppearanceConfig;
   setAppearance(v: AppearanceConfig): void;
@@ -471,7 +526,7 @@ interface AppState {
   setProcState(sessionPath: string, partial: Partial<ProcState>): void;
   /** 确保某会话的 omp 进程在线：已在线直接返回 true；否则按需懒拉起（静默失败返回 false）。
    *  用于"仅浏览历史不拉起进程"后，需要进程能力（输入/模型列表/思考档位等）时再拉起。 */
-  ensureOnline(sessionPath: string): Promise<boolean>;
+  ensureOnline(sessionPath: string, opts?: AcquireOptions): Promise<boolean>;
 
   /** omp 进程崩溃导致上一轮中断的会话（运行时态，key=sessionPath）。
    *  0.5.40：侧栏红点 / 右下角红色 toast「重发上一条」的数据源；用户重发或发新消息后清除。 */
@@ -582,6 +637,53 @@ function mergeContentAndTools(contentParts: MessagePart[], toolParts: ToolPart[]
     else text.push(p);
   }
   return [...thinking, ...toolParts, ...text];
+}
+
+/**
+ * omp 18.4.5+ / 18.13.2+ `set_event_filter({ messageUpdates: "delta" })` 增量合并。
+ * delta 模式下 `message_update.message` 仅含 `{ role: "assistant" }`（无 `content[]`），
+ * 增量片段落在 `frame.assistantMessageEvent`（`thinking_delta` / `text_delta` 等）。
+ * 返回新 parts（保持 thinking → tool → text 顺序）；若事件不含可渲染文本增量则返回 null（跳过更新）。
+ */
+function applyDeltaToParts(
+  parts: MessagePart[],
+  ev: unknown,
+): MessagePart[] | null {
+  if (!ev || typeof ev !== 'object') return null;
+  const e = ev as { type?: string; delta?: unknown };
+  const delta = typeof e.delta === 'string' ? e.delta : '';
+  if (!delta) return null;
+
+  const thinking: ThinkingPart[] = [];
+  const tools: ToolPart[] = [];
+  const texts: TextPart[] = [];
+  for (const p of parts) {
+    if (p.kind === 'thinking') thinking.push(p);
+    else if (p.kind === 'tool') tools.push(p);
+    else texts.push(p);
+  }
+
+  if (e.type === 'thinking_delta') {
+    if (thinking.length > 0) {
+      const last = thinking[thinking.length - 1]!;
+      thinking[thinking.length - 1] = { ...last, text: last.text + delta };
+    } else {
+      thinking.push({ kind: 'thinking', text: delta });
+    }
+    return [...thinking, ...tools, ...texts];
+  }
+
+  if (e.type === 'text_delta') {
+    if (texts.length > 0) {
+      const last = texts[texts.length - 1]!;
+      texts[texts.length - 1] = { ...last, text: last.text + delta };
+    } else {
+      texts.push({ kind: 'text', text: delta });
+    }
+    return [...thinking, ...tools, ...texts];
+  }
+
+  return null;
 }
 
 function textOfParts(parts: MessagePart[]): string {
@@ -882,12 +984,28 @@ export const useApp = create<AppState>((set, get) => ({
   systemPrompt: undefined,
   appearance: undefined,
   inputBehavior: 'guide',
+  intentTracing: false,
+  queuedMessagesMap: {},
+  modelRestorePrompt: null,
+  btwPanel: null,
 
   setReady: (v) => set({ ready: v }),
   setMainView: (v) => set({ mainView: v }),
   setAutomations: (tasks) => set({ automations: tasks }),
   setSettingsOpen: (v) => set({ settingsOpen: v }),
   setSettingsTab: (tab) => set({ settingsTab: tab }),
+  setQueuedMessages: (sessionPath, q) =>
+    set((s) => ({
+      queuedMessagesMap: {
+        ...s.queuedMessagesMap,
+        [sessionPath]: {
+          steering: Array.isArray(q.steering) ? q.steering : [],
+          followUp: Array.isArray(q.followUp) ? q.followUp : [],
+        },
+      },
+    })),
+  setModelRestorePrompt: (p) => set({ modelRestorePrompt: p }),
+  setBtwPanel: (p) => set({ btwPanel: p }),
 
   /**
    * 白名单语义（v2）：
@@ -933,6 +1051,10 @@ export const useApp = create<AppState>((set, get) => ({
   },
   setInputBehavior: (v) => {
     set({ inputBehavior: v });
+    get().persistWorkspaces();
+  },
+  setIntentTracing: (v) => {
+    set({ intentTracing: v });
     get().persistWorkspaces();
   },
   setHooks: (v) => {
@@ -1060,6 +1182,12 @@ export const useApp = create<AppState>((set, get) => ({
       // 不会再清它，不清就会串到新会话上常亮「压缩中」（在线会话由 refreshState 按 omp 真值回填）。
       isCompacting: false,
       compactionInfo: '',
+      fastModeEnabled: undefined,
+      fastModeActive: undefined,
+      slowModeSupported: undefined,
+      slowModeEnabled: undefined,
+      usageLimit: undefined,
+      btwPanel: null,
       ...cleared,
     });
   },
@@ -1164,6 +1292,7 @@ export const useApp = create<AppState>((set, get) => ({
       appearance: migratedAppearance,
       hooks: file.hooks,
       inputBehavior: file.inputBehavior ?? 'guide',
+      intentTracing: Boolean(file.intentTracing),
       sessionNames: file.sessionNames ?? {},
     });
     // 若发生过迁移（任何 id 改了格式）或 customCss 补上 id，立即写回磁盘
@@ -1495,6 +1624,7 @@ export const useApp = create<AppState>((set, get) => ({
         appearance: s.appearance,
         hooks: s.hooks,
         inputBehavior: s.inputBehavior,
+        intentTracing: s.intentTracing,
         sessionNames: s.sessionNames,
       };
       // 动态 import 避免循环依赖（rpc-client 也 import store）
@@ -1532,11 +1662,11 @@ export const useApp = create<AppState>((set, get) => ({
     set({ sessionsMap, procStateMap, messages: [], isStreaming: false, isAborting: false, subagents: [], subagentsAt: 0 });
   },
 
-  ensureOnline: async (sessionPath) => {
+  ensureOnline: async (sessionPath, opts) => {
     const s = get();
     if (!sessionPath) return false;
     const ps = s.procStateMap[sessionPath];
-    if (ps?.status === 'online') return true;
+    if (ps?.status === 'online' && !opts?.model && !opts?.restore) return true;
     // temp 会话进程离线（被杀/淘汰/退出）时绝不直接 acquire：
     // tempKey 在磁盘上不存在，acquire 会全新 spawn 出第二个 .jsonl
     // （实证 2026-09-14 bet_zp：输入框聚焦 ensureOnline(tempKey) 裂出 01a0a048）。
@@ -1548,9 +1678,19 @@ export const useApp = create<AppState>((set, get) => ({
     if (!cwd) return false;
     const mode = ws?.approvalMode ?? 'yolo';
     try {
-      await window.omp.acquire(sessionPath, cwd, mode);
+      await window.omp.acquire(sessionPath, cwd, mode, opts);
       return true;
-    } catch {
+    } catch (err) {
+      const missingModel = parseModelRestoreError(err);
+      if (missingModel) {
+        get().setModelRestorePrompt({
+          sessionPath,
+          cwd,
+          approvalMode: mode,
+          missingModel,
+          restore: opts?.restore,
+        });
+      }
       return false;
     }
   },
@@ -1794,15 +1934,24 @@ export const useApp = create<AppState>((set, get) => ({
         break;
       }
       case 'message_update': {
-        const msg = frame.message as AgentMessage;
+        const msg = frame.message as AgentMessage | undefined;
         if (!msg || msg.role !== 'assistant') break;
         const buf = getBuf();
         for (let i = buf.length - 1; i >= 0; i--) {
           const m = buf[i];
           if (m && m.role === 'assistant' && m.streaming) {
-            const toolParts = m.parts.filter((p): p is ToolPart => p.kind === 'tool');
-            buf[i] = { ...m, parts: mergeContentAndTools(contentToParts(msg), toolParts) };
-            bufferTouched = true;
+            if (Array.isArray(msg.content)) {
+              const toolParts = m.parts.filter((p): p is ToolPart => p.kind === 'tool');
+              buf[i] = { ...m, parts: mergeContentAndTools(contentToParts(msg), toolParts) };
+              bufferTouched = true;
+            } else {
+              // delta 模式（set_event_filter({ messageUpdates: "delta" })）
+              const nextParts = applyDeltaToParts(m.parts, frame.assistantMessageEvent);
+              if (nextParts) {
+                buf[i] = { ...m, parts: nextParts };
+                bufferTouched = true;
+              }
+            }
             break;
           }
         }
@@ -1904,11 +2053,16 @@ export const useApp = create<AppState>((set, get) => ({
           partial: partialTextOf(partialResult) || p.partial,
         }));
         bufferTouched = true;
-        // 子智能体进度：task 推 details.progress[]，hub 推 details.jobs[]（后者带真实 status）
+        // 子智能体进度：task 推 details.progress[]，hub/wait 推 details.jobs[]（后者带真实 status；omp 18.8+ 以 wait 取代 hub）
         if (isDisplay) {
           const incoming = toolName === 'task'
             ? subagentsFromProgress(partialResult)
-            : toolName === 'hub' ? subagentsFromJobs(asObj(partialResult)?.details) : [];
+            : (toolName === 'hub' || toolName === 'wait')
+              ? (() => {
+                  const byJobs = subagentsFromJobs(asObj(partialResult)?.details);
+                  return byJobs.length ? byJobs : subagentsFromProgress(partialResult);
+                })()
+              : [];
           if (incoming.length) set({ subagents: mergeSubagents(get().subagents, incoming), subagentsAt: now });
         }
         break;
@@ -1947,9 +2101,12 @@ export const useApp = create<AppState>((set, get) => ({
           const phases = normalizeTodoPhases(result);
           if (phases) set({ todoPhases: phases });
         }
-        // 子智能体终态：只采信 hub 的 result.details.jobs[]（带 status/durationMs/resolvedModel）。
+        // 子智能体终态：采信 hub / wait 的 result.details.jobs[]（带 status/durationMs/resolvedModel）。
         // task 自身的 end 帧是派发瞬间的启动快照（progress 全 pending、results 为空）→ 必须忽略。
-        if (isDisplay && (frame.toolName === 'hub' || frame.name === 'hub')) {
+        if (
+          isDisplay &&
+          (frame.toolName === 'hub' || frame.name === 'hub' || frame.toolName === 'wait' || frame.name === 'wait')
+        ) {
           const jobs = subagentsFromJobs(asObj(result)?.details);
           if (jobs.length) set({ subagents: mergeSubagents(get().subagents, jobs), subagentsAt: now });
         }
@@ -1960,8 +2117,69 @@ export const useApp = create<AppState>((set, get) => ({
         if (isDisplay) set({ isCompacting: true, compactionInfo: '压缩上下文中…' });
         return;
       }
-      case 'auto_compaction_end': {
+      case 'manual_compaction_start': {
+        if (isDisplay) set({ isCompacting: true, compactionInfo: '手动压缩上下文中…' });
+        return;
+      }
+      case 'auto_compaction_end':
+      case 'manual_compaction_end': {
         if (isDisplay) set({ isCompacting: false, compactionInfo: '' });
+        return;
+      }
+      case 'queue_update': {
+        // omp 18.4+ / 18.10+：原生排队消息变更（steering / followUp）
+        const src = (asObj(frame.queuedMessages) ?? frame) as { steering?: unknown; followUp?: unknown };
+        const steering = Array.isArray(src.steering) ? src.steering.filter((x): x is string => typeof x === 'string') : [];
+        const followUp = Array.isArray(src.followUp) ? src.followUp.filter((x): x is string => typeof x === 'string') : [];
+        set((st) => ({
+          queuedMessagesMap: {
+            ...st.queuedMessagesMap,
+            [rawTargetPath]: { steering, followUp },
+          },
+        }));
+        return;
+      }
+      case 'btw_delta': {
+        if (!isDisplay) return;
+        const delta = typeof frame.delta === 'string' ? frame.delta : '';
+        const topicId = asStr(frame.topicId);
+        if (!delta) return;
+        set((st) => {
+          const prev = st.btwPanel && pathsEqual(st.btwPanel.sessionPath, rawTargetPath)
+            ? st.btwPanel
+            : { open: true, sessionPath: rawTargetPath, question: '', answer: '', streaming: true, topicId };
+          return {
+            btwPanel: {
+              ...prev,
+              open: true,
+              streaming: true,
+              topicId: topicId ?? prev.topicId,
+              answer: prev.answer + delta,
+            },
+          };
+        });
+        return;
+      }
+      case 'btw_record': {
+        if (!isDisplay) return;
+        const answer = asStr(frame.answer) ?? asStr(asObj(frame.record)?.answer);
+        const question = asStr(frame.question) ?? asStr(asObj(frame.record)?.question);
+        const topicId = asStr(frame.topicId) ?? asStr(asObj(frame.record)?.topicId);
+        set((st) => {
+          const prev = st.btwPanel && pathsEqual(st.btwPanel.sessionPath, rawTargetPath)
+            ? st.btwPanel
+            : { open: true, sessionPath: rawTargetPath, question: '', answer: '', streaming: false, topicId };
+          return {
+            btwPanel: {
+              ...prev,
+              open: true,
+              streaming: false,
+              topicId: topicId ?? prev.topicId,
+              question: question ?? prev.question,
+              answer: answer ?? prev.answer,
+            },
+          };
+        });
         return;
       }
       case 'auto_retry_start': {

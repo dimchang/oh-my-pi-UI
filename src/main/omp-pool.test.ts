@@ -260,4 +260,42 @@ describe('OmpProcessPool spawn / 退出生命周期', () => {
     expect(seen).toEqual([]);
     pool.killAll();
   });
+
+  it('OMP 18.6.3+：启动前 stderr 报 Could not restore model 时，acquire reject 携带原模型 ID', async () => {
+    const Mock = await mockProcClass();
+    const before = Mock.instances.length;
+    Mock.autoReady = false;
+    try {
+      const { pool } = makePool();
+      const key = path.join(cwd, 'missing-model.jsonl');
+      const p = pool.acquire(key, cwd, 'yolo');
+      p.catch(() => undefined);
+      await until(() => Mock.instances.length > before);
+      const proc = Mock.instances[Mock.instances.length - 1]!;
+      proc.events.onStderr('Error: Could not restore model google-gemini-cli/gemini-2.5-pro');
+      proc.events.onExit(1);
+      await expect(p).rejects.toThrow(/Could not restore model google-gemini-cli\/gemini-2\.5-pro/);
+      pool.killAll();
+    } finally {
+      Mock.autoReady = true;
+    }
+  });
+
+  it('OMP 19.0+：acquire 透传 restore / model / intentTracing 选项到 OmpProcess', async () => {
+    const { OmpProcess } = await import('../../electron/omp-process');
+    const Mock = OmpProcess as unknown as { optsLog: Array<Record<string, unknown>> };
+    const { pool } = makePool();
+    const key = path.join(cwd, 'opts-forward.jsonl');
+    await pool.acquire(key, cwd, 'always-ask-cached', undefined, {
+      restore: true,
+      model: 'anthropic/claude-sonnet-4-5',
+      intentTracing: true,
+    });
+    const lastOpts = Mock.optsLog[Mock.optsLog.length - 1]!;
+    expect(lastOpts.approvalMode).toBe('always-ask-cached');
+    expect(lastOpts.restore).toBe(true);
+    expect(lastOpts.model).toBe('anthropic/claude-sonnet-4-5');
+    expect(lastOpts.intentTracing).toBe(true);
+    pool.killAll();
+  });
 });

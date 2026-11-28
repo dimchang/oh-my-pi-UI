@@ -3424,3 +3424,373 @@ body {
   gap: 10px;
   padding: 14px 20px 18px;
 }
+
+/* ====== OMP 19.1.1 适配：HTML 表单弹窗 / 模型恢复弹窗 / 排队芯片 / /btw 浮层 / 状态栏按钮 ====== */
+.modal-wide {
+  width: min(640px, 92vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-timeout-badge {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: hsl(var(--warning-200));
+  background: hsl(var(--warning-bg));
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-variant-numeric: tabular-nums;
+}
+.ask-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.ask-form-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: hsl(var(--text-100));
+}
+.ask-form-heading {
+  margin: 6px 0 2px;
+  font-weight: 600;
+  color: hsl(var(--text-100));
+}
+.ask-form-p { margin: 2px 0; }
+.ask-form-fieldset {
+  border: 1px solid hsl(var(--border-200));
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ask-form-fieldset legend {
+  padding: 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: hsl(var(--text-200));
+}
+.ask-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ask-form-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: hsl(var(--text-200));
+}
+.ask-form-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  font-size: 13px;
+  color: hsl(var(--text-100));
+}
+.ask-form-check input {
+  accent-color: hsl(var(--accent-main-000));
+  cursor: pointer;
+}
+.ask-form-input,
+.ask-form-select,
+.ask-form-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid hsl(var(--border-200));
+  border-radius: var(--radius-md);
+  background: hsl(var(--bg-100));
+  color: hsl(var(--text-100));
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+.ask-form-input:focus,
+.ask-form-select:focus,
+.ask-form-textarea:focus {
+  border-color: hsl(var(--accent-main-000));
+  background: hsl(var(--bg-000));
+}
+.ask-form-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.ask-form-table th,
+.ask-form-table td {
+  border: 1px solid hsl(var(--border-200));
+  padding: 6px 8px;
+  text-align: left;
+}
+.ask-form-table th {
+  background: hsl(var(--bg-200));
+  font-weight: 600;
+}
+.ask-form-pre {
+  background: hsl(var(--bg-200));
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-x: auto;
+  margin: 0;
+}
+.ask-form-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: hsl(var(--bg-300));
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.ask-form-img {
+  max-width: 100%;
+  max-height: 260px;
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+.ask-form-list {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+.ask-form-hr {
+  border: none;
+  border-top: 1px solid hsl(var(--border-200));
+  margin: 4px 0;
+}
+
+.model-restore-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid hsl(var(--border-200));
+  border-radius: var(--radius-md);
+  padding: 6px;
+  background: hsl(var(--bg-100));
+}
+.model-restore-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: hsl(var(--text-100));
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+.model-restore-item:hover:not(:disabled) {
+  background: hsl(var(--bg-300));
+}
+.model-restore-item.recommended {
+  border-color: hsl(var(--accent-main-000) / 0.35);
+  background: hsl(var(--accent-main-000) / 0.06);
+}
+.model-restore-name {
+  font-size: 13px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.model-restore-badge {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: hsl(var(--accent-main-000) / 0.14);
+  color: hsl(var(--accent-main-000));
+}
+.model-restore-meta {
+  font-size: 11.5px;
+  color: hsl(var(--text-400));
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.queued-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid hsl(var(--border-200));
+  background: hsl(var(--bg-200));
+}
+.queued-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.queued-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 280px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  background: hsl(var(--bg-000));
+  border: 1px solid hsl(var(--border-200));
+  color: hsl(var(--text-100));
+}
+.queued-chip.steering {
+  border-color: hsl(var(--warning-100) / 0.45);
+}
+.queued-chip-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: hsl(var(--text-300));
+  flex-shrink: 0;
+}
+.queued-chip.steering .queued-chip-tag {
+  color: hsl(var(--warning-200));
+}
+.queued-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queued-chip-remove {
+  border: none;
+  background: transparent;
+  color: hsl(var(--text-400));
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+}
+.queued-chip-remove:hover {
+  color: hsl(var(--danger-000));
+}
+.queued-restore-btn {
+  flex-shrink: 0;
+  border: 1px solid hsl(var(--border-200));
+  background: hsl(var(--bg-000));
+  color: hsl(var(--text-200));
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.queued-restore-btn:hover {
+  border-color: hsl(var(--accent-main-000) / 0.5);
+  color: hsl(var(--accent-main-000));
+}
+
+.btw-card {
+  margin-bottom: 8px;
+  border: 1px solid hsl(var(--accent-main-000) / 0.35);
+  border-radius: var(--radius-md);
+  background: hsl(var(--bg-000));
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.btw-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: hsl(var(--accent-main-000) / 0.08);
+  border-bottom: 1px solid hsl(var(--border-100));
+  font-size: 12px;
+}
+.btw-card-tag {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: hsl(var(--accent-main-000));
+  flex-shrink: 0;
+}
+.btw-card-q {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: hsl(var(--text-200));
+}
+.btw-card-close {
+  border: none;
+  background: transparent;
+  color: hsl(var(--text-300));
+  cursor: pointer;
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+}
+.btw-card-close:hover {
+  background: hsl(var(--bg-300));
+  color: hsl(var(--text-100));
+}
+.btw-card-body {
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: hsl(var(--text-100));
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.skill-badge-manual,
+.skill-badge-disabled {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: var(--radius-pill);
+  vertical-align: middle;
+}
+.skill-badge-manual {
+  background: hsl(var(--accent-main-000) / 0.12);
+  color: hsl(var(--accent-main-000));
+}
+.skill-badge-disabled {
+  background: hsl(var(--warning-bg));
+  color: hsl(var(--warning-200));
+}
+
+.status-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  border: 1px solid hsl(var(--border-200));
+  background: transparent;
+  color: hsl(var(--text-300));
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.status-pill-btn:hover {
+  border-color: hsl(var(--accent-main-000) / 0.5);
+  color: hsl(var(--text-100));
+}
+.status-pill-btn.active {
+  background: hsl(var(--accent-main-000) / 0.14);
+  border-color: hsl(var(--accent-main-000) / 0.5);
+  color: hsl(var(--accent-main-000));
+  font-weight: 600;
+}

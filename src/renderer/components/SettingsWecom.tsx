@@ -13,7 +13,7 @@
 import React, { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { cwdKey, basename } from '../utils/path-key';
-import type { WecomBridgeConfig, WecomBridgeStatus, Workspace } from '../../shared/ipc-channels';
+import type { ApprovalMode, WecomBridgeConfig, WecomBridgeStatus, Workspace } from '../../shared/ipc-channels';
 
 interface ChannelApi {
   label: string;
@@ -70,7 +70,7 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
   const [botId, setBotId] = useState('');
   const [secret, setSecret] = useState('');
   const [cwd, setCwd] = useState('');
-  const [approvalMode, setApprovalMode] = useState<'write' | 'yolo' | 'always-ask'>('write');
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>('write');
   const [injectMode, setInjectMode] = useState<'steer' | 'followUp'>('steer');
   const [busy, setBusy] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
@@ -270,11 +270,12 @@ const BridgeChannelForm: React.FC<{ api: ChannelApi; initialId?: string }> = ({ 
         <select
           className="settings-select"
           value={approvalMode}
-          onChange={(e) => setApprovalMode(e.target.value as 'write' | 'yolo' | 'always-ask')}
+          onChange={(e) => setApprovalMode(e.target.value as ApprovalMode)}
         >
           <option value="write">write — 读写自动，执行类弹窗（推荐）</option>
           <option value="yolo">yolo — 全自动（无人值守时危险）</option>
           <option value="always-ask">always-ask — 每次都弹窗（远程无人应答会卡住）</option>
+          <option value="always-ask-cached">always-ask-cached — 首次询问并记住（omp 19+）</option>
         </select>
       </div>
 

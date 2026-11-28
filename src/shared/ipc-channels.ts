@@ -147,6 +147,10 @@ export interface SkillInfo {
   path?: string;
   /** 技能来源（agents / claude / codex / custom，可空） */
   source?: string;
+  /** omp 18.17.0+：在 config.yml skills.manualSkills 中（仅可 /skill: 手动调用，不注入模型目录） */
+  manual?: boolean;
+  /** omp 18.15.0+：所属第三方源（如 claude/codex）在 config.yml enabledProviders 中未开启 */
+  providerDisabled?: boolean;
 }
 
 /** 技能详情（点卡片后展示，对应 SKILL.md 内容） */
@@ -208,8 +212,17 @@ export interface SessionTailInfo {
 /** omp 权限模式（对应启动参数 `--approval-mode`，spawn 时生效）。
  *  - yolo：所有工具调用自动批准，不弹窗（默认）。
  *  - write：读/写工具自动执行，仅执行类（bash/浏览器/ssh/task）弹窗确认。
- *  - always-ask：每次工具调用都弹窗确认。 */
-export type ApprovalMode = 'yolo' | 'write' | 'always-ask';
+ *  - always-ask：每次工具调用都弹窗确认。
+ *  - always-ask-cached（omp 18.12.3+）：Ask and remember，连文件读取也询问并持久化到 approval-cache.db。 */
+export type ApprovalMode = 'yolo' | 'write' | 'always-ask' | 'always-ask-cached';
+
+/** acquire 启动附加参数（omp 18.6.3 / 18.10.3+） */
+export interface AcquireOptions {
+  /** 显式传入 `--model <provider/id>`（用于原会话模型不可恢复时手动切换替代模型恢复） */
+  model?: string;
+  /** true 时使用 `--restore <session>` 而非 `-r <session>`（omp 18.10.3+ 崩溃后真续跑中断回合） */
+  restore?: boolean;
+}
 
 /** 工作空间 = 一个目录 + 自定义显示名（用户可重命名） */
 export interface Workspace {
@@ -346,6 +359,8 @@ export interface WorkspacesFile {
   /** 会话显示名覆盖层：sessionPath -> 用户自定义名（host 侧，不依赖 omp 写盘）。
    *  与"项目重命名"同思路——只覆盖 UI 展示，不修改磁盘 JSONL。 */
   sessionNames?: Record<string, string>;
+  /** omp 19.0.0+：是否向子进程注入 PI_INTENT_TRACING=1 以开启工具调用意图（默认 false，跟随上游省 token）。 */
+  intentTracing?: boolean;
 }
 
 /** WorkspacesGet 的返回：文件内容 + 主进程算出的「cwd 已失效」信号。
@@ -470,30 +485,44 @@ export interface OmpModelDefinition {
   reasoning?: boolean;
   /** 思考档位声明（ThinkingPicker 依赖 efforts 过滤可选档位；丢失 → 全档位可选 + 切高自动弹回） */
   thinking?: { mode?: string; efforts?: string[]; requiresEffort?: boolean; [k: string]: unknown };
-  /** omp 18.1.18+/18.2.1：wire 兼容开关（schema 校验收紧，类型错误直接拒绝）。GUI 只透传不解释 */
-  compat?: { stripImageInput?: boolean; supportsConfigurationUpdate?: boolean; [k: string]: unknown };
+  /** omp 18.1.18+ / 18.4.4+ / 18.6.3+ / 18.9.1+ / 18.13.0+：wire 兼容开关（schema 校验收紧）。GUI 只透传不解释 */
+  compat?: {
+    stripImageInput?: boolean;
+    supportsConfigurationUpdate?: boolean;
+    bedrockMessagesApi?: boolean;
+    statefulResponses?: boolean;
+    supportsThinkingBindingControls?: boolean;
+    requiresThinkingPresence?: boolean;
+    [k: string]: unknown;
+  };
   /** omp 18.2.10：自定义模型遵循 provider 级 transport（pi-native 走原生网关） */
   transport?: string;
+  /** omp 18.11.3+：自定义网关单请求图片数预算 */
+  imageCountBudget?: number;
+  /** omp 18.10.3 / 18.16.0+：自定义 tokenizer（如 o200k / cl100k） */
+  tokenizer?: string;
+  /** omp 19.0.1+：snapcompact 帧形状 */
+  snapcompactShape?: string;
   cost?: Record<string, unknown>;
   // issue 90: 用显式 extra 字段收集未知字段，替代过度宽松的 [k:string]:unknown 索引签名
   // （索引签名会让所有属性访问退化为 unknown 且无法捕获 typo）
   extra?: Record<string, unknown>;
 }
 
-/** models.yml 的 providers.<id> 结构（对齐 omp 17.x models-config-schema，GUI 只读写关心的字段，未知字段透传保留） */
+/** models.yml 的 providers.<id> 结构（对齐 omp 17–19 models-config-schema，GUI 只读写关心的字段，未知字段透传保留） */
 export interface OmpProviderConfig {
   /** 显示名 */
   name?: string;
   baseUrl?: string;
-  /** api 协议类型，如 openai-completions / anthropic-messages / openrouter … */
+  /** api 协议类型，如 openai-completions / anthropic-messages / google-decisions … */
   api?: string;
   /** 明文 API Key（omp 官方支持的存储方式，启动时读入内存） */
   apiKey?: string;
   /** 鉴权方式：apiKey（默认）/ none / oauth */
   auth?: 'apiKey' | 'none' | 'oauth';
   /** 自动发现模型：openai-models-list = GET {baseUrl}/models。
-   *  omp 18.1.0：新增 injectV1（模型端点带版本前缀的 OpenAI 兼容网关） */
-  discovery?: { type: string; injectV1?: boolean; [k: string]: unknown };
+   *  omp 18.1.0：新增 injectV1；18.13.2：新增 advertisedReasoning */
+  discovery?: { type: string; injectV1?: boolean; advertisedReasoning?: boolean; [k: string]: unknown };
   /** 手动声明的模型列表（可选，与 discovery 二选一或并存） */
   models?: OmpModelDefinition[];
   /** omp 18.2.10：provider 级 transport（pi-native 走原生网关） */
@@ -522,8 +551,8 @@ export interface OmpApi {
   // 不再强制 any/unknown 断言；preload 实现返回 Promise<any> 可安全赋给 Promise<T>。
   /** timeoutMs 可覆盖 FrameRouter 默认 5min 超时（0.5.21：看门狗对账传 3s，防僵死进程堆积 pending） */
   send<T = unknown>(sessionPath: string, cmd: RpcCommand, timeoutMs?: number): Promise<T>;
-  /** 懒拉起某会话的进程（带 -c 续接历史）。已在线则 no-op。 */
-  acquire(sessionPath: string, cwd: string, approvalMode?: ApprovalMode): Promise<void>;
+  /** 懒拉起某会话的进程（历史会话带 -r 或 --restore 续接历史）。已在线则 no-op。 */
+  acquire(sessionPath: string, cwd: string, approvalMode?: ApprovalMode, opts?: AcquireOptions): Promise<void>;
   /** 新建会话：spawn 不带 -c，返回新 sessionPath。
    *  tempKey 由渲染层生成并传入（先切指针再 spawn，消除新建空窗期），非法时主进程兜底自生成。 */
   newSessionForCwd(tempKey: string, cwd: string, approvalMode?: ApprovalMode): Promise<{ sessionPath: string }>;

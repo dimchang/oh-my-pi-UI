@@ -342,7 +342,11 @@ export const SkillsPanel: React.FC = () => {
                 onClick={() => void openDetail(s.name)}
               >
                 <div className="skill-card-avatar" style={{ background: colorOf(s.name) }}>{avatarLetter(s.name)}</div>
-                <div className="skill-card-name">{s.name}</div>
+                <div className="skill-card-name">
+                  {s.name}
+                  {s.manual && <span className="skill-badge-manual" title="仅在手动 /skill: 调用时触发（config.yml skills.manualSkills）">仅手动</span>}
+                  {s.providerDisabled && <span className="skill-badge-disabled" title="所属来源在 config.yml 中被禁用">源未启用</span>}
+                </div>
                 <div className="skill-card-desc">{s.description || '（无描述）'}</div>
                 <div className="skill-card-toggle">
                   <Toggle on={s.enabled} disabled={busy === s.name} onChange={(v) => void toggleSkill(s.name, v)} />
